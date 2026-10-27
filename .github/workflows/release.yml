@@ -40,7 +40,11 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-          # 镜像名必须全小写，GitHub 的 owner 可能带大写
+          # 镜像名必须全小写，GitHub 的 owner 可能带大写。
+          # 这里用 ${GITHUB_REPOSITORY,,}（owner/repo），所以包名就是仓库名
+          # ghcr.io/caspian-vex/qqbot-dev2 —— install.sh 与 compose.yaml 的默认值
+          # 必须和它一致；写成 ghcr.io/<owner>/qqbot 会指向一个不存在的包，
+          # 报错是含糊的 "denied"，很难查。
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: 准备 Node

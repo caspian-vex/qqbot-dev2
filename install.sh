@@ -31,7 +31,9 @@ for arg in "$@"; do
 环境变量:
   QQBOT_DIR    安装目录，默认 /opt/qqbot
   PANEL_PORT   面板端口，默认 5666
-  QQBOT_IMAGE  镜像名，默认 ghcr.io/caspian-vex/qqbot:<版本>
+  QQBOT_IMAGE  镜像名，默认 ghcr.io/caspian-vex/qqbot-dev2:<版本>
+  GHCR_TOKEN   私有包的访问令牌（read:packages）；公开包不用填
+  GHCR_USER    令牌所属账号，默认 caspian-vex
 USAGE
       exit 0
       ;;
@@ -48,7 +50,9 @@ if [ "$BUILD" = "1" ] && [ -z "${QQBOT_VERSION:-}" ]; then
 fi
 QQBOT_VERSION="${QQBOT_VERSION:-latest}"
 # 镜像名。自建仓库时用 QQBOT_IMAGE=registry/xxx/qqbot:tag 覆盖
-QQBOT_IMAGE="${QQBOT_IMAGE:-ghcr.io/caspian-vex/qqbot:${QQBOT_VERSION}}"
+# 镜像名跟仓库名一致：CI 推的是 ghcr.io/${repo}，写成 ghcr.io/<owner>/qqbot
+# 会指向一个不存在的包，报错是含糊的 "denied"。
+QQBOT_IMAGE="${QQBOT_IMAGE:-ghcr.io/caspian-vex/qqbot-dev2:${QQBOT_VERSION}}"
 # 仓库原始地址，用于拉 compose.yaml 与 qqbotctl
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main}"
 # 脚本自身所在目录：--build 时它就是构建上下文
@@ -277,7 +281,26 @@ if [ "$BUILD" = "1" ]; then
   # 本地镜像不在仓库里，pull 必然失败；up 会用本地已有的镜像
   docker compose --env-file "$ENV_FILE" up -d || die "启动失败，查看日志：docker compose -f $COMPOSE_FILE logs"
 else
-  docker compose --env-file "$ENV_FILE" pull || die "拉取镜像失败。检查网络，或确认镜像名 $QQBOT_IMAGE 存在"
+  # 私有包才需要登录；公开包匿名拉。GHCR_TOKEN 传过来就用，不传就按公开包走。
+  if [ -n "${GHCR_TOKEN:-}" ]; then
+    say "  使用 GHCR_TOKEN 登录 ghcr.io…"
+    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USER:-caspian-vex}" --password-stdin >/dev/null 2>&1 \
+      || die "GHCR 登录失败，检查 GHCR_TOKEN（需要 read:packages 权限）"
+  fi
+
+  if ! PULL_OUT="$(docker compose --env-file "$ENV_FILE" pull 2>&1)"; then
+    printf '%s\n' "$PULL_OUT" | tail -5
+    case "$PULL_OUT" in
+      *denied*|*unauthorized*|*"authentication required"*)
+        die "镜像拉取被拒绝：$QQBOT_IMAGE
+       两种可能：
+         1. 镜像名写错了（必须是 ghcr.io/<owner>/<repo>:<tag> 的完整形式）
+         2. 包是私有的。要么在 GitHub 的 Package 设置里改成 public，
+            要么带着令牌跑：GHCR_TOKEN=<有 read:packages 的 PAT> bash install.sh" ;;
+      *)
+        die "拉取镜像失败。检查网络，或确认镜像名 $QQBOT_IMAGE 存在" ;;
+    esac
+  fi
   docker compose --env-file "$ENV_FILE" up -d || die "启动失败，查看日志：docker compose -f $COMPOSE_FILE logs"
 fi
 

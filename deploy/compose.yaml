@@ -68,7 +68,7 @@ services:
   qqbot:
     # 镜像由 CI 构建好推到 GHCR，服务器上只 pull，零编译。
     # 想用本地构建的镜像：在 etc/env 里把 QQBOT_IMAGE 设成 qqbot:dev
-    image: ${QQBOT_IMAGE:-ghcr.io/caspian-vex/qqbot:${QQBOT_VERSION:-latest}}
+    image: ${QQBOT_IMAGE:-ghcr.io/caspian-vex/qqbot-dev2:${QQBOT_VERSION:-latest}}
     container_name: qqbot-core
     restart: unless-stopped
 
