@@ -1,0 +1,23 @@
+# 服务器口令，绝不进版本库
+服务器信息.txt
+
+# 依赖与构建产物。
+# 注意：这里只能写 /dist/（仓库根那个），不能写 dist/ —— 那样会把 web/dist
+# 一起忽略掉，而 web/dist 是**前端源码**（无构建、手写 JS），忽略它的后果是
+# 镜像里没有前端、面板一片空白，CI 里的静态资源用例也会挂。
+node_modules/
+/dist/
+
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# install.sh 在服务器上生成的目录，不该进仓库
+data/
+etc/
+.devroot/
+
+.DS_Store
+.workbuddy/
+.workbuddy-ai/

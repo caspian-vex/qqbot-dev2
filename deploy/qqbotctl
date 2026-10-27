@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+#
+# qqbot 运维命令。安装时被复制到 /usr/local/bin/qqbot。
+#
+# 刻意做得很薄：它只是 docker compose 的包装，
+# 真正的编排逻辑在 compose.yaml 里，避免两处状态。
+set -euo pipefail
+
+DIR="${QQBOT_DIR:-/opt/qqbot}"
+ENV_FILE="$DIR/etc/env"
+COMPOSE_FILE="$DIR/compose.yaml"
+
+if [ ! -f "$COMPOSE_FILE" ]; then
+  echo "找不到 $COMPOSE_FILE，请先运行 install.sh" >&2
+  exit 1
+fi
+
+dc() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+
+env_get() { grep "^$1=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true; }
+env_set() {
+  if grep -q "^$1=" "$ENV_FILE" 2>/dev/null; then
+    sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+  else
+    echo "$1=$2" >> "$ENV_FILE"
+  fi
+}
+
+# 面板端口。容器内外是同一个值（compose 的 ports 与 QQBOT_PANEL_LISTEN 都从它推导），
+# 所以宿主机上的健康检查直接用这个端口。
+panel_port() {
+  local p
+  p=$(env_get PANEL_PORT)
+  case "$p" in
+    ''|*[!0-9]*) echo 5666 ;;
+    *)           echo "$p" ;;
+  esac
+}
+
+# 最小化 Debian 上可能既没有 curl 也没有 wget
+http_ok() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 2 "$url" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 2 -O /dev/null "$url" >/dev/null 2>&1
+  else
+    # 两个都没有就退回看容器健康状态
+    [ "$(docker inspect -f '{{.State.Health.Status}}' qqbot-core 2>/dev/null)" = "healthy" ]
+  fi
+}
+
+# 最小化 Debian 上可能既没有 curl 也没有 wget
+http_get() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 4 "$url" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 4 -O - "$url" 2>/dev/null
+  fi
+}
+
+# 云服务器的公网 IP 不挂在网卡上，只能问外部服务；全失败就退回网卡地址
+public_ip() {
+  local ip
+  for u in https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip; do
+    ip=$(http_get "$u" | tr -d '[:space:]')
+    case "$ip" in
+      ""|*[!0-9.]*) continue ;;
+    esac
+    echo "$ip"
+    return 0
+  done
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo "${ip:-<服务器IP>}"
+}
+
+panel_url() {
+  local bind ip port
+  bind=$(env_get PANEL_BIND)
+  port=$(panel_port)
+  ip=$(public_ip)
+  case "${bind:-0.0.0.0}" in
+    127.0.0.1) echo "http://127.0.0.1:${port}" ;;
+    0.0.0.0)   echo "http://${ip}:${port}" ;;
+    *)         echo "http://${bind}:${port}" ;;
+  esac
+}
+
+# 等面板就绪，同时容忍容器已经退出的情况（早失败比傻等有用）
+wait_ready() {
+  local secs="${1:-90}" i running port
+  port=$(panel_port)
+  echo -n "等待面板就绪"
+  for i in $(seq 1 "$((secs / 2))"); do
+    if http_ok "http://127.0.0.1:${port}/healthz"; then
+      echo; return 0
+    fi
+    running=$(docker inspect -f '{{.State.Running}}' qqbot-core 2>/dev/null || echo false)
+    if [ "$running" != "true" ]; then
+      echo; echo "qqbot 容器已退出，最近日志：" >&2
+      dc logs --tail=40 qqbot >&2 || true
+      return 1
+    fi
+    echo -n "."
+    sleep 2
+  done
+  echo
+  return 1
+}
+
+cmd_status() {
+  echo "=== 容器 ==="
+  dc ps
+  echo
+  echo "=== 面板 ==="
+  if http_ok "http://127.0.0.1:$(panel_port)/healthz"; then
+    echo "健康  $(panel_url)"
+  else
+    echo "不可达（可能仍在启动，或容器已退出）—— 看 qqbot logs"
+  fi
+  echo
+  echo "=== 版本 ==="
+  echo "镜像  qqbot:$(env_get QQBOT_VERSION)"
+  case "$(env_get QQBOT_BUILD_MODE)" in
+    prebuilt) echo "来源  预编译二进制（安装时下载，sha256 已校验）" ;;
+    *)        echo "来源  服务器本地构建" ;;
+  esac
+  echo
+  echo "=== 资源占用 ==="
+  docker stats --no-stream --format \
+    'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}' \
+    qqbot-core qqbot-napcat 2>/dev/null || true
+  echo
+  echo "=== 内存总览 ==="
+  free -m | sed -n '1,2p'
+}
+
+cmd_logs() {
+  local follow="" svc=""
+  for a in "$@"; do
+    case "$a" in
+      -f|--follow) follow="-f" ;;
+      *) svc="$a" ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  dc logs --tail=200 $follow $svc
+}
+
+# 把源码目录同步进 $DIR/src。排除规则必须与 install.sh 保持一致。
+sync_src() {
+  local src="$1"
+  [ -f "$src/go.mod" ] || { echo "$src 不像项目根目录（找不到 go.mod）" >&2; return 1; }
+  tar czf - -C "$src" \
+      --exclude=./.git --exclude=./bin --exclude=./dist \
+      --exclude=./.devroot --exclude=./.workbuddy-ai \
+      --exclude='*.exe' --exclude='*.db' --exclude='*.db-shm' --exclude='*.db-wal' \
+      . | tar xzf - -C "$DIR/src"
+}
+
+cmd_upgrade() {
+  local old new image
+  old=$(env_get QQBOT_VERSION)
+  new="${1:-latest}"
+
+  # 拉镜像式升级：CI 已经在多架构上构建并推好，服务器只负责 pull。
+  # 1 核机器上本地构建一次要几分钟，而 pull 是几十秒，这是整个方案的核心收益。
+  echo "拉取 $new …"
+  env_set QQBOT_VERSION "$new"
+  if ! dc pull qqbot; then
+    echo "拉取失败，版本号回滚为 $old" >&2
+    env_set QQBOT_VERSION "$old"
+    exit 1
+  fi
+
+  dc up -d
+
+  if wait_ready 90; then
+    # 镜像换了，CLI 也要跟着换，否则新增子命令不会生效。
+    # 用 mv 原子替换而不是直接覆盖：当前脚本正被 bash 读取，
+    # 覆盖同一个文件可能让解释器读到半新半旧的内容。
+    if [ -f "$DIR/compose.yaml" ] && command -v curl >/dev/null 2>&1; then
+      if curl -fsSL "${REPO_RAW:-https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main}/deploy/qqbotctl" \
+           -o /usr/local/bin/.qqbot.new 2>/dev/null && [ -s /usr/local/bin/.qqbot.new ]; then
+        chmod 755 /usr/local/bin/.qqbot.new && mv -f /usr/local/bin/.qqbot.new /usr/local/bin/qqbot
+        echo "已更新 qqbot 命令"
+      fi
+    fi
+    echo "升级成功（当前 $new）"
+    [ "$old" != "$new" ] && [ -n "$old" ] && {
+      echo "旧版本 $old 仍保留，回滚：sudo qqbot rollback $old"
+    }
+    return 0
+  fi
+
+  echo "新版本未就绪，自动回滚到 $old" >&2
+  cmd_rollback "$old"
+}
+
+cmd_rollback() {
+  local tag="${1:-}"
+  if [ -z "$tag" ]; then
+    echo "用法: qqbot rollback <版本号>" >&2
+    echo "可用版本：" >&2
+    docker images --format '{{.Repository}}:{{.Tag}}' | grep '^qqbot:' >&2 || true
+    exit 1
+  fi
+  docker image inspect "qqbot:$tag" >/dev/null 2>&1 \
+    || { echo "镜像 qqbot:$tag 不存在（可能被 1Panel 的清理任务删了）" >&2; exit 1; }
+  env_set QQBOT_VERSION "$tag"
+  dc up -d
+  if wait_ready 60; then
+    echo "已回滚到 $tag"
+  else
+    echo "回滚后仍未就绪，手动排查：qqbot logs qqbot" >&2
+    exit 1
+  fi
+}
+
+cmd_backup() {
+  local ts dest
+  ts=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$DIR/backup"
+  dest="$DIR/backup/qqbot-$ts.tar.gz"
+  umask 077
+
+  # 先停容器再打包：SQLite 用 WAL，热拷会拿到不一致的库。
+  # 停机时间只有几百毫秒（打包 20MB 左右），对个人机器人可以接受。
+  local was_running=0
+  if [ "$(docker inspect -f '{{.State.Running}}' qqbot-core 2>/dev/null || echo false)" = "true" ]; then
+    was_running=1
+    dc stop qqbot >/dev/null
+  fi
+
+  tar czf "$dest" -C "$DIR" data/qqbot etc
+  chmod 600 "$dest"
+
+  if [ "$was_running" = 1 ]; then
+    dc start qqbot >/dev/null
+  fi
+
+  echo "已备份到 $dest ($(du -h "$dest" | cut -f1))"
+  # 只留最近 7 份，2G 机器上磁盘比备份值钱
+  ls -1t "$DIR"/backup/qqbot-*.tar.gz 2>/dev/null | tail -n +8 | xargs -r rm -f
+}
+
+cmd_restore() {
+  local src="${1:-}"
+  [ -f "$src" ] || { echo "用法: qqbot restore <备份文件>" >&2; exit 1; }
+  echo "这会覆盖当前数据与密钥，5 秒后开始，Ctrl+C 取消…"
+  sleep 5
+  dc down
+  tar xzf "$src" -C "$DIR"
+  # 备份里的属主信息不保留，恢复后重新对齐，否则容器写不进去
+  chown -R 10001:10001 "$DIR/data/qqbot" 2>/dev/null || true
+  chown -R 1000:1000   "$DIR/data/napcat" 2>/dev/null || true
+  dc up -d
+  echo "已从 $src 恢复"
+}
+
+# 重置面板密码。
+#
+# 镜像里已经有 qqbot 二进制和 SQLite 驱动，所以用一次性容器直接改，
+# 既不需要宿主机装 sqlite3，也不用往运行中的容器里 exec。
+# 改之前先停掉 qqbot，否则两个进程同时写 SQLite 会有一致性问题。
+cmd_reset_password() {
+  local tag was_running=0 rc=0
+  tag=$(env_get QQBOT_VERSION)
+  [ -n "$tag" ] || tag="dev"
+
+  if [ "$(docker inspect -f '{{.State.Running}}' qqbot-core 2>/dev/null || echo false)" = "true" ]; then
+    was_running=1
+    dc stop qqbot >/dev/null
+  fi
+
+  # 容器内 data_dir 是 /opt/qqbot/data（见 qqbot.toml），数据库在它下面一层，
+  # 所以挂载点是 /opt/qqbot/data 而不是 /opt/qqbot/data/qqbot。
+  image=$(env_get QQBOT_IMAGE)
+  [ -n "$image" ] || image="ghcr.io/caspian-vex/qqbot:$tag"
+  docker run --rm -v "$DIR/data/qqbot:/opt/qqbot/data" "$image" \
+    reset-password --db /opt/qqbot/data/qqbot.db "$@" || rc=$?
+
+  if [ "$was_running" = 1 ]; then
+    dc start qqbot >/dev/null
+    wait_ready 30 || true
+  fi
+  return "$rc"
+}
+
+# 打印访问地址。默认是公网 IP 直连，不需要隧道。
+cmd_url() {
+  local ip
+  ip=$(public_ip)
+  cat <<EOF
+面板      $(panel_url)
+         账号 admin（密码见安装结束时的输出）
+
+扫码登录  $(panel_url)  → 左侧「登录」页
+         （NapCat WebUI 不对公网暴露，token 只在服务端使用）
+
+OneBot    ws://127.0.0.1:3001（只绑本机，不对外）
+EOF
+}
+
+# 隧道是备用手段：面板被改回只绑 127.0.0.1 时用它。
+cmd_tunnel() {
+  local ip port
+  ip=$(public_ip)
+  port=$(panel_port)
+  cat <<EOF
+如果面板只绑了 127.0.0.1，在你自己的电脑上建隧道：
+
+  ssh -L 6099:127.0.0.1:6099 -L ${port}:127.0.0.1:${port} root@${ip}
+
+然后打开：
+  NapCat WebUI   http://127.0.0.1:6099/webui
+  qqbot 面板      http://127.0.0.1:${port}
+
+WebUI Token: $(env_get WEBUI_TOKEN)
+
+当前 PANEL_BIND = $(env_get PANEL_BIND)
+EOF
+}
+
+cmd_uninstall() {
+  local purge=0
+  [ "${1:-}" = "--purge" ] && purge=1
+  dc down
+  if [ "$purge" = 1 ]; then
+    echo "删除数据目录 $DIR/data（不可恢复）"
+    rm -rf "$DIR/data"
+  else
+    echo "数据保留在 $DIR/data"
+  fi
+  rm -f /usr/local/bin/qqbot
+  echo "已卸载。$([ "$purge" = 0 ] && echo "重装会沿用现有密钥与数据。")"
+}
+
+usage() {
+  cat <<EOF
+qqbot — 运维命令
+
+  status                  容器与面板状态、资源占用
+  url                     打印面板与 WebUI 的访问地址
+  reset-password          重置面板密码（默认同时关闭 TOTP，加 --keep-totp 保留）
+  logs [-f] [服务]        查看日志（服务：qqbot / napcat）
+  up / down               启动 / 停止
+  restart                 重启
+  upgrade [--src <目录>]  重建镜像并切过去，失败自动回滚（走源码构建，约 2 分钟）
+  rollback <版本>         回滚到指定镜像版本
+  backup                  备份数据与密钥（先停容器，保证一致性）
+  restore <文件>          从备份恢复
+  tunnel                  面板被改成只绑 127.0.0.1 时的备用访问方式
+  uninstall [--purge]     卸载（--purge 同时删数据）
+
+安装目录 $DIR
+EOF
+}
+
+case "${1:-}" in
+  status)    shift; cmd_status "$@" ;;
+  url)       shift; cmd_url "$@" ;;
+  reset-password) shift; cmd_reset_password "$@" ;;
+  logs)      shift; cmd_logs "$@" ;;
+  up)        shift; dc up -d ;;
+  down)      shift; dc down ;;
+  restart)   shift; dc restart ;;
+  upgrade)   shift; cmd_upgrade "$@" ;;
+  rollback)  shift; cmd_rollback "$@" ;;
+  backup)    shift; cmd_backup "$@" ;;
+  restore)   shift; cmd_restore "$@" ;;
+  tunnel)    shift; cmd_tunnel "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "未知命令: $1" >&2; usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,122 @@
+# qqbot 部署编排：NapCat（协议端）+ qqbot（框架与面板）
+#
+# 对外只开一个端口：5666。
+#   - 面板、扫码登录、日志、全部运维都在 5666 上
+#   - NapCat 的 6099 WebUI 和 3001 OneBot WS 都只活在 docker 内网，
+#     不对公网暴露。扫码这件事由 qqbot 服务端代理完成，
+#     所以用户只需要记一套面板凭据。
+#
+# 设计约束（1 核 2G，不可升配）：
+#   - 两个容器总内存上限 1.4G，给系统留出余量
+#   - 日志用服务级轮转，**不改 /etc/docker/daemon.json**
+#     （daemon.json 是全局的，会被 1Panel 之类的面板重写；服务级配置零冲突）
+#
+# 用法：docker compose --env-file etc/env up -d
+
+name: qqbot
+
+services:
+  # ---------------- 协议端 ----------------
+  napcat:
+    image: mlikiowa/napcat-docker:${NAPCAT_TAG:-latest}
+    container_name: qqbot-napcat
+    restart: unless-stopped
+
+    environment:
+      # ws = 正向 WebSocket，NapCat 监听 3001，qqbot 作为客户端连上去
+      MODE: ws
+      # 面板通过它代理扫码登录。绝不下发给浏览器。
+      WEBUI_TOKEN: ${WEBUI_TOKEN:?缺少 WEBUI_TOKEN，请先运行 install.sh}
+      # 1000 是官方 README 的默认值。install.sh 会把 data/napcat 下的目录
+      # chown 到 1000:1000，两者必须一致，否则 NapCat 写不进 QQ 配置。
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
+
+    # 注意：这里刻意没有 ports。
+    # NapCat 的 6099 / 3001 只在 compose 内网可达：
+    #   - 6099 由 qqbot 服务端代理（token 不出服务端）
+    #   - 3001 由 qqbot 通过 ws://napcat:3001 直连
+    # 少暴露一个端口就少一个被扫的面，用户也不用记第二个凭据。
+    expose:
+      - "6099"
+      - "3001"
+
+    volumes:
+      - ./data/napcat/qq:/app/.config/QQ
+      - ./data/napcat/config:/app/napcat/config
+      - ./data/napcat/plugins:/app/napcat/plugins
+      - ./data/napcat/logs:/app/napcat/logs
+
+    # QQNT 底层是 Chromium，默认 64MB 的 /dev/shm 会让渲染进程随机崩溃。
+    # 256MB 是折中：够用，且在 2G 机器上不会把内存吃光（shm 走 tmpfs，算内存）。
+    shm_size: 256m
+
+    mem_limit: 1024m
+    mem_reservation: 512m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    labels:
+      com.qqbot.managed: "true"
+      com.qqbot.role: "protocol"
+
+  # ---------------- 框架与面板 ----------------
+  qqbot:
+    # 镜像由 CI 构建好推到 GHCR，服务器上只 pull，零编译。
+    # 想用本地构建的镜像：在 etc/env 里把 QQBOT_IMAGE 设成 qqbot:dev
+    image: ${QQBOT_IMAGE:-ghcr.io/caspian-vex/qqbot:${QQBOT_VERSION:-latest}}
+    container_name: qqbot-core
+    restart: unless-stopped
+
+    depends_on:
+      - napcat
+
+    # 密钥走 env_file：容器内是非 root，读不了宿主上 0600 root 所有的密钥文件，
+    # 注入环境变量最省事，也不会在容器里留下可读的密钥文件。
+    env_file:
+      - ./etc/env
+
+    environment:
+      QQBOT_ROOT: /opt/qqbot
+      # 容器内必须监听 0.0.0.0，否则端口映射进不来。
+      # 端口只在这里定义一次：etc/env 的 PANEL_PORT 同时决定
+      # 「容器监听哪个端口」和「映射到宿主哪个端口」，改一处就够。
+      QQBOT_LISTEN: "0.0.0.0:${PANEL_PORT:-5666}"
+      # 容器内用服务名寻址
+      QQBOT_NAPCAT_WEBUI: "http://napcat:6099"
+
+    volumes:
+      - ./etc/qqbot.toml:/opt/qqbot/etc/qqbot.toml:ro
+      - ./data/qqbot:/opt/qqbot/data
+
+    ports:
+      # 默认绑所有网卡，直接用 http://<服务器IP>:5666 访问，不需要 SSH 隧道。
+      # 安全边界靠面板自己的认证：随机强密码 + 5 次失败锁定 + 可选 TOTP。
+      # 想只允许本机：在 etc/env 里设 PANEL_BIND=127.0.0.1 再 restart。
+      - "${PANEL_BIND:-0.0.0.0}:${PANEL_PORT:-5666}:${PANEL_PORT:-5666}"
+
+    mem_limit: 384m
+    mem_reservation: 96m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 镜像里已有 HEALTHCHECK，这里把间隔调宽松一点，
+    # 免得 1 核机器上健康检查自己变成负载
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${PANEL_PORT:-5666}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    labels:
+      com.qqbot.managed: "true"
+      com.qqbot.role: "core"

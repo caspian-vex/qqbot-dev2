@@ -1,0 +1,24 @@
+# 构建上下文瘦身。node_modules 尤其重要——不排除的话
+# 宿主机上那份（可能含原生模块、几百 MB）会被整个传进构建器。
+node_modules
+dist
+web/node_modules
+
+# 本地数据与密钥，绝不进镜像
+data
+etc
+*.db
+*.db-shm
+*.db-wal
+服务器信息.txt
+
+# 开发期杂物
+.git
+.github
+.workbuddy-ai
+.smoke
+deploy
+scripts
+test
+*.log
+.DS_Store

@@ -1,0 +1,19 @@
+# 换行符统一 LF。
+#
+# Windows 上 core.autocrlf=true 会把 .sh / Dockerfile 检出成 CRLF，
+# 传到 Linux 就是 `env: 'bash\r': No such file or directory`，
+# Dockerfile 的 RUN 也会带着 \r 执行。这类问题只在真机上才炸，
+# 所以用仓库级规则钉死，不靠每个人的本地配置。
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+deploy/qqbotctl text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
