@@ -7,9 +7,66 @@
 // 首字延迟从 1 秒级涨到 5 秒级，token 也翻几倍。
 // 所以请求体里永远带 thinking.type，而不是"需要时才加"。
 
+/** 一张图的内容块：OpenAI 兼容的 image_url，url 用 `data:` 形式内联。 */
+export type ImagePart = { type: 'image_url'; image_url: { url: string } };
+
+/** 消息内容块。 */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | ImagePart;
+
+/**
+ * 一条消息。
+ *
+ * 纯文本时 content 仍然是字符串——不是所有 OpenAI 兼容端点都吃数组，
+ * 能发字符串就发字符串；只有带图才升级成内容块数组。
+ */
 export interface Message {
   role: string;
-  content: string;
+  content: string | ContentPart[];
+}
+
+/**
+ * 一张图在预算里折算多少 token。
+ *
+ * 图片按分辨率计费，各家中转也不一样，这里取一个偏保守的固定值：
+ * 只用于上下文预算与"网关没回 usage"时的兜底估算，不影响真实计费。
+ * 估高一点最多是少带一轮历史，估低了会直接把请求顶到超限报错。
+ */
+export const IMAGE_TOKENS = 1024;
+
+/** 取消息里的纯文本部分（图片块直接忽略）。 */
+export function contentText(c: string | ContentPart[]): string {
+  if (typeof c === 'string') return c;
+  let out = '';
+  for (const p of c) {
+    if (p.type === 'text') out += p.text;
+  }
+  return out;
+}
+
+/** 估算消息内容的 token 数，图片按 IMAGE_TOKENS 计。 */
+export function contentTokens(c: string | ContentPart[]): number {
+  if (typeof c === 'string') return estimateTokens(c);
+  let n = 0;
+  for (const p of c) {
+    n += p.type === 'text' ? estimateTokens(p.text) : IMAGE_TOKENS;
+  }
+  return n;
+}
+
+/**
+ * 把文字与图片拼成一条 user 消息的 content。
+ *
+ * 没有图片时原样返回字符串；有图片但没文字时不塞空 text 块——
+ * OpenAI 允许纯图片内容，塞一个空串反而有端点会报 400。
+ */
+export function withImages(text: string, images: ContentPart[]): string | ContentPart[] {
+  if (images.length === 0) return text;
+  const parts: ContentPart[] = [];
+  if (text !== '') parts.push({ type: 'text', text });
+  parts.push(...images);
+  return parts;
 }
 
 /** 单次调用使用的模型配置。 */

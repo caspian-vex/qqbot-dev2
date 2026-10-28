@@ -2,7 +2,13 @@
 //
 // 目标是在固定 token 预算内尽可能保留最近、最相关的对话，
 // 既不让模型"失忆"，也不让 token 成本失控。
-import { estimateTokens, type Message as LlmMessage } from '../llm/client';
+import {
+  contentTokens,
+  estimateTokens,
+  withImages,
+  type ContentPart,
+  type Message as LlmMessage,
+} from '../llm/client';
 import type { Store } from '../store';
 import type { ContextSettings } from '../store/types';
 
@@ -19,8 +25,17 @@ export class Manager {
    *
    * 为什么按"整轮"丢弃而不是逐条丢弃：如果上下文以 assistant 开头，
    * 部分模型会表现异常（把历史回复当成待续写内容）。
+   *
+   * images 是本次用户消息附带的图片块：历史的旧图不会重发（库里只存文字），
+   * 只有当前这一轮会带图，所以预算要先把它扣掉。
    */
-  build(sessionID: string, cfg: ContextSettings, system: string, userText: string): LlmMessage[] {
+  build(
+    sessionID: string,
+    cfg: ContextSettings,
+    system: string,
+    userText: string,
+    images: ContentPart[] = [],
+  ): LlmMessage[] {
     // max_turns = 0 是面板上的合法值，含义是「不带历史」。
     // 这里不能套 "> 0 ? x : 默认值" 的写法——那会把 0 悄悄变成 10 轮，
     // 用户关掉上下文后机器人还在接着几十条前的对话往下说。
@@ -30,10 +45,12 @@ export class Manager {
 
     const history = maxTurns === 0 ? [] : this.store.sessions.recent(sessionID, maxTurns * 2);
 
+    const userContent = withImages(userText, images);
+
     // 预算里先扣掉固定开销：系统提示、本轮用户消息、预期输出
     let budget = tokenBudget;
     budget -= estimateTokens(system);
-    budget -= estimateTokens(userText);
+    budget -= contentTokens(userContent);
     budget -= 512; // 预留输出空间
     if (budget < 0) budget = 0;
 
@@ -58,7 +75,8 @@ export class Manager {
     for (const h of history.slice(start)) {
       msgs.push({ role: h.role, content: h.content });
     }
-    msgs.push({ role: 'user', content: userText });
+    // 用户消息里的图片块只属于这一轮，历史里的旧图不会重发
+    msgs.push({ role: 'user', content: userContent });
     return msgs;
   }
 

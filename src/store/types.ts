@@ -72,6 +72,20 @@ export interface ContextSettings {
   token_budget: number;
 }
 
+/**
+ * 图片识别配置。
+ *
+ * 用户发图时把图下载下来随消息一起交给模型（OpenAI 兼容的 image_url 块）。
+ * 出厂默认开启：默认模型本身支持看图，而"发了图机器人装没看见"是最劝退的体验。
+ * 用的是纯文字模型的话，在面板里关掉即可——关掉后图片段仅被忽略，不影响文字回复。
+ */
+export interface VisionSettings {
+  /** 是否把用户发来的图交给模型看。 */
+  enabled: boolean;
+  /** 单条消息最多看几张（多出来的直接丢，不下载）。 */
+  max_images: number;
+}
+
 /** 面板凭据配置。 */
 export interface PanelSettings {
   admin_user: string;
@@ -86,6 +100,7 @@ export interface Settings {
   bot: BotSettings;
   proactive: ProactiveSettings;
   images: ImageSettings;
+  vision: VisionSettings;
   context: ContextSettings;
   panel: PanelSettings;
 }
@@ -107,6 +122,20 @@ export function defaultImages(): ImageSettings {
   return {
     enabled: false,
     max_per_reply: 1,
+  };
+}
+
+/**
+ * 图片识别的出厂默认值。
+ *
+ * 这个块与主动发言、图池不同，出厂是**开**的：默认模型就能看图，
+ * 而"用户发了图，机器人当作没看见"是最劝退的体验。
+ * 关掉只是一次勾选，误开的代价（多花一点 token）比对不上。
+ */
+export function defaultVision(): VisionSettings {
+  return {
+    enabled: true,
+    max_images: 4,
   };
 }
 
@@ -136,6 +165,7 @@ export function defaultSettings(): Settings {
     },
     proactive: defaultProactive(),
     images: defaultImages(),
+    vision: defaultVision(),
     context: {
       max_turns: 10,
       token_budget: 3000,
@@ -168,6 +198,12 @@ export function normalizeSettings(v: Settings): Settings {
   if (v.images === undefined || v.images === null || typeof v.images !== 'object') {
     v.images = defaultImages();
   }
+  // 旧库没有 vision 块：整个补成默认值，理由同 proactive。
+  // 这个块补上之后旧部署是"开启"状态，与出厂默认一致——
+  // 图片识别本来就是用户升级后想要的，不该升级完还得去点一下。
+  if (v.vision === undefined || v.vision === null || typeof v.vision !== 'object') {
+    v.vision = defaultVision();
+  }
   return v;
 }
 
@@ -183,6 +219,7 @@ export function cloneSettings(v: Settings): Settings {
     },
     proactive: { ...v.proactive },
     images: { ...v.images },
+    vision: { ...v.vision },
     context: { ...v.context },
     panel: { ...v.panel },
   };

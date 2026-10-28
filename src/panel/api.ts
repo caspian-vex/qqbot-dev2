@@ -225,6 +225,9 @@ function validateSettings(v: Settings): void {
   if (v.images.max_per_reply < 1 || v.images.max_per_reply > 3) {
     throw new HttpError(400, '单条回复发图上限应在 1-3 张之间');
   }
+  if (v.vision.max_images < 1 || v.vision.max_images > 4) {
+    throw new HttpError(400, '单条消息识图上限应在 1-4 张之间');
+  }
 
   // 名单类的元素类型必须一起校验。只查数组形状是不够的：
   // 传 ["30000"] 这种字符串数组能过 assignOnto，但引擎是拿 number 去
@@ -617,6 +620,7 @@ export class Api {
         v.context = { ...inp.context };
         v.proactive = { ...inp.proactive };
         v.images = { ...inp.images };
+        v.vision = { ...inp.vision };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });

@@ -1,6 +1,13 @@
 // 消息处理引擎：判断要不要回、组装上下文、调用模型、投递回复。
 import { Manager as ContextManager } from '../ctxmgr';
-import { LlmClient, estimateTokens, type LlmConfig, type Message as LlmMessage } from '../llm/client';
+import {
+  LlmClient,
+  contentTokens,
+  estimateTokens,
+  type ContentPart,
+  type LlmConfig,
+  type Message as LlmMessage,
+} from '../llm/client';
 import type { Logger } from '../log/logger';
 import type { BotStatus, EnginePort, EngineStats } from '../panel/ports';
 import { build as buildSystem, emptyVars, expand } from '../persona';
@@ -26,6 +33,13 @@ import {
 import { decide, type Decision } from './filter';
 import { Cooldown, Dedupe, TaskQueue } from './queue';
 import { split, stripMarkdown } from './split';
+import {
+  VISION_HINT,
+  VISION_ONLY_PROMPT,
+  imageMarker,
+  imageRefs,
+  loadImages,
+} from './vision';
 
 /** 引擎需要的发送能力。抽成接口是为了让引擎能脱离真实连接测试。 */
 export interface Sender {
@@ -201,9 +215,34 @@ export class Engine implements EnginePort {
   // ---- 回复链路 ----
 
   private async reply(ev: Event, settings: Settings, d: Decision): Promise<void> {
-    const userText = d.text.trim();
+    const rawText = d.text.trim();
 
-    if (userText === '') {
+    // 先把图取回来。任何一张读不到都只是"少一张"，不能升级成整条回复失败；
+    // 开关关着时不发请求，连一字节都不下载（见 VisionSettings 的说明）。
+    const refs = imageRefs(ev);
+    const images: ContentPart[] = settings.vision.enabled
+      ? await loadImages(refs, {
+          maxImages: settings.vision.max_images,
+          signal: this.opt.signal,
+        })
+      : [];
+    if (settings.vision.enabled && images.length < refs.length) {
+      this.log.debug('部分图片未进入本条消息', { refs: refs.length, kept: images.length });
+    }
+
+    if (rawText === '' && images.length === 0) {
+      // 用户确实发了图，只是一张都没读出来（超限、下载失败、不是真图）。
+      // 直说比"在的，怎么了？"诚实——后者会让人以为机器人根本没收到图。
+      if (refs.length > 0 && settings.vision.enabled) {
+        try {
+          await this.sendText(ev, ['这张图我没加载出来，再发一次？'], settings);
+          this.counters.replied++;
+          this.counters.lastReplyAt = Math.floor(Date.now() / 1000);
+        } catch {
+          // 兜底回复失败就算了，不值得记一条 error
+        }
+        return;
+      }
       // 只 @ 了机器人、或者只发了唤醒词，没带正文。
       // 这种情况给个简短回应即可，没必要为一句"在吗"去调模型。
       if (d.direct) {
@@ -220,6 +259,11 @@ export class Engine implements EnginePort {
       this.counters.ignored++;
       return;
     }
+
+    // 只发图没打字：给模型一句说明它才知道该看图。
+    // 这句只进请求——历史里记的是"用户带了图"，不能把系统的口吻写进用户台词。
+    const askText = rawText === '' ? VISION_ONLY_PROMPT : rawText;
+    const historyText = images.length === 0 ? rawText : `${rawText}${imageMarker(images.length)}`;
 
     let personaPrompt: string;
     try {
@@ -249,6 +293,10 @@ export class Engine implements EnginePort {
       }
     }
 
+    // 带图才提这一句：纯文字对话里塞图片规则，只会让模型以为
+    // 自己刚才收到了图，开始描述一张不存在的画面。
+    if (images.length > 0) system += `\n${VISION_HINT}`;
+
     const sid = sessionId(kindOf(ev), targetOf(ev));
     try {
       this.store.sessions.touch(sid, kindOf(ev), targetOf(ev));
@@ -258,7 +306,7 @@ export class Engine implements EnginePort {
 
     let msgs: LlmMessage[];
     try {
-      msgs = this.ctx.build(sid, settings.context, system, userText);
+      msgs = this.ctx.build(sid, settings.context, system, askText, images);
     } catch (e) {
       this.log.error('组装上下文失败', { err: e });
       this.counters.errors++;
@@ -317,12 +365,14 @@ export class Engine implements EnginePort {
 
     let promptTokens = res.usage.prompt_tokens;
     if (promptTokens === 0) {
-      for (const m of msgs) promptTokens += estimateTokens(m.content);
+      for (const m of msgs) promptTokens += contentTokens(m.content);
     }
     let completionTokens = res.usage.completion_tokens;
     if (completionTokens === 0) completionTokens = estimateTokens(recordText);
 
-    this.ctx.record(sid, 'user', userText, estimateTokens(userText));
+    // 历史只记文字 + 图张数：旧图不会重发，把它们的 token 记进历史会让
+    // 后续每一轮的预算估算都偏小，白白裁掉真正有用的对话。
+    this.ctx.record(sid, 'user', historyText, estimateTokens(historyText));
     this.ctx.record(sid, 'assistant', recordText, completionTokens);
     try {
       this.store.usage.record(settings.llm.model, promptTokens, completionTokens, isPeak());
@@ -352,6 +402,7 @@ export class Engine implements EnginePort {
       user: ev.user_id ?? 0,
       segments: segs.length,
       images: picked.length,
+      seen_images: images.length,
       first_token: `${res.firstTokenMs}ms`,
     });
 

@@ -513,7 +513,8 @@
     ]).then(([s, pool]) => {
       if (!$('#set-body')) return; // 用户已经切走
       const imgDir = pool.dir || '';
-      const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {};
+      const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {},
+            vis = s.vision || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
@@ -662,6 +663,25 @@
         </div>
 
         <div class="card">
+          <h3>图片识别 <span class="hint">用户发来的图直接交给模型看</span></h3>
+          <label class="check">
+            <input type="checkbox" id="f-vision" ${(vis.enabled !== false ? 'checked' : '')}>
+            <span>识别用户发来的图片
+              <span class="note">开启后，@ 或私聊里的图片会下载下来随消息一起发给模型，
+              需要模型支持图片输入（默认的 deepseek-flash 支持）。下载失败、单张超过 5MB、单条合计超过 8MB
+              或不是真图片的会被跳过，这条消息按纯文字处理，不会因此不回复。用的是纯文字模型就把它关掉。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>单条消息最多看几张</label>
+              <input type="number" id="f-vision-max" min="1" max="4" value="${vis.max_images ?? 4}">
+              <div class="note">每张图都要花 token；表情包刷屏时这个上限就是成本的闸。多出来的图不会下载。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>上下文</h3>
           <div class="grid c2">
             <div class="field">
@@ -724,6 +744,10 @@
                 images: {
                   enabled: $('#f-img').checked,
                   max_per_reply: Number($('#f-img-max').value),
+                },
+                vision: {
+                  enabled: $('#f-vision').checked,
+                  max_images: Number($('#f-vision-max').value),
                 },
               },
             });

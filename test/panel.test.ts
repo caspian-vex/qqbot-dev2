@@ -514,6 +514,7 @@ describe('设置接口', () => {
         [{ bot: { whitelist_groups: ['30000'] } }, '群白名单只能填正整数群号'],
         [{ bot: { blacklist_users: ['20000'] } }, '用户黑名单只能填正整数 QQ 号'],
         [{ bot: { wake_words: [123] } }, '唤醒词只能是文本'],
+        [{ vision: { max_images: 5 } }, '单条消息识图上限应在 1-4 张之间'],
       ];
       for (const [body, msg] of cases) {
         const res = await put(body);

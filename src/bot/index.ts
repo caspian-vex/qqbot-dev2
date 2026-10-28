@@ -28,5 +28,19 @@ export {
   type PoolTag,
 } from './imagepool';
 export { decide, matchWakeWord, stripWakeWords, type Decision } from './filter';
+export {
+  VISION_HINT,
+  VISION_MAX_BYTES,
+  VISION_MAX_IMAGES,
+  VISION_ONLY_PROMPT,
+  VISION_TIMEOUT_MS,
+  imageMarker,
+  imageRefs,
+  loadImage,
+  loadImages,
+  pickSource,
+  type ImageRef,
+  type LoadOptions,
+} from './vision';
 export { split, stripMarkdown, truncate, defaultSplit, type SplitOptions } from './split';
 export { Cooldown, Dedupe, TaskQueue } from './queue';

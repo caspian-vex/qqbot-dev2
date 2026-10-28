@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { Engine, type Sender } from '../src/bot';
-import type { LlmClient, Result } from '../src/llm/client';
+import { contentText, type LlmClient, type Message as LlmMessage, type Result } from '../src/llm/client';
 import { Logger } from '../src/log/logger';
 import type { Event, Segment } from '../src/onebot/types';
 import { Store } from '../src/store';
@@ -46,7 +46,7 @@ function makeHarness(opts: {
   patch?: (v: Settings) => void;
   reply?: string;
   echo?: string;
-  llm?: (msgs: { role: string; content: string }[]) => Promise<Result>;
+  llm?: (msgs: LlmMessage[]) => Promise<Result>;
 } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-engine-'));
   tmpDirs.push(dir);
@@ -75,9 +75,9 @@ function makeHarness(opts: {
   };
 
   const llm = {
-    chat: async (_cfg: unknown, msgs: { role: string; content: string }[]) => {
+    chat: async (_cfg: unknown, msgs: LlmMessage[]) => {
       if (opts.llm) return opts.llm(msgs);
-      const last = msgs[msgs.length - 1]!.content;
+      const last = contentText(msgs[msgs.length - 1]!.content);
       const isEcho = last.includes('内部指令');
       return {
         content: isEcho ? (opts.echo ?? '对了，后来呢？') : (opts.reply ?? '第一句。第二句。'),
@@ -225,6 +225,130 @@ describe('跨会话并发上限', () => {
       h.engine.handleEvent(privateEv(20002, 2));
       await waitFor(() => h.sent.length >= 2);
       assert.equal(peak, 2, '两个不同会话应该并行');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('图片识别（引擎接线）', () => {
+  /** 1×1 PNG：文件头是真的，取图链路能一路走通，不需要网络。 */
+  const PNG_B64 =
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+
+  function imageEv(segs: Segment[]): Event {
+    return groupEv({
+      message: [
+        { type: 'at', data: { qq: '10000' } },
+        ...segs,
+        { type: 'image', data: { file: `base64://${PNG_B64}` } },
+      ],
+    });
+  }
+
+  const result = (content: string): Result => ({
+    content,
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    firstTokenMs: 1,
+  });
+
+  it('发图时模型收到 image_url 块，历史里只记张数', async () => {
+    let got: LlmMessage[] = [];
+    const h = makeHarness({
+      llm: async (msgs) => {
+        got = msgs;
+        return result('这图不错。');
+      },
+    });
+    try {
+      h.engine.handleEvent(imageEv([{ type: 'text', data: { text: '这是什么' } }]));
+      await waitFor(() => h.sent.length >= 1);
+
+      const last = got[got.length - 1]!;
+      assert.equal(last.role, 'user');
+      assert.ok(Array.isArray(last.content), '带图时必须升级成内容块数组');
+      const parts = last.content as { type: string; text?: string; image_url?: { url: string } }[];
+      assert.ok(
+        parts.some(
+          (p) => p.type === 'image_url' && p.image_url!.url.startsWith('data:image/png;base64,'),
+        ),
+        '应该有一个 png 的 data URL',
+      );
+      assert.ok(parts.some((p) => p.type === 'text' && p.text === '这是什么'), '文字要保留');
+      assert.ok(
+        contentText(got[0]!.content).includes('结合图片内容回应'),
+        '带图时系统提示要补上看图约束',
+      );
+
+      // 历史里绝不能出现 base64：库会几天涨到 GB
+      const userRow = h.store.sessions
+        .recent('group:30000', 10)
+        .filter((m) => m.role === 'user')
+        .pop()!;
+      assert.equal(userRow.content, '这是什么（附图 1 张）');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('只发图不打字：照样问模型，而不是回「在的，怎么了？」', async () => {
+    let last = '';
+    const h = makeHarness({
+      llm: async (msgs) => {
+        last = contentText(msgs[msgs.length - 1]!.content);
+        return result('看到一只猫。');
+      },
+    });
+    try {
+      h.engine.handleEvent(imageEv([]));
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(last.includes('只发了图片'), `应给模型一句说明，实际: ${last}`);
+      const text = textOf(h.sent[0]!.segs);
+      assert.ok(!text.includes('在的'), '有图就不该走"只 @ 了一下"的兜底');
+      assert.ok(text.includes('猫'));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('图一张都没加载出来时直说，不装作没看见', async () => {
+    const h = makeHarness({ llm: async () => result('不该走到模型') });
+    try {
+      // 只有图没有文字，且 base64 是空的 → 取不到任何图
+      h.engine.handleEvent(
+        groupEv({
+          message: [
+            { type: 'at', data: { qq: '10000' } },
+            { type: 'image', data: { file: 'base64://' } },
+          ],
+        }),
+      );
+      await waitFor(() => h.sent.length >= 1);
+      const text = textOf(h.sent[0]!.segs);
+      assert.ok(text.includes('没加载出来'), `应告诉用户图没取到，实际: ${text}`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('关掉开关后退化成纯文字，图片段被忽略', async () => {
+    let got: LlmMessage[] = [];
+    const h = makeHarness({
+      patch: (v) => (v.vision.enabled = false),
+      llm: async (msgs) => {
+        got = msgs;
+        return result('好的。');
+      },
+    });
+    try {
+      h.engine.handleEvent(imageEv([{ type: 'text', data: { text: '看图' } }]));
+      await waitFor(() => h.sent.length >= 1);
+      const last = got[got.length - 1]!;
+      assert.equal(last.content, '看图', '关掉后不该出现内容块数组');
+      assert.ok(
+        !contentText(got[0]!.content).includes('结合图片内容回应'),
+        '没带图就不该注入看图约束',
+      );
     } finally {
       h.cleanup();
     }
