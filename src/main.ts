@@ -4,7 +4,7 @@
 // 为什么保留这么多子命令：容器里只有这一个二进制，没有 sqlite3、
 // 没有 jq、没有 curl。任何运维动作都必须由它自己提供，
 // 否则用户遇到问题就只剩"删库重装"一条路。
-import { existsSync, statSync, statfsSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, statfsSync } from 'node:fs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -131,13 +131,21 @@ async function cmdRun(argv: string[]): Promise<void> {
   const store = new Store(dbPath);
   store.setBox(box);
 
+  // 图池目录：放图进去机器人就有图可发，删掉目录等于清空池子
+  const imagesDir = join(config.dataDir, 'images');
+  try {
+    mkdirSync(imagesDir, { recursive: true });
+  } catch (e) {
+    log.warn('图池目录创建失败，图池功能不可用', { dir: imagesDir, err: e });
+  }
+
   const ac = new AbortController();
 
   try {
     await ensureAdminPassword(store, log);
 
     const token = secrets['QQBOT_ONEBOT_TOKEN'] ?? config.onebot.accessToken;
-    const engine = new Engine({ store, log, signal: ac.signal });
+    const engine = new Engine({ store, log, signal: ac.signal, imagesDir });
     const client = new Client(config.onebot.url, token, log);
 
     // 引擎与客户端互相注入：先建引擎再建客户端，然后回填，避免循环依赖
@@ -166,6 +174,7 @@ async function cmdRun(argv: string[]): Promise<void> {
       qq,
       // 登录成功后自动补齐这条反向 WS，省掉「去网络页点一下」的手工步骤
       onebotPort: onebotPortOf(config.onebot.url),
+      imagesDir,
       version: versionString(),
     });
 

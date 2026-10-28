@@ -9,8 +9,16 @@ import type { Settings } from '../store/types';
 import { sessionId } from '../store/types';
 import { isPeak, localDay, rfc3339, ZERO_TIME } from '../util/time';
 import type { Event, Segment } from '../onebot/types';
-import { at, isGroup, isMessage, isPrivate, reply, text } from '../onebot/types';
+import { at, image, isGroup, isMessage, isPrivate, reply, text } from '../onebot/types';
 import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
+import {
+  dedupeKeepOrder,
+  extractImageTags,
+  imagePromptBlock,
+  imageUri,
+  listImages,
+  pickImage,
+} from './imagepool';
 import { decide, type Decision } from './filter';
 import { Cooldown, Dedupe, TaskQueue } from './queue';
 import { split, stripMarkdown } from './split';
@@ -28,6 +36,8 @@ export interface EngineOptions {
   log: Logger;
   llm?: LlmClient;
   signal?: AbortSignal;
+  /** 图池目录（数据目录下的 images/）。空串或未传时图池功能整体关闭。 */
+  imagesDir?: string;
 }
 
 interface Counters {
@@ -52,6 +62,7 @@ export class Engine implements EnginePort {
   private readonly log: Logger;
   private readonly llm: LlmClient;
   private readonly ctx: ContextManager;
+  private readonly imagesDir: string;
   private sender: Sender | null = null;
 
   private readonly dedupe = new Dedupe(5 * 60_000);
@@ -85,6 +96,7 @@ export class Engine implements EnginePort {
     this.log = opt.log.with({ component: 'bot' });
     this.llm = opt.llm ?? new LlmClient();
     this.ctx = new ContextManager(opt.store);
+    this.imagesDir = opt.imagesDir ?? '';
     // 退出时拆掉所有未执行的跟进，别让进程死前还发一条消息
     opt.signal?.addEventListener('abort', () => this.cancelAllEchoes(), { once: true });
   }
@@ -218,7 +230,16 @@ export class Engine implements EnginePort {
       nickname: displayOf(ev),
       groupName: await this.groupName(ev.group_id ?? 0),
     };
-    const system = buildSystem(expand(personaPrompt, vars), vars);
+    let system = buildSystem(expand(personaPrompt, vars), vars);
+
+    // 图池开着且池里有图时，把文件名清单告诉模型，让它自己决定配不配图。
+    // 池子为空就不注入：给一个空清单只会诱导模型编造文件名。
+    if (settings.images.enabled && this.imagesDir !== '') {
+      const files = listImages(this.imagesDir);
+      if (files.length > 0) {
+        system += `\n${imagePromptBlock(files, Math.max(1, settings.images.max_per_reply))}`;
+      }
+    }
 
     const sid = sessionId(kindOf(ev), targetOf(ev));
     try {
@@ -256,23 +277,41 @@ export class Engine implements EnginePort {
       return;
     }
 
-    const replyText = stripMarkdown(res.content);
-    if (replyText === '') {
+    const stripped = stripMarkdown(res.content);
+    const { text: bodyText, tags } = extractImageTags(stripped);
+
+    // 选图：模型点名的文件逐一在池子里对号，越界的直接丢。
+    // 池子关着时也照剥不误——标记是给引擎的内部协议，
+    // 绝不能原样出现在聊天里。
+    let picked: string[] = [];
+    if (settings.images.enabled && this.imagesDir !== '' && tags.length > 0) {
+      const files = listImages(this.imagesDir);
+      picked = dedupeKeepOrder(
+        tags.map((t) => pickImage(t, files)).filter((f): f is string => f !== null),
+      ).slice(0, Math.max(1, settings.images.max_per_reply));
+    }
+
+    const replyText = bodyText;
+    if (replyText === '' && picked.length === 0) {
       this.log.warn('模型返回空文本');
       this.counters.errors++;
       return;
     }
 
-    // 先落库再发送：即便发送失败，上下文也是连贯的
+    // 先落库再发送：即便发送失败，上下文也是连贯的。
+    // 发过图要补记成一句备注，否则下一轮模型不知道自己发过什么。
+    const recordText =
+      picked.length > 0 ? `${replyText}\n（发了一张图：${picked.join('、')}）` : replyText;
+
     let promptTokens = res.usage.prompt_tokens;
     if (promptTokens === 0) {
       for (const m of msgs) promptTokens += estimateTokens(m.content);
     }
     let completionTokens = res.usage.completion_tokens;
-    if (completionTokens === 0) completionTokens = estimateTokens(replyText);
+    if (completionTokens === 0) completionTokens = estimateTokens(recordText);
 
     this.ctx.record(sid, 'user', userText, estimateTokens(userText));
-    this.ctx.record(sid, 'assistant', replyText, completionTokens);
+    this.ctx.record(sid, 'assistant', recordText, completionTokens);
     try {
       this.store.usage.record(settings.llm.model, promptTokens, completionTokens, isPeak());
     } catch (e) {
@@ -283,10 +322,11 @@ export class Engine implements EnginePort {
       maxSegments: settings.bot.max_segments,
       maxRunes: 120,
     });
-    if (segs.length === 0) return;
 
     try {
-      await this.sendText(ev, segs);
+      if (segs.length > 0) await this.sendText(ev, segs);
+      // 图片跟在文字后面：先说话再甩图，符合真人"配图"的节奏
+      if (picked.length > 0) await this.sendImages(ev, picked);
     } catch (e) {
       this.log.error('发送回复失败', { err: e });
       this.counters.errors++;
@@ -299,6 +339,7 @@ export class Engine implements EnginePort {
       group: ev.group_id ?? 0,
       user: ev.user_id ?? 0,
       segments: segs.length,
+      images: picked.length,
       first_token: `${res.firstTokenMs}ms`,
     });
 
@@ -500,6 +541,21 @@ export class Engine implements EnginePort {
       }
     }
     return lastId;
+  }
+
+  /**
+   * 发送图池里的图片：一条消息带全部 image 段，跟在文字后面。
+   *
+   * 文件名来自 pickImage 的白名单匹配，这里不再二次校验；
+   * file:// URI 由 pathToFileURL 生成，Windows 盘符也能拼对。
+   */
+  private async sendImages(ev: Event, names: string[]): Promise<void> {
+    const sender = this.sender;
+    if (!sender) throw new Error('协议端未连接');
+    if (names.length === 0 || this.imagesDir === '') return;
+    const parts: Segment[] = names.map((n) => image(imageUri(this.imagesDir, n)));
+    if (isGroup(ev)) await sender.sendGroup(ev.group_id ?? 0, parts, this.opt.signal);
+    else await sender.sendPrivate(ev.user_id ?? 0, parts, this.opt.signal);
   }
 
   /**

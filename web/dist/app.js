@@ -505,9 +505,14 @@
       <div class="desc">模型接入与触发规则，保存后立即生效</div></div></div>
       <div id="set-body"><div class="empty">加载中…</div></div>`;
 
-    api('/api/settings').then((s) => {
+    Promise.all([
+      api('/api/settings'),
+      // 图池接口失败不挡设置页：目录还没建时按空池子处理
+      api('/api/images').catch(() => ({ dir: '', items: [] })),
+    ]).then(([s, pool]) => {
       if (!$('#set-body')) return; // 用户已经切走
-      const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {};
+      const imgDir = pool.dir || '';
+      const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
@@ -629,6 +634,33 @@
         </div>
 
         <div class="card">
+          <h3>图池 <span class="hint">把图片放进数据目录的 images/ 文件夹，机器人自己决定何时配图</span></h3>
+          <label class="check">
+            <input type="checkbox" id="f-img" ${(img.enabled ? 'checked' : '')}>
+            <span>允许机器人发图
+              <span class="note">开启后图池清单会注入系统提示，模型觉得合适就在回复里带一张。
+              它有权不发；图池为空时这个开关没有效果。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>单条回复最多发几张</label>
+              <input type="number" id="f-img-max" min="1" max="3" value="${img.max_per_reply ?? 1}">
+              <div class="note">模型点了更多图也只发前几张；1 张最稳妥。</div>
+            </div>
+            <div class="field">
+              <label>图池目录</label>
+              <input type="text" id="f-img-dir" value="${esc(imgDir)}" readonly>
+              <div class="note">往这个文件夹放 jpg/png/gif/webp 图片即可，改完无需重启。</div>
+            </div>
+          </div>
+          <div class="field">
+            <label>池内文件</label>
+            <div id="f-imglist" class="note">加载中…</div>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>上下文</h3>
           <div class="grid c2">
             <div class="field">
@@ -688,6 +720,10 @@
                   echo_cooldown_min: Number($('#f-echo-cd').value),
                   echo_daily_limit: Number($('#f-echo-limit').value),
                 },
+                images: {
+                  enabled: $('#f-img').checked,
+                  max_per_reply: Number($('#f-img-max').value),
+                },
               },
             });
             ok('设置已保存');
@@ -698,6 +734,15 @@
           }
         },
       });
+
+      // 池内文件清单（纯展示，上传/删除直接操作目录即可）
+      const list = pool.items || [];
+      const listBox = $('#f-imglist');
+      if (listBox) {
+        listBox.textContent = list.length === 0
+          ? '（空）——往上面的目录放几张图，机器人就有图可发了'
+          : list.map((f) => `${f.name}（${Math.max(1, Math.round(f.size / 1024))} KB）`).join('、');
+      }
     }).catch(errInto('#set-body'));
   }
 
