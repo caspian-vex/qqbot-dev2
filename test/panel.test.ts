@@ -14,6 +14,7 @@ import { after, describe, it } from 'node:test';
 import { LogHub } from '../src/log/hub';
 import { Logger } from '../src/log/logger';
 import { hashPassword, newTOTPSecret, totpCode, verifyPassword } from '../src/panel/auth';
+import { normalizeUsername } from '../src/panel/api';
 import { assignOnto, encodeJSON } from '../src/panel/http';
 import { PanelServer, splitHostPort as splitHostPortForTest } from '../src/panel/server';
 import { Store } from '../src/store';
@@ -796,6 +797,118 @@ describe('密码与 TOTP 管理接口', () => {
       assert.equal(off.status, 200);
       assert.equal(h.store.settings.get().panel.totp_enabled, false);
       assert.equal(h.store.settings.get().panel.totp_secret, '');
+    } finally {
+      await h.stop();
+    }
+  });
+});
+
+describe('用户名修改', () => {
+  /** 用指定名字登录（login() 里写死了 admin）。 */
+  const loginAs = (h: Harness, username: string, password = PASSWORD): Promise<Response> =>
+    fetch(`${h.base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+
+  const rename = (h: Harness, c: Cookies, payload: unknown): Promise<Response> =>
+    fetch(`${h.base}/api/auth/username`, {
+      method: 'POST',
+      headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+      body: JSON.stringify(payload),
+    });
+
+  it('规范化：去空白、按码点算长度、挡掉危险的字符', () => {
+    assert.equal(normalizeUsername('  alice  '), 'alice');
+    assert.equal(normalizeUsername('阿绫'), '阿绫');
+    // emoji 是代理对，按 UTF-16 长度会被误判成 2 个字符
+    assert.equal(normalizeUsername('ab😀'), 'ab😀');
+
+    assert.throws(() => normalizeUsername('   '), /用户名不能为空/);
+    assert.throws(() => normalizeUsername('a'), /2-32/);
+    assert.throws(() => normalizeUsername('x'.repeat(33)), /2-32/);
+    assert.throws(() => normalizeUsername('a b'), /不能包含空格/);
+    assert.throws(() => normalizeUsername('a\u0000b'), /不可见字符/);
+    assert.throws(() => normalizeUsername('a/b'), /不能包含/);
+    assert.throws(() => normalizeUsername('a:b'), /不能包含/);
+  });
+
+  it('需要 CSRF 令牌', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await fetch(`${h.base}/api/auth/username`, {
+        method: 'POST',
+        headers: { Cookie: c.header, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'alice', password: PASSWORD }),
+      });
+      assert.equal(res.status, 403);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('密码错被拒，用户名不变', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await rename(h, c, { name: 'alice', password: 'not-the-password' });
+      assert.equal(res.status, 401);
+      assert.deepEqual(await res.json(), { error: '当前密码错误' });
+      assert.equal(h.store.settings.get().panel.admin_user, 'admin');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('改成同名被拒', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await rename(h, c, { name: 'admin', password: PASSWORD });
+      assert.equal(res.status, 400);
+      assert.deepEqual(await res.json(), { error: '新用户名与当前相同' });
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('改名成功：旧名登录失效、新名可登录、当前会话不用重登', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await rename(h, c, { name: 'alice', password: PASSWORD });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ok: true, user: 'alice' });
+      assert.equal(h.store.settings.get().panel.admin_user, 'alice');
+
+      // 会话里的 user 是快照，改名时必须一起换，否则侧栏一直显示旧名
+      const st = await fetch(`${h.base}/api/auth/status`, { headers: { Cookie: c.header } });
+      assert.equal(st.status, 200);
+      assert.equal(((await st.json()) as { user: string }).user, 'alice');
+
+      assert.equal((await loginAs(h, 'admin')).status, 401);
+      assert.equal((await loginAs(h, 'alice')).status, 200);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('中文用户名可用，otpauth 标签被正确转义', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await rename(h, c, { name: '名字', password: PASSWORD });
+      assert.equal(res.status, 200);
+
+      const setup = await fetch(`${h.base}/api/auth/totp/setup`, {
+        method: 'POST',
+        headers: { Cookie: c.header, 'X-CSRF-Token': c.csrf },
+      });
+      const data = (await setup.json()) as { url: string };
+      // 非 ASCII 不转义的话，验证器里会显示成乱码标签
+      assert.match(data.url, /^otpauth:\/\/totp\/qqbot:%E5%90%8D%E5%AD%97\?/);
     } finally {
       await h.stop();
     }

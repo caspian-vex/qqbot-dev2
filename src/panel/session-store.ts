@@ -62,6 +62,20 @@ export class SessionStore {
     this.sessions.delete(tokenDigest(token));
   }
 
+  /**
+   * 改名时同步已有会话。
+   *
+   * 会话里的 user 是登录那一刻的快照：不同步的话，改完用户名后
+   * `/api/auth/status` 还会回旧名字，侧栏也一直显示旧的，
+   * 看着像没改成功。只换名字、不动令牌与过期时间——
+   * 改名不该把其他设备踢下线（同一账号只有一个用户）。
+   */
+  renameUser(from: string, to: string): void {
+    for (const s of this.sessions.values()) {
+      if (s.user === from) s.user = to;
+    }
+  }
+
   /** 当前会话数（诊断用）。 */
   get size(): number {
     return this.sessions.size;

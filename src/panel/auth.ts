@@ -331,9 +331,10 @@ export function totpProvisioningURL(issuer: string, account: string, secret: str
   );
 }
 
-/** 极简转义：issuer/account 只会有字母数字和少量符号。 */
+/** 极简转义：issuer/account 现在允许中文，交给 encodeURIComponent 处理。 */
 function urlEscape(s: string): string {
-  return s.replace(/ /g, '%20').replace(/:/g, '%3A').replace(/\//g, '%2F').replace(/@/g, '%40');
+  // 不能用原来的手工替换：用户名可以含中文，未编码的非 ASCII 在部分验证器里会变成乱码标签
+  return encodeURIComponent(s);
 }
 
 // ---- 令牌 ----

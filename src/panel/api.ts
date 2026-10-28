@@ -163,6 +163,24 @@ function validateSettings(v: Settings): void {
   }
 }
 
+/**
+ * 用户名规范化 + 校验，返回可直接落库的名字。
+ *
+ * 为什么要限制字符：用户名会进 TOTP 的 otpauth 标签、审计日志和登录框，
+ * 夹带空格/控制字符时前后空白看不见，用户会以为自己记错了名字。
+ * 中文放行（按码点算长度），只挡真正会出问题的字符。
+ */
+export function normalizeUsername(raw: string): string {
+  const name = raw.trim();
+  if (name === '') throw new HttpError(400, '用户名不能为空');
+  const len = [...name].length;
+  if (len < 2 || len > 32) throw new HttpError(400, '用户名长度应在 2-32 个字符之间');
+  if (/\s/.test(name)) throw new HttpError(400, '用户名不能包含空格');
+  if (/[\u0000-\u001f\u007f]/.test(name)) throw new HttpError(400, '用户名包含不可见字符');
+  if (/[/\\:?#%]/.test(name)) throw new HttpError(400, '用户名不能包含 / \\ : ? # % 这些符号');
+  return name;
+}
+
 export class Api {
   /**
    * 自动补齐反向 WS 的状态。
@@ -311,6 +329,45 @@ export class Api {
     }
     this.store.audit.record('password.changed', sess.user, clientIP(ctx.req));
     writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  /**
+   * 改登录用户名。
+   *
+   * 要求输入当前密码：会话被盗时，改名是"把主人挡在门外"的第一步，
+   * 代价不该只有一次点击。改完不踢当前会话（也不踢其他设备），
+   * 只是把会话里的用户名快照一起换掉。
+   */
+  async changeUsername(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 4096)) as { name?: unknown; password?: unknown };
+    const rawName = typeof req.name === 'string' ? req.name : '';
+    const password = typeof req.password === 'string' ? req.password : '';
+
+    const name = normalizeUsername(rawName);
+    const settings = this.settings();
+    const current = settings.panel.admin_user === '' ? 'admin' : settings.panel.admin_user;
+    if (name === current) throw new HttpError(400, '新用户名与当前相同');
+
+    if (
+      settings.panel.password_hash !== '' &&
+      !(await verifyPassword(password, settings.panel.password_hash))
+    ) {
+      throw new HttpError(401, '当前密码错误');
+    }
+
+    try {
+      this.store.settings.update((v) => {
+        v.panel.admin_user = name;
+      });
+    } catch (e) {
+      this.d.log.error('保存用户名失败', { err: e });
+      throw new HttpError(500, '保存失败');
+    }
+
+    // 会话里的 user 是登录时的快照，不跟着改的话侧栏和 /api/auth/status 还是旧名
+    this.d.sessions.renameUser(current, name);
+    this.store.audit.record('username.changed', `${current} → ${name}`, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true, user: name });
   }
 
   totpSetup(ctx: ReqCtx): void {

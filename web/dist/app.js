@@ -82,7 +82,7 @@
   const app = { user: null, totp: false };
 
   async function api(path, opts = {}) {
-    const { method = 'GET', body } = opts;
+    const { method = 'GET', body, keepSession = false } = opts;
     const headers = {};
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (method !== 'GET') headers['X-CSRF-Token'] = cookie('qqbot_csrf');
@@ -107,7 +107,8 @@
 
     if (!res.ok) {
       // 会话过期：直接回登录页，不要让用户对着一堆报错猜
-      if (res.status === 401 && app.user) {
+      // keepSession：改密码/改用户名时密码输错也是 401，那种情况不该把人踢出去
+      if (res.status === 401 && app.user && !keepSession) {
         app.user = null;
         renderLogin();
       }
@@ -314,7 +315,7 @@
           ).join('')}
           <div class="side-foot">
             ${themePickHTML()}
-            <div style="margin:8px 0 6px">${esc(app.user || '')}</div>
+            <div id="side-user" style="margin:8px 0 6px">${esc(app.user || '')}</div>
             <a href="#/" data-act="logout" style="color:var(--fg-dim)">退出登录</a>
           </div>
         </aside>
@@ -903,6 +904,19 @@
       </div>
 
       <div class="card">
+        <h3>账户名 <span class="hint">登录面板时使用</span></h3>
+        <div class="grid c2">
+          <div class="field"><label>新用户名</label>
+            <input type="text" id="ac-name" autocomplete="username" value="${esc(app.user || '')}" maxlength="32">
+            <div class="note">2–32 个字符，不能含空格，也不能含 / \ : ? # %。</div></div>
+          <div class="field"><label>当前密码</label>
+            <input type="password" id="ac-name-pw" autocomplete="current-password">
+            <div class="note">改的是登录身份，需要确认是本人操作。</div></div>
+        </div>
+        <button class="btn" data-act="name">更新用户名</button>
+      </div>
+
+      <div class="card">
         <h3>修改密码</h3>
         <div class="grid c3">
           <div class="field"><label>原密码</label><input type="password" id="ac-old" autocomplete="current-password"></div>
@@ -944,6 +958,32 @@
     };
 
     bindActions(el, {
+      name: async (btn) => {
+        const name = $('#ac-name').value.trim();
+        const pw = $('#ac-name-pw').value;
+        if (name === (app.user || '')) return bad('新用户名与当前相同');
+        btn.disabled = true;
+        try {
+          // 密码错时服务端回 401：这个 401 是"当前密码错"，不是会话过期，
+          // 见 api() 的 keepSession —— 否则输错一次就被踢回登录页。
+          const d = await api('/api/auth/username', {
+            method: 'POST',
+            body: { name, password: pw },
+            keepSession: true,
+          });
+          app.user = d.user;
+          const side = $('#side-user');
+          if (side) side.textContent = d.user;
+          $('#ac-name').value = d.user;
+          $('#ac-name-pw').value = '';
+          ok('用户名已更新，下次登录请用新用户名');
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+
       pw: async (btn) => {
         const oldPw = $('#ac-old').value;
         const n1 = $('#ac-new').value;
@@ -952,7 +992,11 @@
         if (n1 !== n2) return bad('两次输入的新密码不一致');
         btn.disabled = true;
         try {
-          await api('/api/auth/password', { method: 'POST', body: { old: oldPw, new: n1 } });
+          await api('/api/auth/password', {
+            method: 'POST',
+            body: { old: oldPw, new: n1 },
+            keepSession: true,
+          });
           ok('密码已更新');
           $('#ac-old').value = $('#ac-new').value = $('#ac-new2').value = '';
         } catch (e) {

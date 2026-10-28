@@ -86,6 +86,7 @@ export class PanelServer {
     r.add('POST', '/api/auth/logout', this.wrap((c, s) => a.logout(c, s), false));
     r.add('GET', '/api/auth/status', this.wrap((c, s) => a.authStatus(c, s), false));
     r.add('POST', '/api/auth/password', this.wrap((c, s) => a.changePassword(c, s), true));
+    r.add('POST', '/api/auth/username', this.wrap((c, s) => a.changeUsername(c, s), true));
     r.add('POST', '/api/auth/totp/setup', this.wrap((c) => a.totpSetup(c), true));
     r.add('POST', '/api/auth/totp/enable', this.wrap((c, s) => a.totpEnable(c, s), true));
     r.add('POST', '/api/auth/totp/disable', this.wrap((c, s) => a.totpDisable(c, s), true));
