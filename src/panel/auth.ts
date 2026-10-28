@@ -308,6 +308,11 @@ export function totpCode(secret: string, at: Date = new Date()): string {
 export function verifyTOTP(secret: string, code: string): boolean {
   const c = code.trim();
   if (c.length !== 6) return false;
+  // 空密钥必须直接判负：HMAC 接受空 key，会算出一个"稳定合法"的 6 位码。
+  // 万一库里出现 enabled=true + secret='' 的脏状态（手工改库、迁移中断），
+  // 不拦这一下就等于两步验证彻底失效。
+  if (secret.trim() === '') return false;
+
   const now = Date.now();
   for (const delta of [0, -30_000, 30_000]) {
     let want: string;

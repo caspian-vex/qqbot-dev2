@@ -261,12 +261,47 @@ export function appendCookie(res: ServerResponse, cookie: string): void {
 // ---- 客户端 IP ----
 
 /**
+ * 直连对端是否属于「自己人」：回环、私网、容器网桥。
+ *
+ * 只有这种对端才可能是反向代理。公网直连时它的 IP 就是真实客户端，
+ * 转发头一律不采信——否则谁都能拿 X-Forwarded-For 换一个身份，
+ * 登录限流按 IP 分桶就形同虚设（每次换一个头就是一次新尝试），
+ * 审计日志里的来源也会变成攻击者随手写的东西。
+ */
+function isPrivatePeer(addr: string): boolean {
+  if (addr === '') return false;
+  if (addr === '::1' || addr === '127.0.0.1') return true;
+
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(addr);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 127 || a === 10) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 169 && b === 254) return true; // link-local（含 docker 网关）
+    return false;
+  }
+
+  // IPv6：唯一本地地址 fc00::/7 与链路本地 fe80::/10
+  const lower = addr.toLowerCase();
+  return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80');
+}
+
+/**
  * 取真实客户端 IP。
  *
- * 容器部署下 req.socket.remoteAddress 永远是 docker 网桥地址，
- * 直接拿它做登录限流等于全局限流。优先取反代写入的头部。
+ * 容器部署下 req.socket.remoteAddress 是 docker 网桥地址，
+ * 直接拿它做登录限流等于全局限流，所以反代场景要取它写入的头部。
+ * 但头部是客户端可伪造的，因此只在对端确实是本机/内网时才采信
+ * （见 isPrivatePeer）：面板直接暴露在公网时，用 socket 地址。
  */
 export function clientIP(req: IncomingMessage): string {
+  const addr = req.socket.remoteAddress ?? '';
+  // IPv4 走 ::ffff:1.2.3.4 这种形式时剥掉前缀
+  const direct = addr.startsWith('::ffff:') ? addr.slice(7) : addr;
+  if (!isPrivatePeer(direct)) return direct;
+
   const cf = req.headers['cf-connecting-ip'];
   if (typeof cf === 'string' && cf !== '') return cf;
 
@@ -276,9 +311,7 @@ export function clientIP(req: IncomingMessage): string {
     return (idx > 0 ? xff.slice(0, idx) : xff).trim();
   }
 
-  const addr = req.socket.remoteAddress ?? '';
-  // IPv4 走 ::ffff:1.2.3.4 这种形式时剥掉前缀
-  return addr.startsWith('::ffff:') ? addr.slice(7) : addr;
+  return direct;
 }
 
 /** 请求是否来自 HTTPS（用于决定 cookie 要不要带 Secure）。 */

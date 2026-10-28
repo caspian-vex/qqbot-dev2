@@ -7,17 +7,17 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { after, describe, it } from 'node:test';
 import {
   UNTAGGED,
   dedupeImages,
   dedupeKeepOrder,
   extractImageTags,
+  imageBase64,
   imageLabel,
-  imageUri,
   isValidTagName,
   listPool,
+  MAX_IMAGE_BYTES,
   normalizeTagName,
   pickImage,
   poolFilePath,
@@ -340,17 +340,25 @@ describe('上传辅助', () => {
 // ---- 其它纯函数 ----
 
 describe('图池辅助函数', () => {
-  it('file:// URI 用 pathToFileURL 拼，反解回来还是原路径', () => {
-    const dir = join(tempDir(), 'images');
-    const uri = imageUri(dir, '猫.png');
+  it('图片以 base64:// 发送（协议端是另一个容器，读不到本机路径）', () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, '猫.png'), 'fake-image-bytes');
+    const data = imageBase64(dir, '猫.png');
+    assert.ok(data !== null);
+    assert.ok(data.startsWith('base64://'));
+    assert.equal(
+      Buffer.from(data.slice('base64://'.length), 'base64').toString('utf8'),
+      'fake-image-bytes',
+    );
+  });
 
-    // 反解回文件路径必须与原路径逐字相等——这一条同时覆盖 Windows 盘符
-    // 与 POSIX 绝对路径，比硬编码 "file:///" + dir 靠谱：后者在 Linux 上
-    // 会拼出四个斜杠（file:////tmp/...），CI 就是这么红的。
-    assert.equal(fileURLToPath(uri), join(dir, '猫.png'));
-    // 中文必须百分号编码，否则 QQ 客户端那边会拿到一个坏路径
-    assert.ok(uri.endsWith('/%E7%8C%AB.png'), uri);
-    assert.ok(!uri.startsWith('file:////'), `不能出现四个斜杠：${uri}`);
+  it('文件不存在、空文件、超限都返回 null 而不是抛错', () => {
+    const dir = tempDir();
+    assert.equal(imageBase64(dir, '没有这张.png'), null);
+    writeFileSync(join(dir, '空.png'), '');
+    assert.equal(imageBase64(dir, '空.png'), null);
+    assert.equal(imageBase64('', '猫.png'), null);
+    assert.ok(MAX_IMAGE_BYTES > 0);
   });
 
   it('去重保序', () => {
@@ -461,7 +469,10 @@ describe('引擎发图链路', () => {
     const imgCall = h.sent[1]!;
     assert.equal(imgCall.segs.length, 1);
     assert.equal(imgCall.segs[0]!.type, 'image');
-    assert.ok(String(imgCall.segs[0]!.data['file']).startsWith('file://'), '图片用 file:// URI 发送');
+    assert.ok(
+      String(imgCall.segs[0]!.data['file']).startsWith('base64://'),
+      '图片要用 base64:// 发送，不能是只有本机才有的绝对路径',
+    );
 
     const history = h.store.sessions.recent(h.sid, 5);
     const last = history[history.length - 1]!;
@@ -479,8 +490,13 @@ describe('引擎发图链路', () => {
 
     assert.equal(h.sent.length, 2, '文字一条、图片一条');
     const file = String(h.sent[1]!.segs[0]!.data['file']);
-    assert.ok(file.includes('funny'), `应指向 funny 目录：${file}`);
-    assert.ok(file.endsWith('meme.png'), file);
+    assert.ok(file.startsWith('base64://'), file);
+    // 走 base64 之后 URI 里看不到目录，只能靠文件内容确认挑中的是 funny/meme.png
+    assert.equal(
+      Buffer.from(file.slice('base64://'.length), 'base64').toString('utf8'),
+      'fake-image-bytes',
+      '发出去的应是 funny 目录里那张图的内容',
+    );
 
     const history = h.store.sessions.recent(h.sid, 5);
     const last = history[history.length - 1]!;

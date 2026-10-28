@@ -110,6 +110,7 @@ wait_ready() {
 }
 
 cmd_status() {
+  local img
   echo "=== 容器 ==="
   dc ps
   echo
@@ -121,10 +122,13 @@ cmd_status() {
   fi
   echo
   echo "=== 版本 ==="
-  echo "镜像  qqbot:$(env_get QQBOT_VERSION)"
+  # 优先显示 etc/env 里真正的镜像引用：它才是 compose 插值的输入
+  img=$(env_get QQBOT_IMAGE)
+  echo "镜像  ${img:-$(image_for "$(env_get QQBOT_VERSION)")}"
   case "$(env_get QQBOT_BUILD_MODE)" in
-    prebuilt) echo "来源  预编译二进制（安装时下载，sha256 已校验）" ;;
-    *)        echo "来源  服务器本地构建" ;;
+    local)    echo "来源  服务器本地构建（install.sh --build）" ;;
+    prebuilt) echo "来源  预编译镜像（安装时从 GHCR 拉取）" ;;
+    *)        echo "来源  未知（旧版 install.sh 写入的 etc/env，重跑 install.sh 可补全）" ;;
   esac
   echo
   echo "=== 资源占用 ==="
@@ -148,29 +152,56 @@ cmd_logs() {
   dc logs --tail=200 $follow $svc
 }
 
-# 把源码目录同步进 $DIR/src。排除规则必须与 install.sh 保持一致。
-sync_src() {
-  local src="$1"
-  [ -f "$src/go.mod" ] || { echo "$src 不像项目根目录（找不到 go.mod）" >&2; return 1; }
-  tar czf - -C "$src" \
-      --exclude=./.git --exclude=./bin --exclude=./dist \
-      --exclude=./.devroot --exclude=./.workbuddy-ai \
-      --exclude='*.exe' --exclude='*.db' --exclude='*.db-shm' --exclude='*.db-wal' \
-      . | tar xzf - -C "$DIR/src"
+# ---- 镜像引用 ----
+#
+# etc/env 里的 QQBOT_IMAGE 是 install.sh 写进去的完整引用（带 tag），
+# 而 compose 的 image 是 ${QQBOT_IMAGE:-...:${QQBOT_VERSION}}：QQBOT_IMAGE 一旦有值，
+# QQBOT_VERSION 就不再参与插值。所以升级/回滚必须两个变量一起改，
+# 否则会出现「版本号显示新的、实际跑的还是旧镜像」。
+#
+# 同理，镜像名不是 qqbot:<tag>（那是本地构建的临时名字），
+# 直接拿 "qqbot:$tag" 去 inspect 必然找不到，回滚就永远失败。
+
+# 仓库名（不含 tag）。registry:5000/x 里的冒号不是 tag 分隔符，只看最后一段。
+image_repo() {
+  local img
+  img=$(env_get QQBOT_IMAGE)
+  [ -n "$img" ] || img="ghcr.io/caspian-vex/qqbot-dev2"
+  case "${img##*/}" in
+    *:*) echo "${img%:*}" ;;
+    *)   echo "$img" ;;
+  esac
 }
 
+# 版本号 → 完整镜像引用
+image_for() { echo "$(image_repo):${1:-latest}"; }
+
 cmd_upgrade() {
-  local old new image
+  local old old_image new image a
   old=$(env_get QQBOT_VERSION)
-  new="${1:-latest}"
+  old_image=$(env_get QQBOT_IMAGE)
+  new="latest"
+
+  # 只认版本号。别的参数必须显式拒绝：以前会把它当版本号去 pull，
+  # 报出来的是「拉取失败」，离真正的原因（参数写错了）很远。
+  for a in "$@"; do
+    case "$a" in
+      -*) echo "未知参数: $a" >&2; echo "用法: qqbot upgrade [版本号]" >&2; exit 1 ;;
+      *)  new="$a" ;;
+    esac
+  done
+
+  image=$(image_for "$new")
 
   # 拉镜像式升级：CI 已经在多架构上构建并推好，服务器只负责 pull。
   # 1 核机器上本地构建一次要几分钟，而 pull 是几十秒，这是整个方案的核心收益。
-  echo "拉取 $new …"
+  echo "拉取 $image …"
   env_set QQBOT_VERSION "$new"
+  env_set QQBOT_IMAGE "$image"
   if ! dc pull qqbot; then
-    echo "拉取失败，版本号回滚为 $old" >&2
+    echo "拉取失败，版本号回滚为 ${old:-latest}" >&2
     env_set QQBOT_VERSION "$old"
+    env_set QQBOT_IMAGE "$old_image"
     exit 1
   fi
 
@@ -180,7 +211,7 @@ cmd_upgrade() {
     # 镜像换了，CLI 也要跟着换，否则新增子命令不会生效。
     # 用 mv 原子替换而不是直接覆盖：当前脚本正被 bash 读取，
     # 覆盖同一个文件可能让解释器读到半新半旧的内容。
-    if [ -f "$DIR/compose.yaml" ] && command -v curl >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1; then
       if curl -fsSL "${REPO_RAW:-https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main}/deploy/qqbotctl" \
            -o /usr/local/bin/.qqbot.new 2>/dev/null && [ -s /usr/local/bin/.qqbot.new ]; then
         chmod 755 /usr/local/bin/.qqbot.new && mv -f /usr/local/bin/.qqbot.new /usr/local/bin/qqbot
@@ -188,27 +219,38 @@ cmd_upgrade() {
       fi
     fi
     echo "升级成功（当前 $new）"
-    [ "$old" != "$new" ] && [ -n "$old" ] && {
+    if [ -n "$old" ] && [ "$old" != "$new" ]; then
       echo "旧版本 $old 仍保留，回滚：sudo qqbot rollback $old"
-    }
+    fi
     return 0
   fi
 
-  echo "新版本未就绪，自动回滚到 $old" >&2
-  cmd_rollback "$old"
+  if [ -n "$old" ]; then
+    echo "新版本未就绪，自动回滚到 $old" >&2
+    cmd_rollback "$old"
+  else
+    # 没有已知的旧版本号，回滚成默认 tag 即可（env 里原本就没写死版本）
+    echo "新版本未就绪，回滚到默认版本" >&2
+    env_set QQBOT_VERSION "$old"
+    env_set QQBOT_IMAGE "$old_image"
+    dc up -d
+    wait_ready 60 || { echo "回滚后仍未就绪，手动排查：qqbot logs qqbot" >&2; exit 1; }
+  fi
 }
 
 cmd_rollback() {
-  local tag="${1:-}"
+  local tag="${1:-}" image
   if [ -z "$tag" ]; then
     echo "用法: qqbot rollback <版本号>" >&2
     echo "可用版本：" >&2
-    docker images --format '{{.Repository}}:{{.Tag}}' | grep '^qqbot:' >&2 || true
+    docker images --format '{{.Repository}}:{{.Tag}}' | grep "^$(image_repo):" >&2 || true
     exit 1
   fi
-  docker image inspect "qqbot:$tag" >/dev/null 2>&1 \
-    || { echo "镜像 qqbot:$tag 不存在（可能被 1Panel 的清理任务删了）" >&2; exit 1; }
+  image=$(image_for "$tag")
+  docker image inspect "$image" >/dev/null 2>&1 \
+    || { echo "镜像 $image 不存在（可能被 1Panel 的清理任务删了；重新拉：qqbot upgrade $tag）" >&2; exit 1; }
   env_set QQBOT_VERSION "$tag"
+  env_set QQBOT_IMAGE "$image"
   dc up -d
   if wait_ready 60; then
     echo "已回滚到 $tag"
@@ -248,13 +290,16 @@ cmd_backup() {
 cmd_restore() {
   local src="${1:-}"
   [ -f "$src" ] || { echo "用法: qqbot restore <备份文件>" >&2; exit 1; }
+  # 先验包再停服务：包坏了还先 down，等于把一个能跑的实例换成停摆的
+  tar tzf "$src" >/dev/null 2>&1 \
+    || { echo "$src 不是有效的 tar.gz，未做任何改动" >&2; exit 1; }
   echo "这会覆盖当前数据与密钥，5 秒后开始，Ctrl+C 取消…"
   sleep 5
   dc down
   tar xzf "$src" -C "$DIR"
-  # 备份里的属主信息不保留，恢复后重新对齐，否则容器写不进去
-  chown -R 10001:10001 "$DIR/data/qqbot" 2>/dev/null || true
-  chown -R 1000:1000   "$DIR/data/napcat" 2>/dev/null || true
+  # 备份里的属主信息不保留，恢复后重新对齐，否则容器写不进去。
+  # 两个容器都跑 uid 1000（见 compose 的 NAPCAT_UID 与 Dockerfile 的 node 用户）。
+  chown -R 1000:1000 "$DIR/data" 2>/dev/null || true
   dc up -d
   echo "已从 $src 恢复"
 }
@@ -290,8 +335,6 @@ cmd_reset_password() {
 
 # 打印访问地址。默认是公网 IP 直连，不需要隧道。
 cmd_url() {
-  local ip
-  ip=$(public_ip)
   cat <<EOF
 面板      $(panel_url)
          账号 admin（密码见安装结束时的输出）
@@ -299,7 +342,7 @@ cmd_url() {
 扫码登录  $(panel_url)  → 左侧「登录」页
          （NapCat WebUI 不对公网暴露，token 只在服务端使用）
 
-OneBot    ws://127.0.0.1:3001（只绑本机，不对外）
+OneBot    ws://napcat:3001（只在 compose 内网，宿主机与公网都不可达）
 EOF
 }
 
@@ -347,7 +390,7 @@ qqbot — 运维命令
   logs [-f] [服务]        查看日志（服务：qqbot / napcat）
   up / down               启动 / 停止
   restart                 重启
-  upgrade [--src <目录>]  重建镜像并切过去，失败自动回滚（走源码构建，约 2 分钟；别名 update）
+  upgrade [版本号]        拉新镜像并重启，未就绪自动回滚（默认 latest；别名 update）
   rollback <版本>         回滚到指定镜像版本
   backup                  备份数据与密钥（先停容器，保证一致性）
   restore <文件>          从备份恢复

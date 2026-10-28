@@ -172,7 +172,7 @@ function maskKey(k: string): string {
 
 function validateSettings(v: Settings): void {
   if (v.llm.base_url === '') throw new HttpError(400, '模型地址不能为空');
-  if (!v.llm.base_url.startsWith('http')) {
+  if (!/^https?:\/\//i.test(v.llm.base_url)) {
     throw new HttpError(400, '模型地址必须以 http(s):// 开头');
   }
   if (v.llm.model === '') throw new HttpError(400, '模型名称不能为空');
@@ -217,6 +217,25 @@ function validateSettings(v: Settings): void {
   if (v.images.max_per_reply < 1 || v.images.max_per_reply > 3) {
     throw new HttpError(400, '单条回复发图上限应在 1-3 张之间');
   }
+
+  // 名单类的元素类型必须一起校验。只查数组形状是不够的：
+  // 传 ["30000"] 这种字符串数组能过 assignOnto，但引擎是拿 number 去
+  // includes 的，于是白名单/黑名单静默失效——被拉黑的人照样会被回复，
+  // 这类"看起来存进去了"的失效比报错难查得多。
+  if (!v.bot.wake_words.every((w) => typeof w === 'string')) {
+    throw new HttpError(400, '唤醒词只能是文本');
+  }
+  if (!isQQList(v.bot.whitelist_groups)) {
+    throw new HttpError(400, '群白名单只能填正整数群号');
+  }
+  if (!isQQList(v.bot.blacklist_users)) {
+    throw new HttpError(400, '用户黑名单只能填正整数 QQ 号');
+  }
+}
+
+/** 群号/QQ 号列表：必须都是正整数。 */
+function isQQList(v: unknown[]): boolean {
+  return v.every((n) => typeof n === 'number' && Number.isSafeInteger(n) && n > 0);
 }
 
 /**
@@ -426,13 +445,31 @@ export class Api {
     writeJSON(ctx.res, 200, { ok: true, user: name });
   }
 
-  totpSetup(ctx: ReqCtx): void {
-    const secret = newTOTPSecret();
+  /**
+   * 生成新的 TOTP 密钥（先存下来但不启用）。
+   *
+   * 已启用两步验证时必须先交一次当前验证码：否则拿到会话的人
+   * 直接调这个接口就能把 totp_enabled 置回 false——关闭二步要验证码、
+   * 换个密钥却不要，等于把 totpDisable 的那道门从旁边绕过去了。
+   */
+  async totpSetup(ctx: ReqCtx, sess: SessionInfo): Promise<void> {
     const settings = this.settings();
+    if (settings.panel.totp_enabled) {
+      let code = '';
+      try {
+        const req = (await body(ctx, 1024)) as { code?: unknown };
+        code = typeof req.code === 'string' ? req.code : '';
+      } catch {
+        code = ''; // 没带 body 就当没给验证码，下面统一报"验证码不正确"
+      }
+      if (!verifyTOTP(settings.panel.totp_secret, code)) {
+        throw new HttpError(400, '验证码不正确');
+      }
+    }
+
+    const secret = newTOTPSecret();
     const url = totpProvisioningURL('qqbot', settings.panel.admin_user, secret);
 
-    // 先存下来但不启用：等用户提交一次正确验证码再打开，
-    // 否则用户手一抖没扫上码就把自己锁在门外了
     try {
       this.store.settings.update((v) => {
         v.panel.totp_secret = secret;
@@ -442,6 +479,7 @@ export class Api {
       this.d.log.error('保存 TOTP 密钥失败', { err: e });
       throw new HttpError(500, '保存失败');
     }
+    this.store.audit.record('totp.setup', sess.user, clientIP(ctx.req));
     writeJSON(ctx.res, 200, { secret, url });
   }
 

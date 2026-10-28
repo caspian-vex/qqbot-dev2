@@ -337,9 +337,19 @@ export class Client {
     const timeout = AbortSignal.timeout(CALL_TIMEOUT);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
+    // 调用方给的 signal 可能已经中止（进程正在退出、上层超时已到）。
+    // AbortSignal.any 在这种情况下返回的就是一个已中止的信号，
+    // 而给已中止的信号补监听器永远不会触发——不在这里拦一下，
+    // 这个 promise 会一直挂着，pending 条目也要等到断线才被清掉。
+    if (combined.aborted) throw new Error(`调用 ${action} 已取消`);
+
     const result = new Promise<unknown>((resolve, reject) => {
       this.pending.set(echo, { action, resolve, reject });
     });
+    // 先挂一个空 catch：取消/超时可能发生在下面 send 完成之前，
+    // 那时 result 还没有 await 的接收者，Node 会把它记成 unhandled rejection。
+    // 真正的错误仍由 await result 抛出，这里只是别让进程先崩。
+    void result.catch(() => undefined);
 
     const onAbort = (): void => {
       const p = this.pending.get(echo);

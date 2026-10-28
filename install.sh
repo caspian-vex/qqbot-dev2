@@ -181,6 +181,9 @@ fi
 env_set PANEL_PORT "$PANEL_PORT"
 env_set QQBOT_IMAGE "$QQBOT_IMAGE"
 env_set QQBOT_VERSION "$QQBOT_VERSION"
+# 镜像来源，qqbot status 用它决定打印「本地构建」还是「GHCR 拉取」。
+# 以前没有这个变量，status 会一律显示「服务器本地构建」。
+env_set QQBOT_BUILD_MODE "$([ "$BUILD" = "1" ] && echo local || echo prebuilt)"
 # 时区：机器人报时间、DeepSeek 峰时判断、用量按天分组都用它。
 # 服务器在境外时尤其重要——不设的话容器默认 UTC，机器人会「活在另一个时区」。
 if ! env_has TZ; then

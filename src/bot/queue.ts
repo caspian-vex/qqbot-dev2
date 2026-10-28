@@ -57,9 +57,23 @@ export class TaskQueue {
   private readonly waiting: (() => void)[] = [];
 
   constructor(
-    private readonly maxConcurrent = 3,
+    private maxConcurrent = 3,
     private readonly maxDepth = 3,
   ) {}
+
+  /**
+   * 调整跨会话并发上限（面板的「最大并发会话」）。
+   *
+   * 上限调大时要立刻把等待中的任务放进来，否则新上限要等下一次
+   * release 才生效——用户改完设置会以为没生效。
+   * 调小时不打断在跑的任务，只是后续不再放新的进来。
+   */
+  setConcurrency(n: number): void {
+    const v = Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 1;
+    if (v === this.maxConcurrent) return;
+    this.maxConcurrent = v;
+    this.drain();
+  }
 
   /**
    * 提交一个任务。返回 false 表示该会话排队已满，任务被丢弃。
@@ -117,13 +131,31 @@ export class TaskQueue {
 
   private release(): void {
     this.running--;
-    const next = this.waiting.shift();
-    if (next) next();
+    this.drain();
+  }
+
+  /**
+   * 在并发上限允许的范围内唤醒等待者。
+   *
+   * 用 while 而不是只唤醒一个：上限被调大（或一次 release 后空出多个槽）时
+   * 应该把空位一次填满，否则并发度会永远比设置值低。
+   */
+  private drain(): void {
+    while (this.running < this.maxConcurrent && this.waiting.length > 0) {
+      const next = this.waiting.shift();
+      if (!next) break;
+      next();
+    }
   }
 
   /** 某会话当前排队数。 */
   depthOf(key: string): number {
     return this.depth.get(key) ?? 0;
+  }
+
+  /** 当前跨会话并发上限（诊断与测试用）。 */
+  get concurrency(): number {
+    return this.maxConcurrent;
   }
 }
 

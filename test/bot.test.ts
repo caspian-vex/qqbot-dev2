@@ -277,6 +277,44 @@ describe('任务队列', () => {
     await new Promise((r) => setTimeout(r, 30));
     assert.deepEqual(order, ['first-in', 'first-out', 'second']);
   });
+
+  it('并发上限可在运行时调整，调大后立刻放行等待中的会话', async () => {
+    const q = new TaskQueue(1, 8);
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+
+    q.submit('a', async () => {
+      order.push('a-in');
+      await gate;
+      order.push('a-out');
+    });
+    q.submit('b', () => {
+      order.push('b');
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(order, ['a-in'], '上限为 1 时 b 应排队');
+    assert.equal(q.concurrency, 1);
+
+    q.setConcurrency(2);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(order, ['a-in', 'b'], '调大上限后 b 应立刻开始跑');
+    assert.equal(q.concurrency, 2);
+
+    release();
+    await gate;
+  });
+
+  it('并发上限被调成 0 或非法值时收敛到 1', () => {
+    const q = new TaskQueue(3, 3);
+    q.setConcurrency(0);
+    assert.equal(q.concurrency, 1);
+    q.setConcurrency(Number.NaN);
+    assert.equal(q.concurrency, 1);
+  });
 });
 
 describe('冷却窗口', () => {
@@ -344,6 +382,25 @@ describe('上下文窗口', () => {
       const m = new ContextManager(st);
       const msgs = m.build('group:1', { max_turns: 10, token_budget: 200 }, 'SYS', '你好');
       assert.ok(msgs.length >= 2, '不能只剩 system + user');
+    } finally {
+      st.close();
+    }
+  });
+
+  it('max_turns 为 0 表示不带历史（面板上的 0 不是"用默认值"）', () => {
+    const st = tempStore();
+    try {
+      st.sessions.touch('group:1', 'group', 1);
+      st.sessions.append('group:1', 'user', '旧问题', 0);
+      st.sessions.append('group:1', 'assistant', '旧回答', 0);
+      const m = new ContextManager(st);
+      const msgs = m.build('group:1', { max_turns: 0, token_budget: 3000 }, 'SYS', '新问题');
+      assert.deepEqual(
+        msgs.map((x) => x.role),
+        ['system', 'user'],
+        '0 轮就是完全没有历史',
+      );
+      assert.equal(msgs[1]!.content, '新问题');
     } finally {
       st.close();
     }

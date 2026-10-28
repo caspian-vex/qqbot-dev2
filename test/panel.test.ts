@@ -13,9 +13,9 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { LogHub } from '../src/log/hub';
 import { Logger } from '../src/log/logger';
-import { hashPassword, newTOTPSecret, totpCode, verifyPassword } from '../src/panel/auth';
+import { hashPassword, newTOTPSecret, totpCode, verifyPassword, verifyTOTP } from '../src/panel/auth';
 import { normalizeUsername } from '../src/panel/api';
-import { assignOnto, encodeJSON } from '../src/panel/http';
+import { assignOnto, clientIP, encodeJSON, type ReqCtx } from '../src/panel/http';
 import { PanelServer, splitHostPort as splitHostPortForTest } from '../src/panel/server';
 import { Store } from '../src/store';
 
@@ -151,6 +151,28 @@ describe('assignOnto 等价于 Go 解码到已有结构体', () => {
   });
 });
 
+describe('客户端 IP 解析', () => {
+  const req = (remoteAddress: string, headers: Record<string, string>): ReqCtx['req'] =>
+    ({ socket: { remoteAddress }, headers }) as unknown as ReqCtx['req'];
+
+  it('公网直连不采信转发头（否则换个头就是一次新的登录尝试）', () => {
+    assert.equal(clientIP(req('203.0.113.9', { 'x-forwarded-for': '1.1.1.1' })), '203.0.113.9');
+    assert.equal(clientIP(req('::ffff:203.0.113.9', { 'cf-connecting-ip': '1.1.1.1' })), '203.0.113.9');
+  });
+
+  it('对端是本机/内网（反代、容器网关）时才采信转发头', () => {
+    assert.equal(clientIP(req('172.18.0.1', { 'x-forwarded-for': '1.1.1.1, 2.2.2.2' })), '1.1.1.1');
+    assert.equal(clientIP(req('::ffff:172.18.0.1', { 'x-forwarded-for': '1.1.1.1' })), '1.1.1.1');
+    assert.equal(clientIP(req('::1', { 'cf-connecting-ip': '3.3.3.3' })), '3.3.3.3');
+    assert.equal(clientIP(req('192.168.1.5', { 'x-forwarded-for': '4.4.4.4' })), '4.4.4.4');
+  });
+
+  it('没有转发头时用 socket 地址，IPv4 映射形式会被剥前缀', () => {
+    assert.equal(clientIP(req('127.0.0.1', {})), '127.0.0.1');
+    assert.equal(clientIP(req('::ffff:10.1.2.3', {})), '10.1.2.3');
+  });
+});
+
 describe('监听地址解析', () => {
   it('支持四种写法', () => {
     assert.deepEqual(splitHostPortForTest('0.0.0.0:5666'), { host: '0.0.0.0', port: 5666 });
@@ -197,6 +219,14 @@ describe('TOTP (RFC 6238)', () => {
   it('新密钥是 32 位无 padding 的 base32', () => {
     const s = newTOTPSecret();
     assert.match(s, /^[A-Z2-7]{32}$/);
+  });
+
+  it('空密钥一律不通过（空 key 的 HMAC 会算出一个稳定的"合法"码）', () => {
+    // HMAC 接受空 key：不显式判负的话，库里出现 enabled=true + secret='' 的脏状态
+    // 就等于两步验证彻底失效——任何人都能算出那个码。
+    assert.equal(verifyTOTP('', '123456'), false);
+    assert.equal(verifyTOTP('', totpCode('')), false, '连空密钥算出的码也不能放行');
+    assert.equal(verifyTOTP('   ', '123456'), false);
   });
 });
 
@@ -479,6 +509,11 @@ describe('设置接口', () => {
         [{ bot: { max_segments: 9 } }, '最大分段数应在 1-8 之间'],
         [{ context: { max_turns: 51 } }, '上下文轮数应在 0-50 之间'],
         [{ context: { token_budget: 100 } }, '上下文 token 预算应在 200-100000 之间'],
+        // 名单只校验"是不是数组"是不够的：字符串数组能存进去，
+        // 但引擎拿 number 去 includes，白名单/黑名单会静默失效
+        [{ bot: { whitelist_groups: ['30000'] } }, '群白名单只能填正整数群号'],
+        [{ bot: { blacklist_users: ['20000'] } }, '用户黑名单只能填正整数 QQ 号'],
+        [{ bot: { wake_words: [123] } }, '唤醒词只能是文本'],
       ];
       for (const [body, msg] of cases) {
         const res = await put(body);
@@ -797,6 +832,33 @@ describe('密码与 TOTP 管理接口', () => {
       assert.equal(off.status, 200);
       assert.equal(h.store.settings.get().panel.totp_enabled, false);
       assert.equal(h.store.settings.get().panel.totp_secret, '');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('已开启两步验证时，重新生成密钥必须先过验证码（否则等于绕过关闭二步的门）', async () => {
+    const h = await harness({ totp: true });
+    try {
+      const c = cookiesOf(await login(h, PASSWORD, totpCode(TOTP_SECRET)));
+      const call = (body?: unknown): Promise<Response> =>
+        fetch(`${h.base}/api/auth/totp/setup`, {
+          method: 'POST',
+          headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+          body: JSON.stringify(body ?? {}),
+        });
+
+      // 不带验证码、验证码错误，都不能把 totp_enabled 关掉
+      for (const body of [undefined, { code: '' }, { code: '000000' }]) {
+        const res = await call(body);
+        assert.equal(res.status, 400, JSON.stringify(body));
+        assert.deepEqual(await res.json(), { error: '验证码不正确' });
+        assert.equal(h.store.settings.get().panel.totp_enabled, true, '不能悄悄关掉二步验证');
+      }
+
+      const ok = await call({ code: totpCode(TOTP_SECRET) });
+      assert.equal(ok.status, 200);
+      assert.equal(h.store.settings.get().panel.totp_enabled, false);
     } finally {
       await h.stop();
     }

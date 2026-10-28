@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, loadSecrets, root, secretsPath, webDir, type Config } from './config';
 import { Engine } from './bot';
+import { parseFlags, flagName } from './cli/flags';
 import { LogHub } from './log/hub';
 import { Logger, type LogLevel } from './log/logger';
 import { NapCatWebUI } from './napcat/webui';
@@ -19,44 +20,6 @@ import { PanelServer } from './panel/server';
 import { Box, generateToken } from './secret/box';
 import { Store } from './store';
 import { versionString } from './version';
-
-// ---- 参数 ----
-
-interface Flags {
-  config?: string;
-  db?: string;
-  keepTOTP?: boolean;
-  help?: boolean;
-}
-
-/**
- * 极简参数解析。
- *
- * 同时认 `--config x` 与 `-config x`：Go 的 flag 包用单横线，
- * 而用户手敲的时候习惯双横线。两种都接受能省掉一次报错。
- */
-function parseFlags(argv: string[], bools: string[] = []): Flags {
-  const out: Flags = {};
-  for (let i = 0; i < argv.length; i++) {
-    const raw = argv[i] ?? '';
-    if (!raw.startsWith('-')) continue;
-    const name = raw.replace(/^--?/, '');
-    if (name === 'help' || name === 'h') {
-      out.help = true;
-      continue;
-    }
-    if (bools.includes(name)) {
-      out[name as 'keepTOTP'] = true;
-      continue;
-    }
-    const val = argv[i + 1];
-    if (val === undefined) continue;
-    i++;
-    if (name === 'config') out.config = val;
-    else if (name === 'db') out.db = val;
-  }
-  return out;
-}
 
 function logLevel(v: string): LogLevel {
   return v === 'debug' || v === 'info' || v === 'warn' || v === 'error' ? v : 'info';
@@ -68,6 +31,13 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0] ?? 'help';
   const rest = argv.slice(1);
+
+  // 子命令的 -h/--help 统一在这里拦掉。以前每个子命令都解析出 help 却没人看，
+  // 于是 `qqbot reset-password --help` 会真的把密码重置掉并打印新密码。
+  if (cmd !== 'help' && rest.some((a) => flagName(a) === 'help' || flagName(a) === 'h')) {
+    usage(process.stdout);
+    return;
+  }
 
   switch (cmd) {
     case 'version':
@@ -144,7 +114,10 @@ async function cmdRun(argv: string[]): Promise<void> {
   try {
     await ensureAdminPassword(store, log);
 
-    const token = secrets['QQBOT_ONEBOT_TOKEN'] ?? config.onebot.accessToken;
+    // 空串不能当"配了 token"：etc/env 里写了 QQBOT_ONEBOT_TOKEN= 但没填值时，
+    // ?? 不会回退到 toml 的 access_token，协议端就会因为 token 不匹配拒绝连接。
+    const secretToken = secrets['QQBOT_ONEBOT_TOKEN'] ?? '';
+    const token = secretToken !== '' ? secretToken : config.onebot.accessToken;
     const engine = new Engine({ store, log, signal: ac.signal, imagesDir });
     const client = new Client(config.onebot.url, token, log);
 
@@ -474,7 +447,7 @@ function checkWritable(dir: string): void {
  * 留着二步验证等于换了密码还是登不进。
  */
 async function cmdResetPassword(argv: string[]): Promise<void> {
-  const flags = parseFlags(argv, ['keepTOTP']);
+  const flags = parseFlags(argv);
 
   let path = flags.db ?? '';
   if (path === '') {

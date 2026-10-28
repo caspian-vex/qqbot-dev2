@@ -14,8 +14,8 @@ import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
 import {
   dedupeImages,
   extractImageTags,
+  imageBase64,
   imageLabel,
-  imageUri,
   listPool,
   poolPromptBlock,
   resolveImage,
@@ -186,7 +186,10 @@ export class Engine implements EnginePort {
       return;
     }
 
-    // 同一会话串行，跨会话并发
+    // 同一会话串行，跨会话并发。
+    // 并发上限来自设置（面板「最大并发会话」），这里每次同步一次，
+    // 改完立即生效；不这么做的话那个输入框就是个摆设。
+    this.queue.setConcurrency(settings.bot.max_concurrent);
     const key = sessionKey(ev);
     const accepted = this.queue.submit(key, () => this.reply(ev, settings, decision));
     if (!accepted) {
@@ -205,7 +208,7 @@ export class Engine implements EnginePort {
       // 这种情况给个简短回应即可，没必要为一句"在吗"去调模型。
       if (d.direct) {
         try {
-          await this.sendText(ev, ['在的，怎么了？']);
+          await this.sendText(ev, ['在的，怎么了？'], settings);
           this.counters.replied++;
           this.counters.lastReplyAt = Math.floor(Date.now() / 1000);
         } catch {
@@ -278,7 +281,7 @@ export class Engine implements EnginePort {
     } catch (e) {
       this.log.error('调用模型失败', { err: e });
       this.counters.errors++;
-      await this.sendFallback(ev);
+      await this.sendFallback(ev, settings);
       return;
     }
 
@@ -333,7 +336,7 @@ export class Engine implements EnginePort {
     });
 
     try {
-      if (segs.length > 0) await this.sendText(ev, segs);
+      if (segs.length > 0) await this.sendText(ev, segs, settings);
       // 图片跟在文字后面：先说话再甩图，符合真人"配图"的节奏
       if (picked.length > 0) await this.sendImages(ev, picked);
     } catch (e) {
@@ -356,10 +359,10 @@ export class Engine implements EnginePort {
   }
 
   /** 模型调用失败时给一句兜底回复，避免用户干等。 */
-  private async sendFallback(ev: Event): Promise<void> {
+  private async sendFallback(ev: Event, settings: Settings): Promise<void> {
     // 兜底也失败就不再重试，避免在故障时放大流量
     try {
-      await this.sendText(ev, ['我这会儿有点卡住了，稍后再试试？']);
+      await this.sendText(ev, ['我这会儿有点卡住了，稍后再试试？'], settings);
     } catch {
       // 故意忽略
     }
@@ -449,7 +452,9 @@ export class Engine implements EnginePort {
         timeoutMs: settings.llm.timeout_sec * 1000,
       };
       const res = await this.llm.chat(cfg, msgs, this.opt.signal);
-      const echoText = stripMarkdown(res.content);
+      // 跟进不配图（图池清单只注入正常回复），但模型可能照着历史里的
+      // 格式自己编一个 [图:xx]——那串符号绝不能原样发到聊天里。
+      const echoText = extractImageTags(stripMarkdown(res.content)).text;
 
       // 空输出是模型行使"闭嘴权"，正常放弃而不是错误
       if (echoText === '') {
@@ -474,7 +479,7 @@ export class Engine implements EnginePort {
 
   /**
    * 无事件发送：跟进没有原始消息可引用，也不 @，直接说话。
-   * 段间延迟读设置（回复链路的 sendText 历史上写死了 300-800，这里不再复刻）。
+   * 段间延迟与回复链路共用 seg_delay_*，两处节奏保持一致。
    */
   private async sendTo(kind: string, target: number, segs: string[], s: Settings): Promise<void> {
     const sender = this.sender;
@@ -519,12 +524,17 @@ export class Engine implements EnginePort {
   /**
    * 按段发送文本，第一段附带引用或 @。
    *
-   * 段之间留随机间隔，模拟真人打字的节奏；最后一段不等待。
+   * 段之间留随机间隔（区间读设置），模拟真人打字的节奏；最后一段不等待。
+   * 引用还是 @ 由 bot.quote_reply 决定：关掉引用的用户往往嫌引用框占地方，
+   * 这时退化成 @，否则群里一句话飘出来没人知道在回谁。
    */
-  private async sendText(ev: Event, segs: string[]): Promise<number> {
+  private async sendText(ev: Event, segs: string[], s: Settings): Promise<number> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
     if (segs.length === 0) return 0;
+
+    const min = Math.max(0, s.bot.seg_delay_min_ms);
+    const max = Math.max(min, s.bot.seg_delay_max_ms);
 
     let lastId = 0;
     for (let i = 0; i < segs.length; i++) {
@@ -533,7 +543,7 @@ export class Engine implements EnginePort {
       // 只有第一段带引用/@，后续段保持干净
       if (i === 0 && isGroup(ev)) {
         const mid = ev.message_id ?? 0;
-        if (mid !== 0) parts.push(reply(mid));
+        if (s.bot.quote_reply && mid !== 0) parts.push(reply(mid));
         else parts.push(at(ev.user_id ?? 0), text(' '));
       }
       parts.push(text(segs[i]!));
@@ -545,8 +555,7 @@ export class Engine implements EnginePort {
 
       // 最后一段不等待
       if (i < segs.length - 1) {
-        const delay = 300 + Math.floor(Math.random() * 500);
-        await sleep(delay, this.opt.signal);
+        await sleep(min + Math.floor(Math.random() * (max - min)), this.opt.signal);
       }
     }
     return lastId;
@@ -555,14 +564,30 @@ export class Engine implements EnginePort {
   /**
    * 发送图池里的图片：一条消息带全部 image 段，跟在文字后面。
    *
-   * 图片来自 resolveImage 的白名单匹配（标签与文件名都校验过），
-   * 这里按「标签目录 + 文件名」拼 file:// URI，Windows 盘符也能拼对。
+   * 图片来自 resolveImage 的白名单匹配（标签与文件名都校验过）。
+   * 段数据用 base64:// 而不是本地路径——协议端是另一个容器，
+   * 图池目录在它那边不存在（见 imagepool.imageBase64 的说明）。
+   * 一张都读不出来就干脆不发，别让协议端收到空消息。
    */
   private async sendImages(ev: Event, imgs: PoolImage[]): Promise<void> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
     if (imgs.length === 0 || this.imagesDir === '') return;
-    const parts: Segment[] = imgs.map((i) => image(imageUri(tagDirOf(this.imagesDir, i.tag), i.name)));
+
+    const parts: Segment[] = [];
+    for (const i of imgs) {
+      const data = imageBase64(tagDirOf(this.imagesDir, i.tag), i.name);
+      if (data === null) {
+        this.log.warn('图池里的图片读取失败或超出大小上限，已跳过', {
+          tag: i.tag,
+          name: i.name,
+        });
+        continue;
+      }
+      parts.push(image(data));
+    }
+    if (parts.length === 0) return;
+
     if (isGroup(ev)) await sender.sendGroup(ev.group_id ?? 0, parts, this.opt.signal);
     else await sender.sendPrivate(ev.user_id ?? 0, parts, this.opt.signal);
   }

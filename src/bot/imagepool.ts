@@ -20,9 +20,8 @@
 // 纯函数尽量不碰文件系统：只有 listPool / poolFilePath 会读盘，且失败时
 // 静默降级（图池读不了不该挡住聊天）。
 
-import { readdirSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { extname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 /** 允许进图池的扩展名。名单之外的文件一律视为不存在。 */
 export const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
@@ -270,9 +269,35 @@ export function imageLabel(img: PoolImage): string {
   return img.tag === UNTAGGED ? img.name : `${img.tag}/${img.name}`;
 }
 
-/** 本地文件的 file:// URI。用 Node 的标准函数拼，Windows 盘符才不会拼错。 */
-export function imageUri(dir: string, name: string): string {
-  return pathToFileURL(join(dir, name)).href;
+/**
+ * 单张图的最大字节数。
+ *
+ * 超过就不发：一来 QQ 自己的图片上限就在 20MB 上下，二来 base64 会把体积
+ * 放大 1/3，在 1 核 2G 的机器上读一张 10MB 的图会明显卡一下。
+ */
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * 把池内图片读成 OneBot 的 base64 段数据（`base64://...`）。
+ *
+ * 为什么不发 file:// 路径：qqbot 与协议端是两个容器，图池目录只挂在
+ * qqbot 这一侧，协议端拿到的绝对路径在它自己的文件系统里根本不存在，
+ * 于是"发图"会静默失败（只在协议端日志里留一条读文件失败）。
+ * base64 是 OneBot v11 明确支持的形态，与两边怎么挂载无关；
+ * 本地开发（同一文件系统）也照样能用。
+ *
+ * 读不到、超限都返回 null：少发一张图，绝不能把聊天搞挂。
+ */
+export function imageBase64(dir: string, name: string): string | null {
+  if (dir === '' || name === '') return null;
+  const full = join(dir, name);
+  try {
+    const st = statSync(full);
+    if (!st.isFile() || st.size <= 0 || st.size > MAX_IMAGE_BYTES) return null;
+    return `base64://${readFileSync(full).toString('base64')}`;
+  } catch {
+    return null;
+  }
 }
 
 /**

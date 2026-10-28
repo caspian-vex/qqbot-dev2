@@ -13,7 +13,7 @@ export class Manager {
    * 组装一次请求的消息列表。
    *
    * 策略：
-   *   1. 取最近 maxTurns 轮（一轮 = 用户 + 助手，所以取 maxTurns*2 条）
+   *   1. 取最近 maxTurns 轮（一轮 = 用户 + 助手，所以取 maxTurns*2 条）；0 表示不带历史
    *   2. 从最新往回累加，直到逼近 token 预算为止
    *   3. 丢弃更早的整轮，保证 user/assistant 成对出现
    *
@@ -21,10 +21,14 @@ export class Manager {
    * 部分模型会表现异常（把历史回复当成待续写内容）。
    */
   build(sessionID: string, cfg: ContextSettings, system: string, userText: string): LlmMessage[] {
-    const maxTurns = cfg.max_turns > 0 ? cfg.max_turns : 10;
+    // max_turns = 0 是面板上的合法值，含义是「不带历史」。
+    // 这里不能套 "> 0 ? x : 默认值" 的写法——那会把 0 悄悄变成 10 轮，
+    // 用户关掉上下文后机器人还在接着几十条前的对话往下说。
+    const rawTurns = Number.isFinite(cfg.max_turns) ? cfg.max_turns : 10;
+    const maxTurns = Math.max(0, Math.floor(rawTurns));
     const tokenBudget = cfg.token_budget > 0 ? cfg.token_budget : 3000;
 
-    const history = this.store.sessions.recent(sessionID, maxTurns * 2);
+    const history = maxTurns === 0 ? [] : this.store.sessions.recent(sessionID, maxTurns * 2);
 
     // 预算里先扣掉固定开销：系统提示、本轮用户消息、预期输出
     let budget = tokenBudget;
