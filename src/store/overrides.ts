@@ -12,6 +12,7 @@
 import {
   cloneSettings,
   type BotSettings,
+  type ComputerSettings,
   type ContextSettings,
   type ImageSettings,
   type ProactiveSettings,
@@ -45,6 +46,16 @@ export type SessionBotOverride = Pick<
 >;
 
 /**
+ * 「电脑操作」允许按会话覆盖的字段。
+ *
+ * 只有这三个进得去：能不能用、一次消息执行几次、单条命令多久超时。
+ * 主人 QQ、白名单、工作目录、是否批准全部留在全局——
+ * 会话能改白名单，等于被拉进来的人自己决定还能拉谁进来；
+ * 会话能关批准，等于把唯一的人工环节交给触发者自己。
+ */
+export type SessionComputerOverride = Pick<ComputerSettings, 'enabled' | 'max_calls' | 'timeout_sec'>;
+
+/**
  * 一个会话的覆盖。
  *
  * 组的键出现即代表"本会话单独设置"，组内必须字段全量（服务端负责补全）。
@@ -60,11 +71,20 @@ export interface SessionOverrides {
   images?: ImageSettings;
   vision?: VisionSettings;
   search?: SearchSettings;
+  computer?: SessionComputerOverride;
   context?: ContextSettings;
 }
 
 /** 可覆盖的组。顺序即面板卡片顺序。 */
-export const OVERRIDABLE_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'context'] as const;
+export const OVERRIDABLE_GROUPS = [
+  'bot',
+  'proactive',
+  'images',
+  'vision',
+  'search',
+  'computer',
+  'context',
+] as const;
 
 export type OverridableGroup = (typeof OVERRIDABLE_GROUPS)[number];
 
@@ -75,6 +95,7 @@ export const GROUP_LABELS: Record<OverridableGroup, string> = {
   images: '图池',
   vision: '图片识别',
   search: '联网搜索',
+  computer: '电脑操作',
   context: '上下文',
 };
 
@@ -109,6 +130,7 @@ export const OVERRIDE_FIELDS: Record<OverridableGroup, Record<string, FieldKind>
   images: { enabled: 'bool', max_per_reply: 'num' },
   vision: { enabled: 'bool', max_images: 'num' },
   search: { enabled: 'bool', max_results: 'num', timeout_sec: 'num', max_calls: 'num' },
+  computer: { enabled: 'bool', max_calls: 'num', timeout_sec: 'num' },
   context: { max_turns: 'num', token_budget: 'num' },
 };
 
@@ -153,6 +175,14 @@ export function groupBase(g: OverridableGroup, global: Settings): Record<string,
       return { ...global.vision };
     case 'search':
       return { ...global.search };
+    case 'computer':
+      // 挑三个字段而不是整块摊开：owner_qq / workdir / 两个名单 / 审批策略
+      // 都是部署级边界，一旦被写进会话快照，之后改全局也带不动这个会话了。
+      return {
+        enabled: global.computer.enabled,
+        max_calls: global.computer.max_calls,
+        timeout_sec: global.computer.timeout_sec,
+      };
     case 'context':
       return { ...global.context };
   }
@@ -246,6 +276,9 @@ export function normalizeOverrides(raw: unknown, global: Settings): SessionOverr
       case 'search':
         out.search = merged as unknown as SearchSettings;
         break;
+      case 'computer':
+        out.computer = merged as unknown as SessionComputerOverride;
+        break;
       case 'context':
         out.context = merged as unknown as ContextSettings;
         break;
@@ -273,6 +306,11 @@ export function pickGroups(global: Settings): Record<OverridableGroup, unknown> 
     images: { ...global.images },
     vision: { ...global.vision },
     search: { ...global.search },
+    computer: {
+      enabled: global.computer.enabled,
+      max_calls: global.computer.max_calls,
+      timeout_sec: global.computer.timeout_sec,
+    },
     context: { ...global.context },
   };
 }
@@ -324,6 +362,16 @@ export function resolveSettings(global: Settings, ov: SessionOverrides | null): 
   if (ov.images) out.images = { ...ov.images };
   if (ov.vision) out.vision = { ...ov.vision };
   if (ov.search) out.search = { ...ov.search };
+  if (ov.computer) {
+    // 先摊全局再盖三个可覆盖字段：主人、名单、工作目录、审批策略必须
+    // 始终来自全局，否则「这个群单独设置过」会连带把白名单冻结成旧值。
+    out.computer = {
+      ...out.computer,
+      enabled: ov.computer.enabled,
+      max_calls: ov.computer.max_calls,
+      timeout_sec: ov.computer.timeout_sec,
+    };
+  }
   if (ov.context) out.context = { ...ov.context };
   return out;
 }

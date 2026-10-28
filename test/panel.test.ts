@@ -14,6 +14,7 @@ import { after, describe, it } from 'node:test';
 import { LogHub } from '../src/log/hub';
 import { Logger } from '../src/log/logger';
 import { hashPassword, newTOTPSecret, totpCode, verifyPassword, verifyTOTP } from '../src/panel/auth';
+import { ApprovalQueue } from '../src/bot/computer-approval';
 import { normalizeUsername } from '../src/panel/api';
 import { assignOnto, clientIP, encodeJSON, type ReqCtx } from '../src/panel/http';
 import { PanelServer, splitHostPort as splitHostPortForTest } from '../src/panel/server';
@@ -32,11 +33,13 @@ interface Harness {
   base: string;
   store: Store;
   panel: PanelServer;
+  /** 注入的待批准队列（传了就与面板共用这一个实例）。 */
+  approvals?: ApprovalQueue;
   stop: () => Promise<void>;
 }
 
 /** 起一个用完即弃的面板实例。每个用例独立实例，避免登录限流互相干扰。 */
-async function harness(opts: { password?: string; totp?: boolean } = {}): Promise<Harness> {
+async function harness(opts: { password?: string; totp?: boolean; approvals?: ApprovalQueue } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-panel-'));
   tmpDirs.push(dir);
 
@@ -56,6 +59,7 @@ async function harness(opts: { password?: string; totp?: boolean } = {}): Promis
     log: Logger.create({ level: 'error', format: 'text' }),
     hub: new LogHub(50),
     webDir: join(process.cwd(), 'web', 'dist'),
+    approvals: opts.approvals,
   });
   const port = await panel.listen('127.0.0.1:0');
 
@@ -63,6 +67,7 @@ async function harness(opts: { password?: string; totp?: boolean } = {}): Promis
     base: `http://127.0.0.1:${port}`,
     store,
     panel,
+    approvals: opts.approvals,
     stop: async () => {
       await panel.close(500);
       store.close();
@@ -515,6 +520,15 @@ describe('设置接口', () => {
         [{ bot: { blacklist_users: ['20000'] } }, '用户黑名单只能填正整数 QQ 号'],
         [{ bot: { wake_words: [123] } }, '唤醒词只能是文本'],
         [{ vision: { max_images: 5 } }, '单条消息识图上限应在 1-4 张之间'],
+        // 电脑操作：范围、路径形态、以及"开了却没人能用"这种语义错
+        [{ computer: { timeout_sec: 99 } }, '命令超时应在 1-60 秒之间'],
+        [{ computer: { max_calls: 9 } }, '每条消息最多执行几次应在 1-5 之间'],
+        [{ computer: { approval_timeout_sec: 10 } }, '批准等待应在 30-300 秒之间'],
+        [{ computer: { workdir: 'data' } }, '工作目录要填绝对路径（以 / 开头）'],
+        [{ computer: { owner_qq: -1 } }, '主人 QQ 只能填正整数'],
+        [{ computer: { allow_users: ['10001'] } }, '允许的好友只能填正整数 QQ 号'],
+        [{ computer: { allow_groups: [0] } }, '允许的群只能填正整数群号'],
+        [{ computer: { enabled: true } }, '开启前至少要填主人 QQ 或一个白名单好友/群'],
       ];
       for (const [body, msg] of cases) {
         const res = await put(body);
@@ -1377,6 +1391,9 @@ describe('会话级设置（按对话对象覆盖）', () => {
         // 类型错要报出来：默默丢组会让用户以为保存成功了
         [{ id: 'group:1', overrides: { bot: { passive_rate: '0.5' } } }, '「触发规则」的 passive_rate 取值类型不正确'],
         [{ id: 'group:1', overrides: { bot: [1, 2] } }, '「触发规则」格式错误'],
+        // 主人与白名单是部署级边界：会话能改它们，等于被拉进来的人自己决定还能拉谁
+        [{ id: 'group:1', overrides: { computer: { owner_qq: 1 } } }, '「电脑操作」不支持按会话设置的字段：owner_qq'],
+        [{ id: 'group:1', overrides: { computer: { allow_groups: [1] } } }, '「电脑操作」不支持按会话设置的字段：allow_groups'],
         [{ id: 'group:1', overrides: [1] }, '会话设置格式错误'],
       ];
       for (const [payload, msg] of cases) {
@@ -1416,7 +1433,15 @@ describe('会话级设置（按对话对象覆盖）', () => {
       const c = await authed(h);
       const empty = await getCfg(h, c, 'group:123');
       assert.deepEqual(empty.overrides, {});
-      assert.deepEqual(Object.keys(empty.global).sort(), ['bot', 'context', 'images', 'proactive', 'search', 'vision']);
+      assert.deepEqual(Object.keys(empty.global).sort(), [
+        'bot',
+        'computer',
+        'context',
+        'images',
+        'proactive',
+        'search',
+        'vision',
+      ]);
       assert.equal(typeof empty.global.bot!.passive_rate, 'number');
 
       // 只传一个字段：服务端补成全量，引擎才不会读到 undefined
@@ -1589,6 +1614,138 @@ describe('会话级设置（按对话对象覆盖）', () => {
       await putCfg(h, c, { id: 'group:123', overrides: {} });
       const reset = h.store.audit.list(10).find((a) => a.action === 'session.settings');
       assert.ok(reset!.detail.includes('default(global)'));
+    } finally {
+      await h.stop();
+    }
+  });
+});
+
+describe('电脑操作审批', () => {
+  const req = {
+    session: 'private:10001',
+    kind: 'private',
+    target: 10001,
+    user: 10001,
+    tool: 'run_command',
+    summary: 'df -h',
+    detail: '{"command":"df -h"}',
+  };
+
+  /** 起一条挂着的申请，返回它的 id 与那个还没 settle 的 promise。 */
+  async function pend(q: ApprovalQueue, timeoutMs = 5000): Promise<string> {
+    void q.ask(req, { timeoutMs });
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      const first = q.list()[0];
+      if (first) return first.id;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error('等不到待批准');
+  }
+
+  function decide(h: Awaited<ReturnType<typeof harness>>, c: { header: string; csrf: string }, body: unknown) {
+    return fetch(`${h.base}/api/computer/decide`, {
+      method: 'POST',
+      headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('未登录 401、缺 CSRF 403', async () => {
+    const q = new ApprovalQueue();
+    const h = await harness({ approvals: q });
+    try {
+      const anon = await fetch(`${h.base}/api/computer/pending`);
+      assert.equal(anon.status, 401);
+
+      const c = await authed(h);
+      const noToken = await fetch(`${h.base}/api/computer/decide`, {
+        method: 'POST',
+        headers: { Cookie: c.header, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'x', approve: true }),
+      });
+      assert.equal(noToken.status, 403);
+      assert.deepEqual(await noToken.json(), { error: 'CSRF 校验失败，请刷新页面重试' });
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('pending 回列表但不外泄内部句柄', async () => {
+    const q = new ApprovalQueue();
+    const h = await harness({ approvals: q });
+    try {
+      const c = await authed(h);
+      const id = await pend(q);
+      const res = await fetch(`${h.base}/api/computer/pending`, { headers: { Cookie: c.header } });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { items: Record<string, unknown>[] };
+      assert.equal(body.items.length, 1);
+      const item = body.items[0]!;
+      assert.equal(item['id'], id);
+      assert.equal(item['summary'], 'df -h');
+      assert.ok((item['remain_ms'] as number) > 0);
+      assert.equal('finish' in item, false);
+      assert.equal('resolve' in item, false);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('批准与拒绝都走通，重复处理转 410，未知 id 转 404', async () => {
+    const q = new ApprovalQueue();
+    const h = await harness({ approvals: q });
+    try {
+      const c = await authed(h);
+
+      const id1 = await pend(q);
+      const ok1 = await decide(h, c, { id: id1, approve: true });
+      assert.equal(ok1.status, 200);
+      assert.deepEqual(await ok1.json(), { ok: true, decision: 'approved' });
+
+      const again = await decide(h, c, { id: id1, approve: true });
+      assert.equal(again.status, 410);
+      assert.deepEqual(await again.json(), { error: '这条待批准已过期或被处理过' });
+
+      const id2 = await pend(q);
+      const ok2 = await decide(h, c, { id: id2, approve: false });
+      assert.equal(ok2.status, 200);
+      assert.deepEqual(await ok2.json(), { ok: true, decision: 'denied' });
+
+      const missing = await decide(h, c, { id: 'deadbeef', approve: true });
+      assert.equal(missing.status, 404);
+      assert.deepEqual(await missing.json(), { error: '没有这条待批准记录' });
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('入参不合法时 400 并给出中文原因', async () => {
+    const h = await harness({ approvals: new ApprovalQueue() });
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ approve: true }, '缺少待批准编号'],
+        [{ id: '', approve: true }, '缺少待批准编号'],
+        [{ id: 'x', approve: 'yes' }, 'approve 必须是布尔值'],
+      ];
+      for (const [body, msg] of cases) {
+        const res = await decide(h, c, body);
+        assert.equal(res.status, 400, JSON.stringify(body));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('没注入队列时 pending 是空列表（旧调用方不该报错）', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await fetch(`${h.base}/api/computer/pending`, { headers: { Cookie: c.header } });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { items: [] });
     } finally {
       await h.stop();
     }

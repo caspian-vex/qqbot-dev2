@@ -532,7 +532,7 @@
       if (!$('#set-body')) return; // 用户已经切走
       const imgDir = pool.dir || '';
       const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {},
-            vis = s.vision || {}, sr = s.search || {};
+            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
@@ -725,6 +725,65 @@
         </div>
 
         <div class="card">
+          <h3>电脑操作 <span class="hint">让模型在这台机器上执行命令、读写文件</span></h3>
+          <label class="check">
+            <input type="checkbox" id="f-cmp" ${cm.enabled ? 'checked' : ''}>
+            <span>允许模型操作这台电脑
+              <span class="note">等于把容器内的 shell 交给下面指定的会话。容器里是 alpine、非 root 的 node 用户，
+              只有 busybox 的 sh（没有 bash/curl/git/python），内存 768MB——装软件包、跑编译会把整个机器人 OOM 掉。
+              默认每次执行都要在这张卡里点「批准」，删根、格式化、关机、docker 之类的命令一律硬拒，批准也不行。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>主人 QQ</label>
+              <input type="text" id="f-cmp-owner" value="${cm.owner_qq || ''}" placeholder="例如 10001">
+              <div class="note">主人私聊始终可用。留空就只靠下面的白名单。</div>
+            </div>
+            <div class="field">
+              <label>默认工作目录</label>
+              <input type="text" id="f-cmp-cwd" value="${esc(cm.workdir || '')}" placeholder="/opt/qqbot/data">
+              <div class="note">留空用数据目录。相对路径与命令的 cwd 都按它算。</div>
+            </div>
+            <div class="field">
+              <label>命令超时（秒）</label>
+              <input type="number" id="f-cmp-timeout" min="1" max="60" value="${cm.timeout_sec ?? 20}">
+              <div class="note">到点强杀整棵进程树。1 核机器上不要给太久。</div>
+            </div>
+            <div class="field">
+              <label>每条消息最多执行几次</label>
+              <input type="number" id="f-cmp-calls" min="1" max="5" value="${cm.max_calls ?? 1}">
+              <div class="note">每次都要人点批准，调大只会在最坏情况下多占几次会话队列。</div>
+            </div>
+            <div class="field">
+              <label>额外允许的好友 QQ</label>
+              <input type="text" id="f-cmp-users" value="${esc((cm.allow_users || []).join('，'))}" placeholder="多个用逗号分隔">
+              <div class="note">这些人的私聊也能用，和主人一样要批准。</div>
+            </div>
+            <div class="field">
+              <label>额外允许的群号</label>
+              <input type="text" id="f-cmp-groups" value="${esc((cm.allow_groups || []).join('，'))}" placeholder="多个用逗号分隔">
+              <div class="note">群里只有群主和管理员能触发，普通成员不算。</div>
+            </div>
+            <div class="field">
+              <label>批准等待（秒）</label>
+              <input type="number" id="f-cmp-wait" min="30" max="300" value="${cm.approval_timeout_sec ?? 90}">
+              <div class="note">面板上没人点就按超时算，操作不会执行。</div>
+            </div>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="f-cmp-approve" ${cm.require_approval !== false ? 'checked' : ''}>
+            <span>每次执行前都要在面板批准
+              <span class="note">关掉就是全自动。出事时没有第二次机会，也想不起是哪个群干的。</span>
+            </span>
+          </label>
+          <div class="field" style="margin-top:14px">
+            <label>待批准 <span class="hint">在这里点「批准」那条命令才会真的执行</span></label>
+            <div id="f-cmp-pending"><div class="note">（正在读取…）</div></div>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>上下文</h3>
           <div class="grid c2">
             <div class="field">
@@ -746,6 +805,18 @@
 
       bindActions(el, {
         save: async (btn) => {
+          // 从关到开要一次显式确认：这个开关等于把 shell 交给聊天窗口，
+          // 手滑点开却不知道后果，比报错难查得多。confirm 放在 disable 之前，
+          // 取消时按钮要能继续点。
+          if (
+            $('#f-cmp').checked &&
+            !cm.enabled &&
+            !confirm(
+              '开启「电脑操作」后，主人和白名单里的会话可以让模型在这台服务器上执行任意命令、读写任何文件（容器内 node 用户）。确定开启？',
+            )
+          ) {
+            return;
+          }
           btn.disabled = true;
           try {
             await api('/api/settings', {
@@ -799,6 +870,18 @@
                   timeout_sec: sr.timeout_sec ?? 8,
                   max_calls: Number($('#f-search-calls').value),
                 },
+                computer: {
+                  enabled: $('#f-cmp').checked,
+                  // 空串要落成 0（= 不设主人），Number('') 是 0，但 trim 后再兜一层更直白
+                  owner_qq: Number($('#f-cmp-owner').value.trim() || '0') || 0,
+                  workdir: $('#f-cmp-cwd').value.trim(),
+                  timeout_sec: Number($('#f-cmp-timeout').value),
+                  max_calls: Number($('#f-cmp-calls').value),
+                  require_approval: $('#f-cmp-approve').checked,
+                  approval_timeout_sec: Number($('#f-cmp-wait').value),
+                  allow_users: parseNumList($('#f-cmp-users').value),
+                  allow_groups: parseNumList($('#f-cmp-groups').value),
+                },
               },
             });
             ok('设置已保存');
@@ -808,7 +891,64 @@
             btn.disabled = false;
           }
         },
+        'cmp-yes': async (btn) => {
+          btn.disabled = true;
+          try {
+            await api('/api/computer/decide', { method: 'POST', body: { id: btn.dataset.id, approve: true } });
+            ok('已批准');
+          } catch (e) {
+            bad(e.message);
+          } finally {
+            void pollPending();
+          }
+        },
+        'cmp-no': async (btn) => {
+          btn.disabled = true;
+          try {
+            await api('/api/computer/decide', { method: 'POST', body: { id: btn.dataset.id, approve: false } });
+            ok('已拒绝');
+          } catch (e) {
+            bad(e.message);
+          } finally {
+            void pollPending();
+          }
+        },
       });
+
+      // 待批准列表：2 秒一轮。只在设置页开着时轮，切走由 stops 收掉——
+      // 这里轮的是内存里的队列，代价只有一次自己的 HTTP 请求，很便宜。
+      async function pollPending() {
+        const box = $('#f-cmp-pending');
+        if (!box) return;
+        let d;
+        try {
+          d = await api('/api/computer/pending');
+        } catch {
+          return; // 轮询失败不该弹 toast，下一轮再说
+        }
+        const items = d.items || [];
+        box.innerHTML =
+          items.length === 0
+            ? '<div class="note">（没有待批准的操作）</div>'
+            : items
+                .map(
+                  (x) => `<div class="row" style="gap:8px;align-items:flex-start;margin:10px 0">
+                <div style="flex:1 1 320px;min-width:0">
+                  <div class="mono" style="font-size:11.5px">${esc(x.session)} · ${esc(x.tool)}</div>
+                  <div class="note" style="white-space:pre-wrap;word-break:break-all">${esc(
+                    String(x.detail || x.summary || '').slice(0, 800),
+                  )}</div>
+                  <div class="note">剩余 ${Math.ceil((Number(x.remain_ms) || 0) / 1000)} 秒</div>
+                </div>
+                <button class="btn" data-act="cmp-yes" data-id="${esc(x.id)}">批准</button>
+                <button class="btn ghost" data-act="cmp-no" data-id="${esc(x.id)}">拒绝</button>
+              </div>`,
+                )
+                .join('');
+      }
+      void pollPending();
+      const pendingTimer = setInterval(() => void pollPending(), 2000);
+      stops.push(() => clearInterval(pendingTimer));
 
       // 标签概览（真正的增删改在「图池」页）
       const tags = pool.tags || [];
@@ -826,13 +966,14 @@
 
   // 与服务端 OVERRIDABLE_GROUPS 一一对应，顺序即卡片顺序。
   // 模型与面板凭据不在这里：它们是部署级的，按会话复制会变成 N 份密文。
-  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'context'];
+  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'computer', 'context'];
   const OVR_META = {
     bot: { title: '触发规则', hint: '唤醒词、接话概率、冷却、分段' },
     proactive: { title: '主动发言', hint: '回复后隔一会儿补一句' },
     images: { title: '图池', hint: '要不要发图、发几张' },
     vision: { title: '图片识别', hint: '用户发的图要不要看' },
     search: { title: '联网搜索', hint: '拿不准时自己去查' },
+    computer: { title: '电脑操作', hint: '执行命令、读写文件（要批准）' },
     context: { title: '上下文', hint: '带几轮历史、多少预算' },
   };
 
@@ -950,6 +1091,15 @@
     if (g === 'vision') {
       return { enabled: $('#f-vision').checked, max_images: num('#f-vision-max') };
     }
+    // 注意位置：这个函数最后一行是隐式的 context 兜底，新组加在它后面
+    // 会静默把 max_turns/token_budget 当成新组的值存进去。
+    if (g === 'computer') {
+      return {
+        enabled: $('#f-cmp').checked,
+        max_calls: num('#f-cmp-calls'),
+        timeout_sec: num('#f-cmp-timeout'),
+      };
+    }
     if (g === 'search') {
       return {
         enabled: $('#f-search').checked,
@@ -1004,6 +1154,7 @@
       const imgVal = st.images.val;
       const visVal = st.vision.val;
       const srVal = st.search.val;
+      const cmpVal = st.computer.val;
       const ctxVal = st.context.val;
 
       // 人格不是"覆盖"，天然就是按会话的，所以它没有「本会话单独设置」开关
@@ -1051,6 +1202,18 @@
             ${ovrNum('f-search-results', '每次取几条结果', srVal.max_results, 1, 10, '取多了会挤占上下文预算，3-5 条通常够用。')}
             ${ovrNum('f-search-calls', '每条消息最多搜几次', srVal.max_calls, 1, 3, '成本硬闸：每多一次就是一次模型请求加一次搜索请求。')}
           </div>`, st) +
+        // 电脑操作只允许按会话改三样：开不开、几次、多久超时。
+        // 主人、白名单、工作目录、是否批准都留在全局设置里——会话能改这些，
+        // 等于被拉进来的人自己决定还能拉谁进来。
+        ovrCard('computer', `
+          ${ovrCheck('f-cmp', '允许这个会话操作这台电脑', cmpVal.enabled,
+            '每次执行前仍需主人在「全局设置」里点批准，不点就按超时处理。')}
+          <div class="grid c2">
+            ${ovrNum('f-cmp-calls', '每条消息最多执行几次', cmpVal.max_calls, 1, 5, '多一步"查一下再改"很正常，但每次都要人点一次批准。')}
+            ${ovrNum('f-cmp-timeout', '命令超时（秒）', cmpVal.timeout_sec, 1, 60, '到点强杀整棵进程树。')}
+          </div>
+          <div class="note">主人 QQ、白名单群、工作目录、是否批准是部署级设置，只能在
+            <a href="#/settings">全局设置</a> 里改。</div>`, st) +
         ovrCard('context', `
           <div class="grid c2">
             ${ovrNum('f-turns', '保留轮数', ctxVal.max_turns, 0, 50, '一轮 = 用户一句 + 助手一句。0 表示不带历史。')}

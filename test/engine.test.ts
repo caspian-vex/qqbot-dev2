@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { Engine, type Sender } from '../src/bot';
+import { ApprovalQueue } from '../src/bot/computer-approval';
 import {
   contentText,
   type LlmClient,
@@ -37,6 +38,8 @@ interface Harness {
   engine: Engine;
   store: Store;
   sent: Sent[];
+  /** 引擎用的待批准队列。电脑操作用例靠它模拟"面板上点了批准"。 */
+  approvals: ApprovalQueue;
   cleanup: () => void;
 }
 
@@ -97,16 +100,21 @@ function makeHarness(opts: {
     },
   } as unknown as LlmClient;
 
+  const approvals = new ApprovalQueue();
   const engine = new Engine({
     store,
     log: Logger.create({ level: 'error', format: 'text' }),
     llm,
     searchFetch: opts.searchFetch,
+    // 工作目录就用临时目录：电脑操作真的会在这台机器上落文件，
+    // 默认 cwd 指到仓库里会在跑测试时污染工作区。
+    dataDir: dir,
+    approvals,
   });
   engine.setSender(sender);
   engine.setSelf(10000, 'bot');
 
-  return { engine, store, sent, cleanup: () => store.close() };
+  return { engine, store, sent, approvals, cleanup: () => store.close() };
 }
 
 function groupEv(patch: Partial<Event> = {}): Event {
@@ -890,6 +898,235 @@ describe('按会话的设置覆盖', () => {
       h.engine.handleEvent(g(30001, '你好', 20000, 2));
       await waitFor(() => h.sent.length >= 2);
       assert.ok(seen[1]!.length >= 4, '群同号不应沾到私聊的覆盖');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('电脑操作', () => {
+  const OWNER = 20000;
+  const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+
+  /** 打开电脑操作，主人是 OWNER，每次执行要批准。 */
+  function cmp(opts: {
+    patch?: (v: Settings) => void;
+    llm?: (msgs: LlmMessage[], tools?: ToolDef[]) => Promise<Result>;
+  }): Harness {
+    return makeHarness({
+      patch: (v) => {
+        v.computer.enabled = true;
+        v.computer.owner_qq = OWNER;
+        v.computer.require_approval = true;
+        v.computer.timeout_sec = 10;
+        v.computer.max_calls = 1;
+        opts.patch?.(v);
+      },
+      llm: opts.llm,
+    });
+  }
+
+  function call(id: string, name: string, args: unknown) {
+    return { id, type: 'function', function: { name, arguments: JSON.stringify(args) } };
+  }
+
+  /** 发一条消息，sender 带上 role（私聊为空串，群聊按用例要给 owner/admin/member）。 */
+  function say(h: Harness, ev: Event): void {
+    h.engine.handleEvent({ ...ev, sender: { user_id: ev.user_id ?? 0, nickname: 'n', card: '', role: '' } });
+  }
+
+  /** 写一份会话覆盖，走 normalizeOverrides（与面板 PUT 之后库里形状一致）。 */
+  function setOv(h: Harness, sid: string, ov: Record<string, unknown>): void {
+    h.store.sessionSettings.set(sid, normalizeOverrides(ov, h.store.settings.get()), {
+      kind: sid.startsWith('group:') ? 'group' : 'private',
+    });
+  }
+
+  it('主人私聊：四个工具一起下发，system 里带工作目录', async () => {
+    const seen: { msgs: LlmMessage[]; tools?: ToolDef[] }[] = [];
+    const h = cmp({
+      llm: async (msgs, tools) => {
+        seen.push({ msgs, tools });
+        return { content: '好的。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      say(h, privateEv(OWNER, 1));
+      await waitFor(() => h.sent.length === 1);
+
+      const first = seen[0]!;
+      const names = (first.tools ?? []).map((t) => t.function.name).sort();
+      assert.deepEqual(names, ['list_dir', 'read_file', 'run_command', 'write_file']);
+      assert.match(contentText(first.msgs[0]!.content), /默认工作目录/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('不在白名单的人：不下发工具，也不注入说明', async () => {
+    const seen: { msgs: LlmMessage[]; tools?: ToolDef[] }[] = [];
+    const h = cmp({
+      llm: async (msgs, tools) => {
+        seen.push({ msgs, tools });
+        return { content: '好的。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      say(h, privateEv(99999, 1));
+      await waitFor(() => h.sent.length === 1);
+      assert.equal(seen[0]!.tools, undefined, '没有权限就不该带 tools 字段');
+      assert.doesNotMatch(contentText(seen[0]!.msgs[0]!.content), /默认工作目录/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('白名单群：群主/管理员能用，普通成员不能用', async () => {
+    for (const role of ['owner', 'admin', 'member']) {
+      const seen: { tools?: ToolDef[] }[] = [];
+      const h = cmp({
+        patch: (v) => {
+          v.computer.allow_groups = [30000];
+        },
+        llm: async (_msgs, tools) => {
+          seen.push({ tools });
+          return { content: '好的。', usage, firstTokenMs: 1 };
+        },
+      });
+      try {
+        h.engine.handleEvent({ ...groupEv(), sender: { user_id: 20000, nickname: 'n', card: '', role } });
+        await waitFor(() => h.sent.length === 1);
+        const has = (seen[0]!.tools ?? []).some((t) => t.function.name === 'run_command');
+        assert.equal(has, role !== 'member', `${role} 的判定不对`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('批准之后才执行，结果回灌给模型', async () => {
+    const seen: LlmMessage[][] = [];
+    const h = cmp({
+      llm: async (msgs, tools) => {
+        seen.push(msgs);
+        if (msgs.some((m) => m.role === 'tool')) return { content: '磁盘还剩 8G。', usage, firstTokenMs: 1 };
+        if ((tools ?? []).some((t) => t.function.name === 'run_command')) {
+          return { content: '', usage, firstTokenMs: 1, toolCalls: [call('c1', 'run_command', { command: 'echo hi' })] };
+        }
+        return { content: '没有工具可用。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      say(h, privateEv(OWNER, 1));
+      await waitFor(() => h.approvals.list().length === 1);
+      h.approvals.decide(h.approvals.list()[0]!.id, true);
+      await waitFor(() => h.sent.length === 1);
+
+      assert.match(textOf(h.sent[0]!.segs), /磁盘还剩 8G/);
+      const toolMsg = seen[1]!.find((m) => m.role === 'tool');
+      assert.ok(toolMsg, '第二轮应该带一条工具结果');
+      assert.match(contentText(toolMsg.content), /退出码 0/);
+      assert.match(contentText(toolMsg.content), /hi/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('拒绝之后不执行，回灌一句"没批准"', async () => {
+    const seen: LlmMessage[][] = [];
+    const h = cmp({
+      llm: async (msgs, tools) => {
+        seen.push(msgs);
+        if (msgs.some((m) => m.role === 'tool')) return { content: '那先不看了。', usage, firstTokenMs: 1 };
+        if ((tools ?? []).some((t) => t.function.name === 'run_command')) {
+          return { content: '', usage, firstTokenMs: 1, toolCalls: [call('c1', 'run_command', { command: 'echo hi' })] };
+        }
+        return { content: '没有工具可用。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      say(h, privateEv(OWNER, 1));
+      await waitFor(() => h.approvals.list().length === 1);
+      h.approvals.decide(h.approvals.list()[0]!.id, false);
+      await waitFor(() => h.sent.length === 1);
+
+      const toolMsg = seen[1]!.find((m) => m.role === 'tool');
+      assert.match(contentText(toolMsg!.content), /没有得到批准/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('同一次要调两个：第二个回"次数已用完"，不会静默丢掉 tool_call_id', async () => {
+    const seen: LlmMessage[][] = [];
+    const h = cmp({
+      llm: async (msgs, tools) => {
+        seen.push(msgs);
+        const tools2 = msgs.filter((m) => m.role === 'tool');
+        if (tools2.length > 0) return { content: '好。', usage, firstTokenMs: 1 };
+        if ((tools ?? []).some((t) => t.function.name === 'run_command')) {
+          return {
+            content: '',
+            usage,
+            firstTokenMs: 1,
+            toolCalls: [call('c1', 'run_command', { command: 'echo a' }), call('c2', 'run_command', { command: 'echo b' })],
+          };
+        }
+        return { content: '没有工具可用。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      say(h, privateEv(OWNER, 1));
+      await waitFor(() => h.approvals.list().length === 1);
+      h.approvals.decide(h.approvals.list()[0]!.id, true);
+      await waitFor(() => h.sent.length === 1);
+
+      const results = seen[1]!.filter((m) => m.role === 'tool');
+      assert.equal(results.length, 2, '两个 call 都必须有回执，少一个下一轮就是 400');
+      assert.match(contentText(results[0]!.content), /退出码 0/);
+      assert.match(contentText(results[1]!.content), /次数已用完/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('危险命令连批准都不进', async () => {
+    const seen: LlmMessage[][] = [];
+    const h = cmp({
+      llm: async (msgs, tools) => {
+        seen.push(msgs);
+        if (msgs.some((m) => m.role === 'tool')) return { content: '这个不能做。', usage, firstTokenMs: 1 };
+        if ((tools ?? []).some((t) => t.function.name === 'run_command')) {
+          return { content: '', usage, firstTokenMs: 1, toolCalls: [call('c1', 'run_command', { command: 'rm -rf /' })] };
+        }
+        return { content: '没有工具可用。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      say(h, privateEv(OWNER, 1));
+      await waitFor(() => h.sent.length === 1);
+
+      const toolMsg = seen[1]!.find((m) => m.role === 'tool');
+      assert.match(contentText(toolMsg!.content), /硬性拒绝/);
+      assert.equal(h.approvals.list().length, 0, '硬拒的命令不该在面板上留待批准');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('会话里关掉电脑操作：这个会话就不带工具了', async () => {
+    const seen: { tools?: ToolDef[] }[] = [];
+    const h = cmp({
+      llm: async (_msgs, tools) => {
+        seen.push({ tools });
+        return { content: '好的。', usage, firstTokenMs: 1 };
+      },
+    });
+    try {
+      setOv(h, `private:${OWNER}`, { computer: { enabled: false } });
+      say(h, privateEv(OWNER, 1));
+      await waitFor(() => h.sent.length === 1);
+      assert.equal(seen[0]!.tools, undefined);
     } finally {
       h.cleanup();
     }

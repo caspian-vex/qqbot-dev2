@@ -116,6 +116,40 @@ export interface SearchSettings {
   max_calls: number;
 }
 
+/**
+ * 电脑操作：把容器内的 shell 与文件系统交给模型。
+ *
+ * 这一块是整套设置里唯一「开对了没感觉、开错了直接丢机器」的开关，
+ * 所以默认全关、默认每次执行都要批准，并且把「谁能触发」做成部署级字段
+ * （不参与按会话覆盖：会话能改白名单，等于被拉进来的人自己决定还能拉谁）。
+ *
+ * 边界说明：机器人跑在容器里（alpine、非 root 的 node 用户），
+ * 「完全放开」指的是不限制路径，不是指能动宿主机——没有挂载就够不着。
+ */
+export interface ComputerSettings {
+  /** 是否允许模型操作这台机器。关掉时工具根本不下发给模型。 */
+  enabled: boolean;
+  /** 主人 QQ：私聊时始终可用。0 表示不设主人，只靠白名单。 */
+  owner_qq: number;
+  /**
+   * 默认工作目录。空串表示用数据目录（/opt/qqbot/data）。
+   * 它同时是相对路径的解析起点和命令的 cwd。
+   */
+  workdir: string;
+  /** 单条命令的超时（秒）。 */
+  timeout_sec: number;
+  /** 一条消息里最多执行几次（搜索之外独立计数）。 */
+  max_calls: number;
+  /** 每次执行前是否需要在面板点批准。关掉就是全自动，没有第二次机会。 */
+  require_approval: boolean;
+  /** 等待批准的秒数，超时按拒绝处理。 */
+  approval_timeout_sec: number;
+  /** 额外允许的好友 QQ（私聊）。 */
+  allow_users: number[];
+  /** 额外允许的群号：群内只有群主/管理员能触发。 */
+  allow_groups: number[];
+}
+
 /** 面板凭据配置。 */
 export interface PanelSettings {
   admin_user: string;
@@ -123,7 +157,6 @@ export interface PanelSettings {
   totp_secret: string;
   totp_enabled: boolean;
 }
-
 /** 全部运行期设置，整体以一个 JSON 文档存放。 */
 export interface Settings {
   llm: LLMSettings;
@@ -132,6 +165,7 @@ export interface Settings {
   images: ImageSettings;
   vision: VisionSettings;
   search: SearchSettings;
+  computer: ComputerSettings;
   context: ContextSettings;
   panel: PanelSettings;
 }
@@ -185,6 +219,27 @@ export function defaultSearch(): SearchSettings {
   };
 }
 
+/**
+ * 电脑操作的出厂默认值。
+ *
+ * 全关、无主人、无白名单——开着它就意味着「某个 QQ 能在这台机器上执行命令」，
+ * 这种能力不能靠安装脚本替用户默认打开。批准也必须默认开：
+ * 关掉批准等于把面板上那一次点击也省了，出事时没有任何人工环节。
+ */
+export function defaultComputer(): ComputerSettings {
+  return {
+    enabled: false,
+    owner_qq: 0,
+    workdir: '',
+    timeout_sec: 20,
+    max_calls: 1,
+    require_approval: true,
+    approval_timeout_sec: 90,
+    allow_users: [],
+    allow_groups: [],
+  };
+}
+
 /** 出厂默认值。刻意保守：被动接话概率低、上下文预算小、思考模式关闭。 */
 export function defaultSettings(): Settings {
   return {
@@ -213,6 +268,7 @@ export function defaultSettings(): Settings {
     images: defaultImages(),
     vision: defaultVision(),
     search: defaultSearch(),
+    computer: defaultComputer(),
     context: {
       max_turns: 10,
       token_budget: 3000,
@@ -270,6 +326,25 @@ export function normalizeSettings(v: Settings): Settings {
     if (!Number.isFinite(v.search.timeout_sec)) v.search.timeout_sec = ds.timeout_sec;
     if (!Number.isFinite(v.search.max_calls)) v.search.max_calls = ds.max_calls;
   }
+  // 旧库没有 computer 块：整块补默认值（关着的）。升级不该悄悄把 shell 交出去。
+  if (v.computer === undefined || v.computer === null || typeof v.computer !== 'object') {
+    v.computer = defaultComputer();
+  } else {
+    // 字段级兜底在这里比别的块更要紧：timeout_sec 是 NaN 时 setTimeout 会
+    // 1 毫秒就触发，表现成「每条命令都超时」；approval_timeout_sec 同理，
+    // 会让审批永远来不及点。这类故障看起来像玄学，其实是脏数据。
+    const dc = defaultComputer();
+    const c = v.computer;
+    if (typeof c.enabled !== 'boolean') c.enabled = dc.enabled;
+    if (!Number.isSafeInteger(c.owner_qq) || c.owner_qq < 0) c.owner_qq = dc.owner_qq;
+    if (typeof c.workdir !== 'string') c.workdir = dc.workdir;
+    if (typeof c.require_approval !== 'boolean') c.require_approval = dc.require_approval;
+    if (!Number.isFinite(c.timeout_sec)) c.timeout_sec = dc.timeout_sec;
+    if (!Number.isFinite(c.max_calls)) c.max_calls = dc.max_calls;
+    if (!Number.isFinite(c.approval_timeout_sec)) c.approval_timeout_sec = dc.approval_timeout_sec;
+    if (!Array.isArray(c.allow_users)) c.allow_users = [];
+    if (!Array.isArray(c.allow_groups)) c.allow_groups = [];
+  }
   return v;
 }
 
@@ -287,6 +362,11 @@ export function cloneSettings(v: Settings): Settings {
     images: { ...v.images },
     vision: { ...v.vision },
     search: { ...v.search },
+    computer: {
+      ...v.computer,
+      allow_users: [...v.computer.allow_users],
+      allow_groups: [...v.computer.allow_groups],
+    },
     context: { ...v.context },
     panel: { ...v.panel },
   };

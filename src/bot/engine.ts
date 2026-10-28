@@ -10,6 +10,7 @@ import {
   type Message as LlmMessage,
   type Result,
   type ToolCall,
+  type ToolDef,
 } from '../llm/client';
 import type { Logger } from '../log/logger';
 import type { BotStatus, EnginePort, EngineStats } from '../panel/ports';
@@ -21,6 +22,16 @@ import { sessionId } from '../store/types';
 import { isPeak, localDay, rfc3339, ZERO_TIME } from '../util/time';
 import type { Event, Segment } from '../onebot/types';
 import { at, image, isGroup, isMessage, isPrivate, reply, text } from '../onebot/types';
+import { ApprovalQueue } from './computer-approval';
+import {
+  computerAccess,
+  computerPromptBlock,
+  computerTools,
+  isComputerTool,
+  resolveWorkdir,
+  runComputerTool,
+  type ComputerActor,
+} from './computer';
 import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
 import {
   dedupeImages,
@@ -75,15 +86,27 @@ export interface EngineOptions {
    * 中间的一跳，用真网络跑用例既慢又不稳定，而这里要验的是"搜到了怎么用"。
    */
   searchFetch?: typeof fetch;
+  /**
+   * 数据目录。电脑操作的默认工作目录就是它（配置里没填 workdir 时）。
+   * 不传就退到进程 cwd——容器里是 /app，那是 root 所有的目录，
+   * 写文件会 EACCES，所以线上必须传。
+   */
+  dataDir?: string;
+  /**
+   * 待批准队列。引擎与面板必须共用同一个实例，否则面板看不到引擎挂起的申请。
+   * 不传就自己建一个（测试里够用，线上由 main.ts 注入）。
+   */
+  approvals?: ApprovalQueue;
 }
 
 /**
  * 工具循环最多几轮（含第一轮）。
  *
- * 3 轮 = 初次 + 两批搜索。实际几乎用不到第三批——模型通常搜一次就够。
- * 给上限是因为每多一轮就是一次完整的模型请求，费用和延迟都线性涨。
+ * 4 轮 = 初次 + 三批工具。搜索与电脑操作共用这条轮数预算，各自另有次数闸：
+ * 电脑操作多一步"查一下再改"很正常，但每多一轮就是一次完整的模型请求，
+ * 费用与延迟都线性涨，所以给到 4 就打住。
  */
-const SEARCH_MAX_ROUNDS = 3;
+const TOOL_MAX_ROUNDS = 4;
 
 /**
  * 进程级每日跟进硬顶，不可配置。
@@ -105,6 +128,20 @@ interface Counters {
   lastReplyAt: number;
 }
 
+/** 本次请求可以带哪些工具。由 reply() 算一次，ask/runTools 共用同一个结论。 */
+interface ToolScope {
+  search: boolean;
+  computer: boolean;
+  /** 电脑操作的触发者。权限不通过时 computer=false，这个字段也不会被用到。 */
+  actor: ComputerActor;
+}
+
+/** 两类工具各自的次数预算。共用轮数、分开计数。 */
+interface ToolBudget {
+  used: { search: number; computer: number };
+  limit: { search: number; computer: number };
+}
+
 /** 一个已排定、尚未执行的跟进。 */
 interface PendingEcho {
   kind: string;
@@ -118,6 +155,8 @@ export class Engine implements EnginePort {
   private readonly llm: LlmClient;
   private readonly ctx: ContextManager;
   private readonly imagesDir: string;
+  private readonly dataDir: string;
+  private readonly approvals: ApprovalQueue;
   private sender: Sender | null = null;
 
   private readonly dedupe = new Dedupe(5 * 60_000);
@@ -161,6 +200,8 @@ export class Engine implements EnginePort {
     this.llm = opt.llm ?? new LlmClient();
     this.ctx = new ContextManager(opt.store);
     this.imagesDir = opt.imagesDir ?? '';
+    this.dataDir = opt.dataDir ?? process.cwd();
+    this.approvals = opt.approvals ?? new ApprovalQueue(this.log);
     // 退出时拆掉所有未执行的跟进，别让进程死前还发一条消息
     opt.signal?.addEventListener('abort', () => this.cancelAllEchoes(), { once: true });
   }
@@ -371,6 +412,24 @@ export class Engine implements EnginePort {
     // 它会在回复里编出"我查了一下"，用户直接被误导。
     if (settings.search.enabled) system += `\n${searchPromptBlock(settings.search.max_calls)}`;
 
+    // 电脑操作：权限只算这一次，prompt 与工具声明都用它。两处各算一遍，
+    // 迟早会漂移成"说明书里说能执行命令、tools 却没下发"。
+    const actor: ComputerActor = {
+      sid,
+      kind: kindOf(ev),
+      target: targetOf(ev),
+      user: ev.user_id ?? 0,
+      role: ev.sender?.role ?? '',
+    };
+    const computer = computerAccess(settings.computer, actor);
+    if (computer.allowed) {
+      system += `\n${computerPromptBlock(settings.computer, resolveWorkdir(settings.computer, this.dataDir))}`;
+    } else if (settings.computer.enabled) {
+      // 开关开着但不适用于这个人/这个群：不注入说明、不下发工具，
+      // 模型就不会承诺"我帮你看一下"，用户也不会白等一次超时。
+      this.log.debug('电脑操作不适用于本会话', { session: sid, reason: computer.reason });
+    }
+
     try {
       // 名字只用于面板显示，拿不到就回空串（touch 不会因此擦掉旧值）。
       // 群名在算 vars 时已经拉过一次，这里直接用缓存里的结果，不多发请求。
@@ -400,7 +459,11 @@ export class Engine implements EnginePort {
 
     let res: Result;
     try {
-      res = await this.ask(settings, cfg, msgs);
+      res = await this.ask(settings, cfg, msgs, {
+        search: settings.search.enabled,
+        computer: computer.allowed,
+        actor,
+      });
     } catch (e) {
       this.log.error('调用模型失败', { err: e });
       this.counters.errors++;
@@ -499,8 +562,13 @@ export class Engine implements EnginePort {
    *   2. 搜索源报错/超时 → 错误文本作为工具结果给它，由它自己决定怎么说
    *   3. 轮数或次数用尽 → 不再给工具，逼它用已有信息作答
    */
-  private async ask(s: Settings, cfg: LlmConfig, msgs: LlmMessage[]): Promise<Result> {
-    if (!s.search.enabled) return this.llm.chat(cfg, msgs, this.opt.signal);
+  private async ask(s: Settings, cfg: LlmConfig, msgs: LlmMessage[], scope: ToolScope): Promise<Result> {
+    const tools: ToolDef[] = [];
+    if (scope.search) tools.push(WEB_SEARCH_TOOL);
+    if (scope.computer) tools.push(...computerTools());
+    // 一个工具都没开：请求形状与加工具之前逐字一致。少带两个字段，也就少
+    // 一类"某个中转不认 tools 却又不报错"的兼容问题。
+    if (tools.length === 0) return this.llm.chat(cfg, msgs, this.opt.signal);
 
     // 模型写 query 时常常省掉主语（「那场比赛」），把用户原话一起交给 Search API
     // 能让它补上语境。取最后一条 user 消息：历史里的旧提问与这次搜索无关。
@@ -508,11 +576,19 @@ export class Engine implements EnginePort {
 
     // max_calls 是成本硬闸。NaN 时 Math.max(1, NaN) 还是 NaN，
     // 比较恒为假会让工具一次都不给；normalize 已经兜过一层，这里再兜一层。
-    const limit = Number.isFinite(s.search.max_calls)
-      ? Math.max(1, Math.floor(s.search.max_calls))
-      : 2;
+    const limit = { search: intOr(s.search.max_calls, 2), computer: intOr(s.computer.max_calls, 1) };
+    const budget: ToolBudget = { used: { search: 0, computer: 0 }, limit };
+    // 两类工具共用这条轮数预算，但次数各算各的：搜索贵在请求费，
+    // 命令贵在它要一个真人点批准，混成一个计数器会让其中一类莫名少用。
+    //
+    // 只算"这次真的下发了的"那几类的余量：把没下发的组的额度也算进来，
+    // 搜索用完之后 left() 仍然 > 0，工具就会一直被带上，
+    // 模型就会一遍遍请求搜索、每次只收到一句"次数已用完"。
+    const left = (): number =>
+      (scope.search ? limit.search - budget.used.search : 0) +
+      (scope.computer ? limit.computer - budget.used.computer : 0);
+
     let convo = msgs;
-    let used = 0;
     let promptTokens = 0;
     let completionTokens = 0;
     let firstTokenMs = 0;
@@ -523,7 +599,7 @@ export class Engine implements EnginePort {
       if (firstTokenMs === 0) firstTokenMs = r.firstTokenMs;
     };
     // 多轮请求的用量必须累加：只记最后一轮会让面板上的 token 统计少一半，
-    // 而搜索带来的 prompt 膨胀恰恰是最需要被看见的成本。
+    // 而工具带来的 prompt 膨胀恰恰是最需要被看见的成本。
     const pack = (content: string): Result => ({
       content,
       usage: {
@@ -534,19 +610,14 @@ export class Engine implements EnginePort {
       firstTokenMs,
     });
 
-    for (let round = 0; round < SEARCH_MAX_ROUNDS; round++) {
-      const allowTools = used < limit;
+    for (let round = 0; round < TOOL_MAX_ROUNDS; round++) {
+      const allowTools = left() > 0;
       let res: Result;
       try {
-        res = await this.llm.chat(
-          cfg,
-          convo,
-          this.opt.signal,
-          allowTools ? [WEB_SEARCH_TOOL] : undefined,
-        );
+        res = await this.llm.chat(cfg, convo, this.opt.signal, allowTools ? tools : undefined);
       } catch (e) {
         if (round === 0 && toolsUnsupported(e)) {
-          this.log.warn('当前模型不支持工具调用，本次跳过联网搜索', { err: e });
+          this.log.warn('当前模型不支持工具调用，本次按普通对话回答', { err: e });
           return this.llm.chat(cfg, msgs, this.opt.signal);
         }
         throw e;
@@ -556,18 +627,17 @@ export class Engine implements EnginePort {
       const calls = res.toolCalls ?? [];
       if (!allowTools || calls.length === 0) return pack(res.content);
 
-      const ran = await this.runTools(calls, limit - used, s, cfg, ori);
-      used += ran.count;
+      const ran = await this.runTools(calls, budget, scope, s, cfg, ori);
       convo = [
         ...convo,
         // 这条 assistant 消息必须原样回填：端点是按 tool_call_id 配对结果的，
         // 少了它，后面那些 role=tool 的消息会变成"来路不明的工具结果"。
         { role: 'assistant', content: res.content, tool_calls: calls },
-        ...ran.msgs,
+        ...ran,
       ];
     }
 
-    // 轮数用尽还在要工具：不给工具再问一次，让它用已经查到的内容收尾
+    // 轮数用尽还在要工具：不给工具再问一次，让它用已经拿到的内容收尾
     const last = await this.llm.chat(cfg, convo, this.opt.signal);
     sum(last);
     return pack(last.content);
@@ -576,70 +646,101 @@ export class Engine implements EnginePort {
   /** 执行模型请求的工具调用，每个 call_id 都必须回一条消息。 */
   private async runTools(
     calls: ToolCall[],
-    remain: number,
+    budget: ToolBudget,
+    scope: ToolScope,
     s: Settings,
     cfg: LlmConfig,
     ori: string,
-  ): Promise<{ msgs: LlmMessage[]; count: number }> {
+  ): Promise<LlmMessage[]> {
     const msgs: LlmMessage[] = [];
-    let count = 0;
+    const say = (id: string, name: string, content: string): void => {
+      msgs.push({ role: 'tool', tool_call_id: id, name, content });
+    };
 
     for (const c of calls) {
       const name = c.function?.name ?? '';
       const id = c.id;
-      if (name !== SEARCH_TOOL_NAME) {
-        msgs.push({ role: 'tool', tool_call_id: id, name, content: `没有名为 ${name} 的工具。` });
-        continue;
-      }
-      if (count >= remain) {
-        // 超预算也要回一条：漏掉任何一个 tool_call_id，下一次请求就是 400
-        msgs.push({
-          role: 'tool',
-          tool_call_id: id,
-          name,
-          content: '本次的搜索次数已用完，请直接用现有信息回答。',
-        });
-        continue;
-      }
-      const query = toolQuery(c.function?.arguments ?? '');
-      if (query === '') {
-        msgs.push({
-          role: 'tool',
-          tool_call_id: id,
-          name,
-          content: '搜索词为空。请给出具体的 query 再来一次。',
-        });
+      const args = c.function?.arguments ?? '';
+
+      if (name === SEARCH_TOOL_NAME) {
+        if (budget.used.search >= budget.limit.search) {
+          // 超预算也要回一条：漏掉任何一个 tool_call_id，下一次请求就是 400
+          say(id, name, '本次的搜索次数已用完，请直接用现有信息回答。');
+          continue;
+        }
+        const query = toolQuery(args);
+        if (query === '') {
+          say(id, name, '搜索词为空。请给出具体的 query 再来一次。');
+          continue;
+        }
+        budget.used.search++;
+        try {
+          const hits = await webSearch(query, {
+            // 搜索走 DeepSeek 官方 Search API，与模型共用同一把 Key、同一个域名：
+            // 面板上少一份配置，也就少一处会配错的地方。
+            apiKey: cfg.apiKey,
+            baseURL: cfg.baseURL,
+            maxResults: s.search.max_results,
+            timeoutMs: s.search.timeout_sec * 1000,
+            oriQuestion: ori,
+            signal: this.opt.signal,
+            fetchImpl: this.opt.searchFetch,
+          });
+          this.log.info('已联网搜索', { query, hits: hits.length });
+          say(id, name, formatHits(hits));
+        } catch (e) {
+          // 搜不到不等于答不了：把失败原话交给模型，它通常能老实说"没查到"
+          this.log.warn('联网搜索失败', { query, err: e });
+          say(
+            id,
+            name,
+            `搜索失败（${(e as Error).message}）。不要编造搜索结果，直接说明没查到，或按你已知的信息回答。`,
+          );
+        }
         continue;
       }
 
-      count++;
-      try {
-        const hits = await webSearch(query, {
-          // 搜索走 DeepSeek 官方 Search API，与模型共用同一把 Key、同一个域名：
-          // 面板上少一份配置，也就少一处会配错的地方。
-          apiKey: cfg.apiKey,
-          baseURL: cfg.baseURL,
-          maxResults: s.search.max_results,
-          timeoutMs: s.search.timeout_sec * 1000,
-          oriQuestion: ori,
+      if (isComputerTool(name)) {
+        // 权限在 reply() 里已经算过一次：这里的判断防的是"模型自己编了个工具名"
+        // 或者历史里残留了上一轮的调用——那种情况下不执行，也不登记批准。
+        if (!scope.computer) {
+          say(id, name, '这个会话没有电脑操作权限。');
+          continue;
+        }
+        if (budget.used.computer >= budget.limit.computer) {
+          say(id, name, '本次的电脑操作次数已用完，请直接用现有信息回答。');
+          continue;
+        }
+        budget.used.computer++;
+        const text = await runComputerTool(name, args, {
+          settings: s.computer,
+          actor: scope.actor,
+          cwd: resolveWorkdir(s.computer, this.dataDir),
+          approvals: this.approvals,
+          log: this.log,
+          audit: (action, detail) => this.audit(action, detail),
           signal: this.opt.signal,
-          fetchImpl: this.opt.searchFetch,
         });
-        this.log.info('已联网搜索', { query, hits: hits.length });
-        msgs.push({ role: 'tool', tool_call_id: id, name, content: formatHits(hits) });
-      } catch (e) {
-        // 搜不到不等于答不了：把失败原话交给模型，它通常能老实说"没查到"
-        this.log.warn('联网搜索失败', { query, err: e });
-        msgs.push({
-          role: 'tool',
-          tool_call_id: id,
-          name,
-          content: `搜索失败（${(e as Error).message}）。不要编造搜索结果，直接说明没查到，或按你已知的信息回答。`,
-        });
+        say(id, name, text);
+        continue;
       }
+
+      say(id, name, `没有名为 ${name} 的工具。`);
     }
 
-    return { msgs, count };
+    return msgs;
+  }
+
+  /**
+   * 写一条审计。审计失败不影响主流程——记不下来这件事本身，
+   * 不该让用户的问题也回答不了。
+   */
+  private audit(action: string, detail: string): void {
+    try {
+      this.store.audit.record(action, detail, '');
+    } catch {
+      // 故意忽略
+    }
   }
 
   /** 模型调用失败时给一句兜底回复，避免用户干等。 */
@@ -984,6 +1085,11 @@ function formatLocalMinute(d: Date): string {
  * 用作 Search API 的 ori_question：查询理解靠它补主语。带图的消息里
  * 图片块直接跳过——搜索接口只认文本，塞 data URL 进去既没用又超长。
  */
+/** 取一个有限的正整数，坏值退回默认值（NaN 会让工具循环空转）。 */
+function intOr(v: number, fallback: number): number {
+  return Number.isFinite(v) ? Math.max(1, Math.floor(v)) : fallback;
+}
+
 function lastUserText(msgs: LlmMessage[]): string {
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]!;

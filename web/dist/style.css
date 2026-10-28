@@ -358,11 +358,17 @@ a:hover { text-decoration: underline; }
   margin-bottom: 5px;
 }
 
-.field .note {
+/* 说明文字的统一长相：不管挂在哪一层，都是小一号的灰字。
+   以前只给 .field .note 定了样式，卡片里直接放的 <div class="note">
+   会继承正文的 13px 亮色，看着像又一句正文标题。 */
+.note {
   font-size: 11px;
   color: var(--fg-mute);
-  margin-top: 4px;
   line-height: 1.5;
+}
+
+.field .note {
+  margin-top: 4px;
 }
 
 input[type=text],
@@ -421,7 +427,13 @@ select { cursor: pointer; }
 }
 
 .check input { margin: 4px 0 0; accent-color: var(--accent); flex: none; }
-.check .note { margin: 2px 0 0; }
+/* 勾选项下面那句说明必须自成一行。这几个 span 原本是 inline，
+   长说明会和标题连成一句「允许模型联网搜索开启后把 web_search…」，
+   读起来像串行错误。字号颜色由上面的 .note 统一给。 */
+.check .note {
+  display: block;
+  margin: 2px 0 0;
+}
 
 /* ---------- 会话设置：整组开关 ---------- */
 

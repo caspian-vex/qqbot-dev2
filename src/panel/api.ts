@@ -73,6 +73,7 @@ import {
   writeJSON,
   type ReqCtx,
 } from './http';
+import type { ApprovalQueue } from '../bot/computer-approval';
 import type { EnginePort, OneBotPort, QQLoginPort } from './ports';
 import { SESSION_TTL_MS, type SessionInfo, type SessionStore } from './session-store';
 
@@ -112,6 +113,11 @@ export interface ApiDeps {
   onebotPort?: number;
   /** 图池目录；未配置时图池接口返回空列表。 */
   imagesDir?: string;
+  /**
+   * 待批准队列。必须和引擎用的是同一个实例，否则面板上永远看不到东西。
+   * 不传就当成"永远没有待批准"：接口照常返回，只是列表一直为空。
+   */
+  computer?: ApprovalQueue;
 }
 
 /**
@@ -275,6 +281,46 @@ function validateSettings(v: Settings): void {
   if (!isQQList(v.bot.blacklist_users)) {
     throw new HttpError(400, '用户黑名单只能填正整数 QQ 号');
   }
+
+  // ---- 电脑操作 ----
+  // 这一组的校验不只是"数字在范围内"：开启时没有任何白名单，等于开了个
+  // 谁也进不去的功能，用户会以为配好了却在聊天里怎么喊都没反应。
+  if (v.computer.timeout_sec < 1 || v.computer.timeout_sec > 60) {
+    throw new HttpError(400, '命令超时应在 1-60 秒之间');
+  }
+  if (v.computer.max_calls < 1 || v.computer.max_calls > 5) {
+    throw new HttpError(400, '每条消息最多执行几次应在 1-5 之间');
+  }
+  if (v.computer.approval_timeout_sec < 30 || v.computer.approval_timeout_sec > 300) {
+    throw new HttpError(400, '批准等待应在 30-300 秒之间');
+  }
+  // 容器里只有 /opt/qqbot 归 node 用户，工作目录填成 /app 之类会在第一次
+  // 执行时以 EACCES 收场，而那时用户已经离开设置页了。
+  if (v.computer.workdir.trim() !== '' && !/^\//.test(v.computer.workdir.trim())) {
+    throw new HttpError(400, '工作目录要填绝对路径（以 / 开头）');
+  }
+  if (v.computer.owner_qq !== 0 && !isQQ(v.computer.owner_qq)) {
+    throw new HttpError(400, '主人 QQ 只能填正整数');
+  }
+  if (!isQQList(v.computer.allow_users)) {
+    throw new HttpError(400, '允许的好友只能填正整数 QQ 号');
+  }
+  if (!isQQList(v.computer.allow_groups)) {
+    throw new HttpError(400, '允许的群只能填正整数群号');
+  }
+  if (
+    v.computer.enabled &&
+    v.computer.owner_qq === 0 &&
+    v.computer.allow_users.length === 0 &&
+    v.computer.allow_groups.length === 0
+  ) {
+    throw new HttpError(400, '开启前至少要填主人 QQ 或一个白名单好友/群');
+  }
+}
+
+/** 单个 QQ 号：正整数。与 isQQList 的元素判据同一条。 */
+function isQQ(n: unknown): boolean {
+  return typeof n === 'number' && Number.isSafeInteger(n) && n > 0;
 }
 
 /** 群号/QQ 号列表：必须都是正整数。 */
@@ -655,6 +701,13 @@ export class Api {
         v.images = { ...inp.images };
         v.vision = { ...inp.vision };
         v.search = { ...inp.search };
+        // 两个名单必须显式复制：这里漏写或直接引用 inp，面板上的数组会和
+        // store 缓存共享同一个引用，后面对它的任何改动都会越过 save 生效。
+        v.computer = {
+          ...inp.computer,
+          allow_users: [...inp.computer.allow_users],
+          allow_groups: [...inp.computer.allow_groups],
+        };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });
@@ -957,6 +1010,61 @@ export class Api {
       clientIP(ctx.req),
     );
     writeJSON(ctx.res, 200, { ok: true, overrides });
+  }
+
+  // ---- 电脑操作：待批准 ----
+
+  /**
+   * 待批准列表。面板每 2 秒轮一次。
+   *
+   * 只回展示用的字段：队列内部那个 resolve 句柄绝不能出现在响应里，
+   * 否则前端拿到一个不能序列化的函数、或者更糟——一个能被构造出来的"自动批准"。
+   */
+  computerPending(ctx: ReqCtx): void {
+    // 字段名在这里显式翻译成 snake_case：面板其余接口都是这个风格
+    // （target_id / created_at），直接把内部结构吐出去会变成一半驼峰一半下划线。
+    const items = (this.d.computer?.list() ?? []).map((x) => ({
+      id: x.id,
+      session: x.session,
+      kind: x.kind,
+      target: x.target,
+      user: x.user,
+      tool: x.tool,
+      summary: x.summary,
+      detail: x.detail,
+      created_at: x.createdAt,
+      expires_at: x.expiresAt,
+      remain_ms: x.remainMs,
+    }));
+    writeJSON(ctx.res, 200, { items });
+  }
+
+  /**
+   * 点批准/拒绝。
+   *
+   * 三种结果对应三种状态码，缺一不可：404 说明前端拿着一条不存在的记录
+   * （通常是页面开着很久没刷新），410 说明它已经过期或被处理过。
+   * 都回 200 的话，用户会以为"我批准了"，而引擎那边其实早就超时放弃了。
+   */
+  async computerDecide(ctx: ReqCtx, sess: SessionInfo): Promise<void> {
+    const raw = await body(ctx, 4 * 1024);
+    const req = (raw ?? {}) as { id?: unknown; approve?: unknown };
+    const id = typeof req.id === 'string' ? req.id.trim() : '';
+    if (id === '') throw new HttpError(400, '缺少待批准编号');
+    if (typeof req.approve !== 'boolean') throw new HttpError(400, 'approve 必须是布尔值');
+
+    const q = this.d.computer;
+    const result = q ? q.decide(id, req.approve) : 'unknown';
+    if (result === 'unknown') throw new HttpError(404, '没有这条待批准记录');
+    if (result === 'expired') throw new HttpError(410, '这条待批准已过期或被处理过');
+
+    this.d.log.info('处理电脑操作审批', { id, approve: String(req.approve), by: sess.user });
+    this.store.audit.record(
+      req.approve ? 'computer.approved' : 'computer.denied',
+      id,
+      clientIP(ctx.req),
+    );
+    writeJSON(ctx.res, 200, { ok: true, decision: req.approve ? 'approved' : 'denied' });
   }
 
   /**

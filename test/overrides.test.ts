@@ -16,6 +16,7 @@ import {
   isEmptyOverrides,
   normalizeOverrides,
   overriddenGroups,
+  groupBase,
   pickBot,
   pickGroups,
   resolveSettings,
@@ -191,7 +192,15 @@ describe('规范化外来覆盖', () => {
   });
 
   it('组清单与字段清单自洽（面板白名单靠它，写漏一个就是静默不支持）', () => {
-    assert.deepEqual([...OVERRIDABLE_GROUPS], ['bot', 'proactive', 'images', 'vision', 'search', 'context']);
+    assert.deepEqual([...OVERRIDABLE_GROUPS], [
+      'bot',
+      'proactive',
+      'images',
+      'vision',
+      'search',
+      'computer',
+      'context',
+    ]);
     assert.deepEqual(Object.keys(OVERRIDE_FIELDS.bot).sort(), [
       'blacklist_users',
       'group_cooldown_sec',
@@ -204,6 +213,44 @@ describe('规范化外来覆盖', () => {
     ]);
   });
 
+  it('电脑操作的会话覆盖不带走部署级字段，也不冻结全局值', () => {
+    const g = defaultSettings();
+    g.computer = {
+      ...g.computer,
+      enabled: true,
+      owner_qq: 10001,
+      workdir: '/opt/qqbot/data',
+      allow_users: [20002],
+      allow_groups: [30003],
+      require_approval: true,
+      approval_timeout_sec: 90,
+    };
+    const ov = normalizeOverrides({ computer: { enabled: true, max_calls: 3, timeout_sec: 15 } }, g);
+    const r = resolveSettings(g, ov);
+
+    assert.equal(r.computer.enabled, true);
+    assert.equal(r.computer.max_calls, 3);
+    assert.equal(r.computer.timeout_sec, 15);
+    // 部署级边界必须还是全局那份
+    assert.equal(r.computer.owner_qq, 10001);
+    assert.equal(r.computer.workdir, '/opt/qqbot/data');
+    assert.deepEqual(r.computer.allow_users, [20002]);
+    assert.deepEqual(r.computer.allow_groups, [30003]);
+    assert.equal(r.computer.require_approval, true);
+
+    // 全局随后改了白名单：这个会话要跟着变，说明没被冻结进快照
+    const g2 = defaultSettings();
+    g2.computer = { ...g.computer, allow_users: [40004] };
+    assert.deepEqual(resolveSettings(g2, ov).computer.allow_users, [40004]);
+    // 也不该污染全局
+    assert.deepEqual(g.computer.allow_users, [20002]);
+  });
+
+  it('groupBase(computer) 只暴露三个可覆盖字段', () => {
+    const keys = Object.keys(groupBase('computer', defaultSettings())).sort();
+    assert.deepEqual(keys, ['enabled', 'max_calls', 'timeout_sec']);
+  });
+
   it('空覆盖识别', () => {
     assert.equal(isEmptyOverrides(null), true);
     assert.equal(isEmptyOverrides({}), true);
@@ -214,11 +261,19 @@ describe('规范化外来覆盖', () => {
     ]);
   });
 
-  it('pickGroups 只给六个可覆盖组（不含 Key 与面板凭据）', () => {
+  it('pickGroups 只给七个可覆盖组（不含 Key 与面板凭据）', () => {
     const g = defaultSettings();
     g.llm.api_key = 'sk-secret';
     const p = pickGroups(g);
-    assert.deepEqual(Object.keys(p).sort(), ['bot', 'context', 'images', 'proactive', 'search', 'vision']);
+    assert.deepEqual(Object.keys(p).sort(), [
+      'bot',
+      'computer',
+      'context',
+      'images',
+      'proactive',
+      'search',
+      'vision',
+    ]);
     assert.ok(!JSON.stringify(p).includes('sk-secret'));
   });
 });

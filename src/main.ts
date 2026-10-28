@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, loadSecrets, root, secretsPath, webDir, type Config } from './config';
 import { Engine } from './bot';
+import { ApprovalQueue } from './bot/computer-approval';
 import { parseFlags, flagName } from './cli/flags';
 import { LogHub } from './log/hub';
 import { Logger, type LogLevel } from './log/logger';
@@ -118,7 +119,12 @@ async function cmdRun(argv: string[]): Promise<void> {
     // ?? 不会回退到 toml 的 access_token，协议端就会因为 token 不匹配拒绝连接。
     const secretToken = secrets['QQBOT_ONEBOT_TOKEN'] ?? '';
     const token = secretToken !== '' ? secretToken : config.onebot.accessToken;
-    const engine = new Engine({ store, log, signal: ac.signal, imagesDir });
+    // 待批准队列：引擎挂起申请、面板读取并点批准，必须是同一个实例。
+    // 放在这里建，两边的生命周期就都由 ac.signal 统一收口。
+    const approvals = new ApprovalQueue(log.with({ component: 'computer' }));
+    ac.signal.addEventListener('abort', () => approvals.cancelAll(), { once: true });
+
+    const engine = new Engine({ store, log, signal: ac.signal, imagesDir, dataDir: config.dataDir, approvals });
     const client = new Client(config.onebot.url, token, log);
 
     // 引擎与客户端互相注入：先建引擎再建客户端，然后回填，避免循环依赖
@@ -148,6 +154,7 @@ async function cmdRun(argv: string[]): Promise<void> {
       // 登录成功后自动补齐这条反向 WS，省掉「去网络页点一下」的手工步骤
       onebotPort: onebotPortOf(config.onebot.url),
       imagesDir,
+      approvals,
       version: versionString(),
     });
 

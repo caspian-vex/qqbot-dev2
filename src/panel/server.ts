@@ -18,6 +18,7 @@ import {
   type Handler,
   type ReqCtx,
 } from './http';
+import type { ApprovalQueue } from '../bot/computer-approval';
 import { nullEngine, nullOneBot, nullQQLogin, type EnginePort, type OneBotPort, type QQLoginPort } from './ports';
 import { SessionStore, type SessionInfo } from './session-store';
 
@@ -34,6 +35,11 @@ export interface PanelOptions {
   onebotPort?: number;
   /** 图池目录（数据目录下的 images/）；不传时图池页显示为空。 */
   imagesDir?: string;
+  /**
+   * 待批准队列。**必须和引擎共用同一个实例**，否则引擎挂起的申请面板看不见，
+   * 每次执行都会以"等待批准超时"收场。不传就是空队列（测试与旧调用方够用）。
+   */
+  approvals?: ApprovalQueue;
   hub?: LogHub;
   version?: string;
 }
@@ -65,6 +71,7 @@ export class PanelServer {
       qq: opt.qq ?? nullQQLogin(),
       onebotPort: opt.onebotPort,
       imagesDir: opt.imagesDir,
+      computer: opt.approvals,
     });
 
     this.router = this.buildRouter();
@@ -103,6 +110,9 @@ export class PanelServer {
     // 会话级设置：按对话对象覆盖触发规则/主动发言/图池/识图/搜索/上下文
     r.add('GET', '/api/sessions/settings', this.wrap((c) => a.sessionSettings(c), false));
     r.add('PUT', '/api/sessions/settings', this.wrap((c, s) => a.putSessionSettings(c), true));
+    // 电脑操作的待批准：GET 免 CSRF（只读），POST 点批准必须带 token
+    r.add('GET', '/api/computer/pending', this.wrap((c) => a.computerPending(c), false));
+    r.add('POST', '/api/computer/decide', this.wrap((c, s) => a.computerDecide(c, s), true));
     r.add('GET', '/api/usage', this.wrap((c) => a.usage(c), false));
     r.add('GET', '/api/audit', this.wrap((c) => a.audit(c), false));
     r.add('POST', '/api/test/send', this.wrap((c, s) => a.testSend(c, s), true));
