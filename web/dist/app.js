@@ -136,6 +136,7 @@
     network:  { title: '网络', icon: '⇄', view: viewNetwork },
     napcat:   { title: '协议端', icon: '⌗', view: viewNapcat },
     settings: { title: '设置', icon: '⚙', view: viewSettings },
+    pool:     { title: '图池', icon: '❏', view: viewPool },
     personas: { title: '人格', icon: '✦', view: viewPersonas },
     sessions: { title: '会话', icon: '☰', view: viewSessions },
     usage:    { title: '用量', icon: '▤', view: viewUsage },
@@ -634,11 +635,11 @@
         </div>
 
         <div class="card">
-          <h3>图池 <span class="hint">把图片放进数据目录的 images/ 文件夹，机器人自己决定何时配图</span></h3>
+          <h3>图池 <span class="hint">按标签分类的图片库，在「<a href="#/pool">图池</a>」页维护</span></h3>
           <label class="check">
             <input type="checkbox" id="f-img" ${(img.enabled ? 'checked' : '')}>
             <span>允许机器人发图
-              <span class="note">开启后图池清单会注入系统提示，模型觉得合适就在回复里带一张。
+              <span class="note">开启后图池的「标签 + 备注」会注入系统提示，模型判断此刻适合哪一类就发哪一类。
               它有权不发；图池为空时这个开关没有效果。</span>
             </span>
           </label>
@@ -651,11 +652,11 @@
             <div class="field">
               <label>图池目录</label>
               <input type="text" id="f-img-dir" value="${esc(imgDir)}" readonly>
-              <div class="note">往这个文件夹放 jpg/png/gif/webp 图片即可，改完无需重启。</div>
+              <div class="note">一个标签一个子目录；也可以直接往这里拷图，算作「未分类」。</div>
             </div>
           </div>
           <div class="field">
-            <label>池内文件</label>
+            <label>标签概览</label>
             <div id="f-imglist" class="note">加载中…</div>
           </div>
         </div>
@@ -735,15 +736,298 @@
         },
       });
 
-      // 池内文件清单（纯展示，上传/删除直接操作目录即可）
-      const list = pool.items || [];
+      // 标签概览（真正的增删改在「图池」页）
+      const tags = pool.tags || [];
       const listBox = $('#f-imglist');
       if (listBox) {
-        listBox.textContent = list.length === 0
-          ? '（空）——往上面的目录放几张图，机器人就有图可发了'
-          : list.map((f) => `${f.name}（${Math.max(1, Math.round(f.size / 1024))} KB）`).join('、');
+        listBox.innerHTML = tags.length === 0
+          ? '（空）——去 <a href="#/pool">图池</a> 新建一个标签并上传图片，机器人就有图可发了'
+          : tags.map((t) => `${esc(t.name)}（${t.count} 张）`).join('、') +
+            ` · 共 ${pool.total || 0} 张 · <a href="#/pool">去图池管理</a>`;
       }
     }).catch(errInto('#set-body'));
+  }
+
+  /* ================= 图池 ================= */
+
+  const fmtKB = (n) => Math.max(1, Math.round((n || 0) / 1024)) + ' KB';
+  const imgRaw = (tag, name) =>
+    '/api/images/raw?tag=' + encodeURIComponent(tag) + '&name=' + encodeURIComponent(name);
+
+  // 上传不能用 api()：那个会把 body 序列化成 JSON，这里要发文件本身。
+  // 文件名走查询串、类型靠服务端嗅探文件头，前端只负责把字节送到。
+  async function uploadImage(tag, file) {
+    const q = '?tag=' + encodeURIComponent(tag) + '&name=' + encodeURIComponent(file.name || '');
+    let res;
+    try {
+      res = await fetch('/api/images/upload' + q, {
+        method: 'POST',
+        headers: {
+          'X-CSRF-Token': cookie('qqbot_csrf'),
+          'Content-Type': file.type || 'application/octet-stream',
+        },
+        body: file,
+        credentials: 'same-origin',
+      });
+    } catch (e) {
+      throw new Error('网络错误：' + e.message);
+    }
+    const text = await res.text();
+    let data = null;
+    if (text) { try { data = JSON.parse(text); } catch (_) { data = null; } }
+    if (!res.ok) {
+      if (res.status === 401) { app.user = null; renderLogin(); }
+      throw new Error((data && data.error) || ('上传失败（HTTP ' + res.status + '）'));
+    }
+    return data;
+  }
+
+  function viewPool(el) {
+    el.innerHTML = `
+      <div class="page-head">
+        <div>
+          <h2>图池</h2>
+          <div class="desc">按标签分类的图片库。标签的备注会写进系统提示，机器人据此判断此刻该发哪一类图</div>
+        </div>
+        <button class="btn" data-act="new-tag">新建标签</button>
+      </div>
+
+      <div class="card">
+        <h3>怎么用 <span class="hint">标签 = 一个子目录，备注 = 给模型看的说明</span></h3>
+        <div class="note">
+          建一个标签（例如 <code>funny</code>），备注写清"好笑的梗图，群里出现好笑的事时发"，
+          再往里传几张图。之后机器人聊到好笑的场面，就会自己挑一张 funny 里的图发出来。<br>
+          模型侧的写法是 <code>[图:funny]</code>（随机一张）或 <code>[图:funny/文件名]</code>（指定一张），
+          越界的名字一律丢弃，不会把奇怪的路径发出去。
+        </div>
+      </div>
+
+      <div class="card" id="pool-new" style="display:none">
+        <h3>新建标签</h3>
+        <div class="row">
+          <div class="grow" style="flex:0 0 180px">
+            <label class="field" style="margin:0"><span style="font-size:12px;color:var(--fg-dim)">标签名</span></label>
+            <input type="text" id="pool-new-name" maxlength="24" placeholder="funny">
+          </div>
+          <div class="grow" style="flex:1 1 320px">
+            <label class="field" style="margin:0"><span style="font-size:12px;color:var(--fg-dim)">备注（给机器人看）</span></label>
+            <input type="text" id="pool-new-note" maxlength="300" placeholder="好笑的梗图，群里出现好笑的事时发">
+          </div>
+          <button class="btn" data-act="create-tag">创建</button>
+          <button class="btn ghost" data-act="cancel-new">取消</button>
+        </div>
+        <div class="note">标签名可用中文、字母、数字、下划线、连字符；备注随时能改。</div>
+      </div>
+
+      <div id="pool-body"><div class="empty">加载中…</div></div>`;
+
+    let pool = { dir: '', tags: [], total: 0 };
+
+    const thumbHTML = (t) => t.images.map((im) => `
+      <figure class="pool-thumb">
+        <img src="${esc(imgRaw(t.name, im.name))}" alt="${esc(im.name)}" loading="lazy">
+        <figcaption>
+          <span class="nm" title="${esc(im.name)} · ${fmtKB(im.size)}">${esc(im.name)}</span>
+          <button class="x" data-act="del-img" data-tag="${esc(t.name)}" data-name="${esc(im.name)}"
+                  title="删除这张">×</button>
+        </figcaption>
+      </figure>`).join('');
+
+    const tagHTML = (t) => {
+      const untagged = t.name === '未分类';
+      return `
+      <div class="card pool-tag">
+        <div class="pool-head">
+          <div class="grow">
+            <h3>${esc(t.name)} <span class="hint">${t.images.length} 张</span></h3>
+          </div>
+          <div class="row" style="gap:6px;flex:0 0 auto">
+            <button class="btn sm ghost" data-act="pick" data-tag="${esc(t.name)}">上传图片</button>
+            ${untagged ? '' : `<button class="btn sm ghost" data-act="rename" data-tag="${esc(t.name)}">改名</button>
+            <button class="btn sm danger" data-act="del-tag" data-tag="${esc(t.name)}">删除标签</button>`}
+          </div>
+        </div>
+
+        <div class="field">
+          <label>备注 <span class="hint">${t.note
+            ? '写清这一类图是什么、什么场景适合发'
+            : '还没写——机器人只看得到标签名，判断会差一些'}</span></label>
+          <textarea rows="2" maxlength="300" data-note
+            placeholder="例如：好笑的梗图与沙雕表情包，群里出现好笑的事、被调侃时发">${esc(t.note || '')}</textarea>
+          <div class="row end" style="margin-top:8px">
+            <button class="btn sm" data-act="save-note" data-tag="${esc(t.name)}">保存备注</button>
+          </div>
+        </div>
+
+        <div class="drop" data-drop="${esc(t.name)}">
+          <input type="file" accept="image/*" multiple hidden data-file>
+          ${t.images.length ? `<div class="pool-grid">${thumbHTML(t)}</div>` : ''}
+          <div class="drop-hint">把图片拖到这里，或点「上传图片」 · jpg/png/gif/webp/bmp，单张 ≤ 8MB</div>
+        </div>
+      </div>`;
+    };
+
+    const render = () => {
+      const body = $('#pool-body');
+      if (!body) return; // 用户已经切走
+      if (!pool.dir) {
+        body.innerHTML = '<div class="empty">图池目录未配置（服务端没有传 imagesDir）</div>';
+        return;
+      }
+      body.innerHTML = pool.tags.length
+        ? pool.tags.map(tagHTML).join('')
+        : '<div class="card"><div class="empty">还没有标签。点右上角「新建标签」，再往里传图。</div></div>';
+    };
+
+    const reload = async () => {
+      pool = await api('/api/image-tags');
+      render();
+    };
+
+    const doUpload = async (tag, fileList) => {
+      const files = Array.from(fileList || []).filter(
+        (f) => f.type.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp)$/i.test(f.name || ''),
+      );
+      if (!files.length) { bad('只能上传图片文件'); return; }
+
+      let done = 0;
+      const errs = [];
+      for (const f of files) {
+        try {
+          await uploadImage(tag, f);
+          done++;
+        } catch (e) {
+          errs.push(`${f.name}：${e.message}`);
+        }
+      }
+      if (done) ok(`已上传 ${done} 张到「${tag}」`);
+      if (errs.length) {
+        bad(errs.slice(0, 2).join('；') + (errs.length > 2 ? ` 等 ${errs.length} 个失败` : ''));
+      }
+      await reload();
+    };
+
+    bindActions(el, {
+      'new-tag': () => {
+        $('#pool-new').style.display = '';
+        $('#pool-new-name').focus();
+      },
+      'cancel-new': () => { $('#pool-new').style.display = 'none'; },
+
+      'create-tag': async (btn) => {
+        const name = $('#pool-new-name').value.trim();
+        const note = $('#pool-new-note').value.trim();
+        if (!name) { bad('标签名不能为空'); return; }
+        btn.disabled = true;
+        try {
+          await api('/api/image-tags', { method: 'PUT', body: { name, note } });
+          $('#pool-new-name').value = '';
+          $('#pool-new-note').value = '';
+          $('#pool-new').style.display = 'none';
+          ok('标签已创建');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+
+      'save-note': async (btn) => {
+        const tag = btn.dataset.tag;
+        const card = btn.closest('.pool-tag');
+        const note = card.querySelector('textarea[data-note]').value.trim();
+        btn.disabled = true;
+        try {
+          await api('/api/image-tags', { method: 'PUT', body: { name: tag, note } });
+          ok('备注已保存');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+
+      rename: async (btn) => {
+        const from = btn.dataset.tag;
+        const to = window.prompt(`把「${from}」改成：`, from);
+        if (to === null) return;
+        try {
+          await api('/api/image-tags/rename', { method: 'POST', body: { from, to: to.trim() } });
+          ok('已改名');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        }
+      },
+
+      'del-tag': async (btn) => {
+        const tag = btn.dataset.tag;
+        if (!window.confirm(`删除标签「${tag}」？标签里还有图的话会先被拦下来。`)) return;
+        try {
+          await api('/api/image-tags?name=' + encodeURIComponent(tag), { method: 'DELETE' });
+          ok('标签已删除');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        }
+      },
+
+      'del-img': async (btn) => {
+        const tag = btn.dataset.tag;
+        const name = btn.dataset.name;
+        if (!window.confirm(`删除「${tag}」里的 ${name}？`)) return;
+        try {
+          await api(
+            '/api/images?tag=' + encodeURIComponent(tag) + '&name=' + encodeURIComponent(name),
+            { method: 'DELETE' },
+          );
+          ok('已删除');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        }
+      },
+
+      pick: (btn) => {
+        const input = btn.closest('.pool-tag').querySelector('input[type=file]');
+        if (input) input.click();
+      },
+    });
+
+    // 选文件与拖拽都落在 .drop 上：前者靠 input 的 change，
+    // 后者靠容器上的三个事件（dragover 必须 preventDefault 才会触发 drop）
+    el.addEventListener('change', (e) => {
+      const input = e.target.closest('input[type=file]');
+      if (!input || !input.files || input.files.length === 0) return;
+      const tag = input.closest('.drop').dataset.drop;
+      void doUpload(tag, input.files).then(() => { input.value = ''; });
+    });
+
+    el.addEventListener('dragover', (e) => {
+      const drop = e.target.closest('.drop');
+      if (!drop) return;
+      e.preventDefault();
+      drop.classList.add('over');
+    });
+
+    el.addEventListener('dragleave', (e) => {
+      const drop = e.target.closest('.drop');
+      if (drop && !drop.contains(e.relatedTarget)) drop.classList.remove('over');
+    });
+
+    el.addEventListener('drop', (e) => {
+      const drop = e.target.closest('.drop');
+      if (!drop) return;
+      e.preventDefault();
+      drop.classList.remove('over');
+      if (e.dataTransfer && e.dataTransfer.files.length) {
+        void doUpload(drop.dataset.drop, e.dataTransfer.files);
+      }
+    });
+
+    reload().catch(errInto('#pool-body'));
   }
 
   /* ================= 人格 ================= */

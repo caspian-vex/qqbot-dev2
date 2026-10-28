@@ -106,6 +106,14 @@ export class PanelServer {
     r.add('GET', '/api/groups', this.wrap((c) => a.groups(c), false));
     r.add('GET', '/api/friends', this.wrap((c) => a.friends(c), false));
     r.add('GET', '/api/images', this.wrap((c) => a.images(c), false));
+    // 图池管理：标签增删改、上传、删除、原图预览
+    r.add('GET', '/api/image-tags', this.wrap((c) => a.images(c), false));
+    r.add('PUT', '/api/image-tags', this.wrap((c, s) => a.saveImageTag(c, s), true));
+    r.add('POST', '/api/image-tags/rename', this.wrap((c, s) => a.renameImageTag(c, s), true));
+    r.add('DELETE', '/api/image-tags', this.wrap((c, s) => a.deleteImageTag(c, s), true));
+    r.add('POST', '/api/images/upload', this.wrap((c, s) => a.uploadImage(c, s), true));
+    r.add('DELETE', '/api/images', this.wrap((c, s) => a.deleteImage(c, s), true));
+    r.add('GET', '/api/images/raw', this.wrap((c) => a.imageRaw(c), false));
 
     // 扫码登录 QQ（Go 版没有的新增能力）
     r.add('GET', '/api/qq/status', this.wrap((c) => a.qqStatus(c), false));

@@ -2,8 +2,30 @@
 //
 // 与 Go 版 internal/panel/api.go 一一对应：路由、状态码、中文错误文案
 // 全部逐字保留——前端会把 error 字段直接 toast 出来，改一个字就是改产品文案。
-import { readdirSync, statSync } from 'node:fs';
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { extname, join } from 'node:path';
+import {
+  IMAGE_MIME,
+  UNTAGGED,
+  isValidTagName,
+  listPool,
+  normalizeTagName,
+  poolFilePath,
+  sanitizeStem,
+  sniffImageExt,
+  tagDirOf,
+  uniqueName,
+} from '../bot/imagepool';
 import type { LogHub } from '../log/hub';
 import type { Logger } from '../log/logger';
 import type { Store } from '../store';
@@ -26,6 +48,7 @@ import {
   HttpError,
   isSecureRequest,
   parseCookies,
+  readBinary,
   readJSON,
   serializeCookie,
   writeJSON,
@@ -36,6 +59,15 @@ import { SESSION_TTL_MS, type SessionInfo, type SessionStore } from './session-s
 
 export const COOKIE_SESSION = 'qqbot_session';
 export const COOKIE_CSRF = 'qqbot_csrf';
+
+/**
+ * 单张图上限。
+ *
+ * 8MB 的依据：QQ 自己的图片上限是 30MB 左右，但图池里的图是要被反复发出去的，
+ * 池子越大越占磁盘（1 核 2G 的机器往往只有 20-40GB 盘），
+ * 而且超大图在 QQ 客户端里会被压缩得看不清。表情包/梗图基本都在 1MB 以内。
+ */
+export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
 /** 已通过鉴权的处理函数。 */
 export type AuthedHandler = (ctx: ReqCtx, sess: SessionInfo) => void | Promise<void>;
@@ -715,35 +747,265 @@ export class Api {
   }
 
   // ---- 图池 ----
+  //
+  // 图池是「一个标签一个目录」：data/images/<标签>/。面板负责三件事：
+  // 管标签（增删改备注）、传图、删图。文件系统仍是唯一事实来源，
+  // 库里的 image_tags 只补一条盘上放不下的东西——给模型看的备注。
+
+  /** 图池根目录；未配置时为空串（所有写操作直接报错，读操作返回空池）。 */
+  private poolDir(): string {
+    return this.d.imagesDir ?? '';
+  }
+
+  /** 标签名 → 备注。读库失败时退化成"全都没备注"，不影响面板打开。 */
+  private tagNotes(): Map<string, string> {
+    try {
+      return this.store.imageTags.notes();
+    } catch (e) {
+      this.d.log.warn('读取图池标签失败', { err: e });
+      return new Map();
+    }
+  }
+
+  /** 规范化并校验标签名，非法直接 400。 */
+  private tagName(raw: string): string {
+    const name = normalizeTagName(raw);
+    if (name === '') throw new HttpError(400, '标签名不能为空');
+    if (!isValidTagName(name)) {
+      throw new HttpError(400, '标签名只能包含中文、字母、数字、下划线或连字符（1-24 个字符）');
+    }
+    return name;
+  }
+
+  /** 图池概览：标签、备注、每张图的名称与大小。 */
+  images(ctx: ReqCtx): void {
+    const dir = this.poolDir();
+    const tags = listPool(dir, this.tagNotes());
+    const items = tags.flatMap((t) =>
+      t.images.map((i) => ({ tag: i.tag, name: i.name, size: i.size })),
+    );
+    writeJSON(ctx.res, 200, {
+      dir,
+      total: items.length,
+      tags: tags.map((t) => ({
+        name: t.name,
+        note: t.note,
+        count: t.images.length,
+        images: t.images.map((i) => ({ name: i.name, size: i.size, mtime: i.mtime })),
+      })),
+      items,
+    });
+  }
 
   /**
-   * 图池文件清单，供设置页展示"池里有什么"。
+   * 新建标签或保存备注。
    *
-   * 只报文件名和大小，不提供预览/上传/删除：
-   * 图是用户自己放进目录的，面板能看一眼就够了，
-   * 做成可写的反而要为一张图引入一套上传与越权防线。
+   * 一个接口干两件事：面板里"新建标签"和"改备注"本来就是同一个输入框，
+   * 分成两个接口只会让前端在空标签上多一次判断。名字存在即更新备注。
    */
-  images(ctx: ReqCtx): void {
-    const dir = this.d.imagesDir ?? '';
-    const items: { name: string; size: number }[] = [];
-    if (dir !== '') {
-      try {
-        for (const name of readdirSync(dir)) {
-          if (!['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(extname(name).toLowerCase())) {
-            continue;
-          }
-          try {
-            items.push({ name, size: statSync(join(dir, name)).size });
-          } catch {
-            // 列目录与 stat 之间文件被删了：跳过这一张就行
-          }
-        }
-      } catch {
-        // 目录还没建（用户没放过图）：返回空列表而不是 500
+  async saveImageTag(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 8 * 1024)) as { name?: unknown; note?: unknown };
+    const name = this.tagName(typeof req.name === 'string' ? req.name : '');
+    const note = (typeof req.note === 'string' ? req.note : '').trim();
+    if ([...note].length > 300) throw new HttpError(400, '备注最多 300 个字符');
+
+    const dir = this.poolDir();
+    if (dir === '') throw new HttpError(400, '图池目录未配置');
+
+    try {
+      // 未分类不是一个真实目录：它的图就散在 images/ 根目录下，
+      // 所以只存备注，不建目录（建了会与虚拟标签重名）。
+      if (name !== UNTAGGED) mkdirSync(tagDirOf(dir, name), { recursive: true });
+      this.store.imageTags.save(name, note);
+    } catch (e) {
+      this.d.log.error('保存图池标签失败', { name, err: e });
+      throw new HttpError(500, '保存失败');
+    }
+    this.store.audit.record('image-tag.saved', name, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true, name, note });
+  }
+
+  /** 标签改名：目录与库一起改。 */
+  async renameImageTag(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 8 * 1024)) as { from?: unknown; to?: unknown };
+    const from = normalizeTagName(typeof req.from === 'string' ? req.from : '');
+    const to = this.tagName(typeof req.to === 'string' ? req.to : '');
+    if (from === UNTAGGED) throw new HttpError(400, `「${UNTAGGED}」是散图的固定归类，不能改名`);
+    if (to === UNTAGGED) throw new HttpError(400, `「${UNTAGGED}」是保留名，换一个`);
+    if (!isValidTagName(from)) throw new HttpError(400, '原标签名不合法');
+    if (from === to) {
+      writeJSON(ctx.res, 200, { ok: true, name: to });
+      return;
+    }
+
+    const dir = this.poolDir();
+    if (dir === '') throw new HttpError(400, '图池目录未配置');
+    const fromDir = tagDirOf(dir, from);
+    const toDir = tagDirOf(dir, to);
+    if (existsSync(toDir)) throw new HttpError(400, `标签「${to}」已存在`);
+
+    try {
+      if (existsSync(fromDir)) renameSync(fromDir, toDir);
+      this.store.imageTags.rename(from, to);
+    } catch (e) {
+      this.d.log.error('标签改名失败', { from, to, err: e });
+      throw new HttpError(500, '改名失败');
+    }
+    this.store.audit.record('image-tag.renamed', `${from} → ${to}`, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true, name: to });
+  }
+
+  /** 删除标签。只允许删空标签——带图的标签删掉等于静默销毁用户素材。 */
+  async deleteImageTag(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const name = normalizeTagName(ctx.query.get('name') ?? '');
+    if (name === UNTAGGED) throw new HttpError(400, `「${UNTAGGED}」不能删除`);
+    if (!isValidTagName(name)) throw new HttpError(400, '标签名不合法');
+
+    const dir = this.poolDir();
+    if (dir === '') throw new HttpError(400, '图池目录未配置');
+    const target = tagDirOf(dir, name);
+
+    let count = 0;
+    try {
+      count = readdirSync(target).length;
+    } catch {
+      count = 0; // 目录本来就不存在：只剩库里的登记，直接删即可
+    }
+    if (count > 0) {
+      throw new HttpError(400, `标签「${name}」下还有 ${count} 个文件，先删掉再删标签`);
+    }
+
+    try {
+      // rmdir 而不是 rm：它天生只删空目录，等于给上面那次计数再上一道保险，
+      // 也避免任何"递归删目录"的写法出现在用户可触发的路径上。
+      rmdirSync(target);
+      this.store.imageTags.remove(name);
+    } catch (e) {
+      // 目录本来就不存在（只有库里的登记）也要把记录删掉
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.store.imageTags.remove(name);
+      } else {
+        this.d.log.error('删除标签失败', { name, err: e });
+        throw new HttpError(500, '删除失败');
       }
     }
-    items.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
-    writeJSON(ctx.res, 200, { dir, items });
+    this.store.audit.record('image-tag.deleted', name, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  /**
+   * 上传一张图片。
+   *
+   * 请求体就是文件本身（Content-Type 随浏览器），文件名走查询串。
+   * 类型只认文件头嗅探的结果：改扩展名的伪装文件进不来。
+   */
+  async uploadImage(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const dir = this.poolDir();
+    if (dir === '') throw new HttpError(400, '图池目录未配置');
+
+    const rawTag = normalizeTagName(ctx.query.get('tag') ?? '');
+    const tag = rawTag === '' ? UNTAGGED : rawTag;
+    if (tag !== UNTAGGED && !isValidTagName(tag)) {
+      throw new HttpError(400, '标签名只能包含中文、字母、数字、下划线或连字符（1-24 个字符）');
+    }
+
+    const target = tagDirOf(dir, tag);
+    try {
+      mkdirSync(target, { recursive: true });
+    } catch (e) {
+      this.d.log.error('创建图池标签目录失败', { tag, err: e });
+      throw new HttpError(500, '创建标签目录失败');
+    }
+
+    let buf: Buffer;
+    try {
+      buf = await readBinary(ctx.req, MAX_UPLOAD_BYTES);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '';
+      if (msg === '请求体过大') {
+        throw new HttpError(413, `图片过大（单张上限 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB）`);
+      }
+      throw new HttpError(400, '读取上传内容失败');
+    }
+
+    const ext = sniffImageExt(buf);
+    if (ext === null) throw new HttpError(400, '只支持 jpg / png / gif / webp / bmp 图片');
+
+    const requested = ctx.query.get('name') ?? '';
+    const stem = sanitizeStem(requested === '' ? `img-${Date.now()}` : requested);
+    let existing: Set<string>;
+    try {
+      existing = new Set(readdirSync(target));
+    } catch {
+      existing = new Set();
+    }
+    const name = uniqueName(stem, ext, existing);
+
+    try {
+      writeFileSync(join(target, name), buf);
+    } catch (e) {
+      this.d.log.error('写入图片失败', { tag, name, err: e });
+      throw new HttpError(500, '保存图片失败');
+    }
+    this.store.audit.record('image.uploaded', `${tag}/${name}`, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true, tag, name, size: buf.length });
+  }
+
+  /** 删除一张图片。 */
+  deleteImage(ctx: ReqCtx, _sess: SessionInfo): void {
+    const dir = this.poolDir();
+    const tag = normalizeTagName(ctx.query.get('tag') ?? '') || UNTAGGED;
+    const name = ctx.query.get('name') ?? '';
+    const path = poolFilePath(dir, tag, name);
+    if (path === null) throw new HttpError(400, '参数不合法');
+    if (!existsSync(path)) throw new HttpError(404, '图片不存在');
+
+    try {
+      unlinkSync(path);
+    } catch (e) {
+      this.d.log.error('删除图片失败', { tag, name, err: e });
+      throw new HttpError(500, '删除失败');
+    }
+    this.store.audit.record('image.deleted', `${tag}/${name}`, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  /**
+   * 原图输出（面板缩略图用）。
+   *
+   * 路径必须过 poolFilePath 的白名单：标签名与文件名都要合法，
+   * 否则 ../ 就能读到数据库和密钥文件。Content-Type 只从扩展名映射表里取，
+   * 不做任何"回落到 application/octet-stream"的兜底——那种兜底会让
+   * 浏览器把可疑文件当下载，反而更容易出事。
+   */
+  imageRaw(ctx: ReqCtx): void {
+    const tag = normalizeTagName(ctx.query.get('tag') ?? '') || UNTAGGED;
+    const name = ctx.query.get('name') ?? '';
+    const path = poolFilePath(this.poolDir(), tag, name);
+    if (path === null || !existsSync(path)) {
+      throw new HttpError(404, '图片不存在');
+    }
+
+    const ext = extname(name).toLowerCase();
+    const mime = IMAGE_MIME[ext] ?? 'application/octet-stream';
+    let size = 0;
+    try {
+      size = statSync(path).size;
+    } catch {
+      throw new HttpError(404, '图片不存在');
+    }
+
+    ctx.res.writeHead(200, {
+      'Content-Type': mime,
+      'Content-Length': size,
+      // 私有缓存：图池是登录后才可见的，不能被中间的共享缓存存下来
+      'Cache-Control': 'private, max-age=60',
+    });
+    if (ctx.req.method === 'HEAD') {
+      ctx.res.end();
+      return;
+    }
+    createReadStream(path).pipe(ctx.res);
   }
 
   // ---- 群与好友 ----

@@ -12,12 +12,16 @@ import type { Event, Segment } from '../onebot/types';
 import { at, image, isGroup, isMessage, isPrivate, reply, text } from '../onebot/types';
 import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
 import {
-  dedupeKeepOrder,
+  dedupeImages,
   extractImageTags,
-  imagePromptBlock,
+  imageLabel,
   imageUri,
-  listImages,
-  pickImage,
+  listPool,
+  poolPromptBlock,
+  resolveImage,
+  tagDirOf,
+  type PoolImage,
+  type PoolTag,
 } from './imagepool';
 import { decide, type Decision } from './filter';
 import { Cooldown, Dedupe, TaskQueue } from './queue';
@@ -232,12 +236,13 @@ export class Engine implements EnginePort {
     };
     let system = buildSystem(expand(personaPrompt, vars), vars);
 
-    // 图池开着且池里有图时，把文件名清单告诉模型，让它自己决定配不配图。
-    // 池子为空就不注入：给一个空清单只会诱导模型编造文件名。
+    // 图池开着且池里有图时，把「标签 + 备注 + 示例文件」告诉模型，
+    // 让它自己决定配不配图、配哪一类。池子为空就不注入：
+    // 给一个空清单只会诱导模型编造文件名。
     if (settings.images.enabled && this.imagesDir !== '') {
-      const files = listImages(this.imagesDir);
-      if (files.length > 0) {
-        system += `\n${imagePromptBlock(files, Math.max(1, settings.images.max_per_reply))}`;
+      const pool = this.loadPool();
+      if (pool.some((t) => t.images.length > 0)) {
+        system += `\n${poolPromptBlock(pool, Math.max(1, settings.images.max_per_reply))}`;
       }
     }
 
@@ -280,14 +285,14 @@ export class Engine implements EnginePort {
     const stripped = stripMarkdown(res.content);
     const { text: bodyText, tags } = extractImageTags(stripped);
 
-    // 选图：模型点名的文件逐一在池子里对号，越界的直接丢。
+    // 选图：模型点名的标签/文件名逐一在池子里对号，越界的直接丢。
     // 池子关着时也照剥不误——标记是给引擎的内部协议，
     // 绝不能原样出现在聊天里。
-    let picked: string[] = [];
+    let picked: PoolImage[] = [];
     if (settings.images.enabled && this.imagesDir !== '' && tags.length > 0) {
-      const files = listImages(this.imagesDir);
-      picked = dedupeKeepOrder(
-        tags.map((t) => pickImage(t, files)).filter((f): f is string => f !== null),
+      const pool = this.loadPool();
+      picked = dedupeImages(
+        tags.map((t) => resolveImage(t, pool)).filter((f): f is PoolImage => f !== null),
       ).slice(0, Math.max(1, settings.images.max_per_reply));
     }
 
@@ -301,7 +306,11 @@ export class Engine implements EnginePort {
     // 先落库再发送：即便发送失败，上下文也是连贯的。
     // 发过图要补记成一句备注，否则下一轮模型不知道自己发过什么。
     const recordText =
-      picked.length > 0 ? `${replyText}\n（发了一张图：${picked.join('、')}）` : replyText;
+      picked.length === 0
+        ? replyText
+        : `${replyText}\n（发了${picked.length === 1 ? '一张' : `${picked.length} 张`}图：${picked
+            .map(imageLabel)
+            .join('、')}）`;
 
     let promptTokens = res.usage.prompt_tokens;
     if (promptTokens === 0) {
@@ -546,16 +555,34 @@ export class Engine implements EnginePort {
   /**
    * 发送图池里的图片：一条消息带全部 image 段，跟在文字后面。
    *
-   * 文件名来自 pickImage 的白名单匹配，这里不再二次校验；
-   * file:// URI 由 pathToFileURL 生成，Windows 盘符也能拼对。
+   * 图片来自 resolveImage 的白名单匹配（标签与文件名都校验过），
+   * 这里按「标签目录 + 文件名」拼 file:// URI，Windows 盘符也能拼对。
    */
-  private async sendImages(ev: Event, names: string[]): Promise<void> {
+  private async sendImages(ev: Event, imgs: PoolImage[]): Promise<void> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
-    if (names.length === 0 || this.imagesDir === '') return;
-    const parts: Segment[] = names.map((n) => image(imageUri(this.imagesDir, n)));
+    if (imgs.length === 0 || this.imagesDir === '') return;
+    const parts: Segment[] = imgs.map((i) => image(imageUri(tagDirOf(this.imagesDir, i.tag), i.name)));
     if (isGroup(ev)) await sender.sendGroup(ev.group_id ?? 0, parts, this.opt.signal);
     else await sender.sendPrivate(ev.user_id ?? 0, parts, this.opt.signal);
+  }
+
+  /**
+   * 读一次图池（磁盘 + 标签备注）。
+   *
+   * 不缓存：用户在面板里刚传完图，下一句就该能发出去。
+   * 池子规模是几十到几百张，一次 readdir + stat 的开销可以忽略。
+   * 备注读失败只影响提示词质量，不该让整条回复失败。
+   */
+  private loadPool(): PoolTag[] {
+    if (this.imagesDir === '') return [];
+    let notes = new Map<string, string>();
+    try {
+      notes = this.store.imageTags.notes();
+    } catch (e) {
+      this.log.warn('读取图池标签备注失败', { err: e });
+    }
+    return listPool(this.imagesDir, notes);
   }
 
   /**

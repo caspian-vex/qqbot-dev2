@@ -140,6 +140,37 @@ export async function readJSON(
 }
 
 /**
+ * 读取原始请求体（图片上传用）。
+ *
+ * 不用 multipart：面板只有这一个上传入口，与其手写一个 boundary 解析器
+ * （还要防畸形头部、防超长 header 段），不如让前端直接把 File 当 body 发，
+ * 文件名走查询串。少一个解析器就少一类越权与 DoS 的入口。
+ */
+export async function readBinary(
+  req: IncomingMessage,
+  limit: number,
+  timeoutMs = 120_000,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+
+  const timer = setTimeout(() => req.destroy(), timeoutMs);
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      total += buf.length;
+      if (total > limit) throw new BodyError('请求体过大');
+      chunks.push(buf);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (total === 0) throw new BodyError('空请求体');
+  return Buffer.concat(chunks);
+}
+
+/**
  * 把 patch 上的字段覆盖到 target 上，只认 target 里已存在的键。
  *
  * 等价于 Go 把 JSON 解码到一个已初始化的结构体：

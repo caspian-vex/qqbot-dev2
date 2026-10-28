@@ -65,6 +65,19 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX ix_audit_id ON audit_log(id DESC);
   `,
+  // v2：图池标签。
+  //
+  // 只存标签名与备注，图片本身仍是磁盘上的文件（data/images/<标签>/）。
+  // 为什么不在库里记图片：图池是"用户往目录里丢图"的模型，
+  // 盘上有文件就算数，库里再记一份就会立刻出现两套事实，
+  // 而用户手动拷图进目录时没人会去同步数据库。
+  `
+  CREATE TABLE image_tags (
+    name       TEXT    PRIMARY KEY,
+    note       TEXT    NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+  );
+  `,
 ];
 
 export class Db {
