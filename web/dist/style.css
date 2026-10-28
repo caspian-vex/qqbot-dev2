@@ -530,20 +530,87 @@ tbody tr:hover { background: var(--row-hover); }
 
 /* ---------- 对话 ---------- */
 
-.chat { display: flex; flex-direction: column; gap: 10px; max-height: 460px; overflow: auto; padding-right: 4px; }
+/* 会话记录。
+   一条消息 = 气泡外的一行元信息 + 气泡本身。元信息放外面而不是塞进气泡，
+   是为了让"谁说的、什么时候"退成背景，正文才是视觉主体。 */
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: min(58vh, 520px);
+  overflow: auto;
+  padding: 2px 6px 2px 2px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.chat::-webkit-scrollbar { width: 8px; }
+.chat::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 4px;
+}
+.chat::-webkit-scrollbar-track { background: transparent; }
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  max-width: 76%;
+}
+
+/* 用户消息靠右，整块镜像：元信息也贴右，不然会和正文对不齐。 */
+.msg.user { align-self: flex-end; align-items: flex-end; }
+
+.msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 3px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--fg-mute);
+}
+
+.msg-head .who { color: var(--fg-dim); font-weight: 600; }
+.msg-head .tok { font-variant-numeric: tabular-nums; }
 
 .bubble {
-  max-width: 78%;
-  padding: 8px 12px;
-  border-radius: 10px;
-  font-size: 13px;
+  max-width: 100%;
+  padding: 9px 13px;
+  border-radius: 12px;
+  font-size: 13.5px;
+  line-height: 1.7;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
 }
 
-.bubble.user { align-self: flex-end; background: var(--bubble-user-bg); border: 1px solid var(--bubble-user-bd); }
-.bubble.assistant { align-self: flex-start; background: var(--bubble-as-bg); border: 1px solid var(--line); }
-.bubble .meta { font-size: 10.5px; color: var(--fg-mute); margin-top: 4px; }
+/* 气泡靠说话人那一侧的下角收窄，形成"尖角"，方向与左右对齐一致。 */
+.msg.bot .bubble {
+  background: var(--bubble-as-bg);
+  border: 1px solid var(--line);
+  border-bottom-left-radius: 4px;
+}
+
+.msg.user .bubble {
+  background: var(--bubble-user-bg);
+  border: 1px solid var(--bubble-user-bd);
+  border-bottom-right-radius: 4px;
+}
+
+/* 空内容的占位气泡，弱化到不与真消息混淆。 */
+.bubble.muted { color: var(--fg-mute); }
+
+/* 只有一个「附图 N 张」的备注徽标。 */.img-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 5px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
 
 /* ---------- 提示 ---------- */
 

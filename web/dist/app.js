@@ -1158,6 +1158,64 @@
 
   /* ================= 会话 ================= */
 
+  // 会话记录里的一条消息。
+  //
+  // 排版的三条原则，都是老版本踩过的坑：
+  //   1. 元信息（角色/时间/token）放气泡**外**。塞在气泡里时，那行灰色小字
+  //      紧贴着正文，一屏看下去分不清哪句是模型说的；
+  //   2. 正文先 trim 再折叠连续换行。模型输出常带尾部换行，配合 pre-wrap
+  //      会在气泡里撑出好几行空白，气泡高度能比内容高三倍；
+  //   3. 入库时补的「（附图 N 张）」是备注不是台词，渲染成徽标，不混进正文。
+  function renderMessage(m) {
+    const isUser = m.role === 'user';
+    let text = String(m.content == null ? '' : m.content)
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    let chip = '';
+    const hit = text.match(/（附图 (\d+) 张）/);
+    if (hit) {
+      chip = `<span class="img-chip">附图 ${esc(hit[1])} 张</span>`;
+      // 标记可能贴在正文末尾（"说的啥（附图 1 张）"），摘掉后要把两侧的空格收干净
+      text = (text.slice(0, hit.index) + text.slice(hit.index + hit[0].length)).trim();
+    }
+
+    // 空内容（早期脏数据、或只有一段被清掉的标记）留一个占位，
+    // 否则这一行只剩头部元信息，看起来像渲染失败。
+    let bubble;
+    if (text !== '') {
+      bubble = `<div class="bubble">${esc(text)}</div>`;
+    } else if (chip === '') {
+      bubble = '<div class="bubble muted">（空消息）</div>';
+    } else {
+      bubble = '';
+    }
+    return `<div class="msg ${isUser ? 'user' : 'bot'}">
+      <div class="msg-head">
+        <span class="who">${isUser ? '用户' : '助手'}</span>
+        <span class="when">${esc(fmtStamp(m.created_at))}</span>
+        <span class="tok">${fmtInt(m.tokens)} tok</span>
+      </div>
+      ${bubble}${chip === '' ? '' : `<div class="msg-extra">${chip}</div>`}
+    </div>`;
+  }
+
+  // 对话里的时间戳按"今天只显示时分秒"来写：一屏全是完整日期会把
+  // 真正要看的正文挤到不可见的地方。
+  function fmtStamp(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime()) || d.getFullYear() < 1970) return '—';
+    const p = (x) => String(x).padStart(2, '0');
+    const hm = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    const now = new Date();
+    const sameDay =
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate();
+    return sameDay ? hm : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
+  }
+
   function viewSessions(el) {
     el.innerHTML = `<div class="page-head">
         <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录</div></div>
@@ -1208,11 +1266,7 @@
             $('#ss-chat').innerHTML = '<div class="empty">这个会话还没有消息</div>';
             return;
           }
-          $('#ss-chat').innerHTML = items.map((m) => `
-            <div class="bubble ${m.role === 'user' ? 'user' : 'assistant'}">
-              ${esc(m.content)}
-              <div class="meta">${esc(m.role)} · ${esc(fmtTime(m.created_at))} · ${fmtInt(m.tokens)} tok</div>
-            </div>`).join('');
+          $('#ss-chat').innerHTML = items.map(renderMessage).join('');
           $('#ss-chat').scrollTop = $('#ss-chat').scrollHeight;
         } catch (e) {
           $('#ss-chat').innerHTML = `<div class="err-inline">${esc(e.message)}</div>`;
