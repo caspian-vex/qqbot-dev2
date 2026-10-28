@@ -39,7 +39,11 @@ FROM node:${NODE_VERSION}-alpine AS runtime
 # tini 负责转发信号并回收僵尸进程。
 # 没有它，docker stop 的 SIGTERM 到不了 node，容器只能等 10 秒超时被 SIGKILL，
 # 面板就来不及优雅关闭 SSE 连接和 SQLite。
-RUN apk add --no-cache tini
+#
+# tzdata 不能省：机器人报时间、DeepSeek 峰时判断、用量按天分组都依赖本地时区。
+# alpine 默认没有 zoneinfo，只设 TZ=Asia/Shanghai 会静默回退成 UTC——
+# 症状是「服务器在中国境外时，机器人总说凌晨」。装了 tzdata 后 TZ 才真正生效。
+RUN apk add --no-cache tini tzdata
 
 WORKDIR /app
 
@@ -52,7 +56,9 @@ COPY --from=build /src/package.json ./package.json
 # 目录必须存在且属主是 node，否则首次启动创建 SQLite 会失败。
 ENV QQBOT_ROOT=/opt/qqbot \
     QQBOT_LISTEN=0.0.0.0:5666 \
-    NODE_ENV=production
+    NODE_ENV=production \
+    # 默认东八区：用户和 QQ 好友在中国。compose 的 etc/env 里设 TZ 可覆盖。
+    TZ=Asia/Shanghai
 RUN mkdir -p /opt/qqbot/etc /opt/qqbot/data && chown -R node:node /opt/qqbot
 
 USER node

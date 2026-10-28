@@ -32,6 +32,7 @@ for arg in "$@"; do
   QQBOT_DIR    安装目录，默认 /opt/qqbot
   PANEL_PORT   面板端口，默认 5666
   QQBOT_IMAGE  镜像名，默认 ghcr.io/caspian-vex/qqbot-dev2:<版本>
+  TZ           容器时区，默认 Asia/Shanghai（机器人报时间/峰时判断/用量分组都靠它）
   GHCR_TOKEN   私有包的访问令牌（read:packages）；公开包不用填
   GHCR_USER    令牌所属账号，默认 caspian-vex
 USAGE
@@ -180,6 +181,11 @@ fi
 env_set PANEL_PORT "$PANEL_PORT"
 env_set QQBOT_IMAGE "$QQBOT_IMAGE"
 env_set QQBOT_VERSION "$QQBOT_VERSION"
+# 时区：机器人报时间、DeepSeek 峰时判断、用量按天分组都用它。
+# 服务器在境外时尤其重要——不设的话容器默认 UTC，机器人会「活在另一个时区」。
+if ! env_has TZ; then
+  env_set TZ "${TZ:-Asia/Shanghai}"
+fi
 [ -n "$(env_get NAPCAT_TAG)" ] || env_set NAPCAT_TAG "$NAPCAT_TAG"
 ok "端口 $PANEL_PORT"
 

@@ -27,6 +27,8 @@ services:
       MODE: ws
       # 面板通过它代理扫码登录。绝不下发给浏览器。
       WEBUI_TOKEN: ${WEBUI_TOKEN:?缺少 WEBUI_TOKEN，请先运行 install.sh}
+      # 日志与 WebUI 显示的时间。默认东八区，etc/env 里设 TZ 可覆盖。
+      TZ: ${TZ:-Asia/Shanghai}
       # 1000 是官方 README 的默认值。install.sh 会把 data/napcat 下的目录
       # chown 到 1000:1000，两者必须一致，否则 NapCat 写不进 QQ 配置。
       NAPCAT_UID: "1000"
@@ -88,6 +90,9 @@ services:
       QQBOT_LISTEN: "0.0.0.0:${PANEL_PORT:-5666}"
       # 容器内用服务名寻址
       QQBOT_NAPCAT_WEBUI: "http://napcat:6099"
+      # 机器人报时间、峰时判断、用量按天分组都靠它。镜像里默认
+      # Asia/Shanghai，这里显式声明是为了让 etc/env 的 TZ 能覆盖镜像默认值。
+      TZ: ${TZ:-Asia/Shanghai}
 
     volumes:
       - ./etc/qqbot.toml:/opt/qqbot/etc/qqbot.toml:ro

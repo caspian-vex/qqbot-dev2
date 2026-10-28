@@ -113,6 +113,7 @@ qqbot tunnel            # 打印现成的 ssh -L 命令与 WebUI token
 | `QQBOT_IMAGE` | `ghcr.io/caspian-vex/qqbot-dev2:<版本>` | 换自建仓库时覆盖 |
 | `QQBOT_VERSION` | `latest`（`--build` 时为 `dev`） | 镜像 tag |
 | `NAPCAT_TAG` | `latest` | NapCat 镜像 tag |
+| `TZ` | `Asia/Shanghai` | 容器时区：机器人报时间、峰时判断、用量按天分组都靠它 |
 | `GHCR_TOKEN` | 空 | 包为私有时填，需 `read:packages` |
 | `GHCR_USER` | `caspian-vex` | 令牌所属账号 |
 | `REPO_RAW` | 本仓库 main 的 raw 地址 | 拉了 `compose.yaml` / `qqbot` 命令的源 |
@@ -133,6 +134,7 @@ cat > etc/env <<'EOF'
 QQBOT_SECRET_KEY=<32 字节 hex>      # 换了它，已存的 API Key 全部解不开
 WEBUI_TOKEN=<16 字节 hex>           # 面板代理扫码用，不下发浏览器
 PANEL_PORT=5666
+TZ=Asia/Shanghai                     # 机器人报时间/峰时判断/用量分组
 QQBOT_IMAGE=ghcr.io/caspian-vex/qqbot-dev2:latest
 QQBOT_VERSION=latest
 NAPCAT_TAG=latest
@@ -287,6 +289,7 @@ npm run build        # esbuild 打包到 dist/（server.js + argon-worker.js）
 
 | 症状 | 原因 | 处理 |
 | --- | --- | --- |
+| 机器人报的时间不对（差 8 小时或半天） | 容器时区不是东八区（境外服务器默认 UTC） | 在 `etc/env` 里设 `TZ=Asia/Shanghai` 后 `qqbot restart`；2026-10-28 之后的镜像已内置 tzdata，老镜像只设 TZ 不生效需先升级 |
 | `qqbot-core` 反复重启，日志 `unable to open database file` | `data/` 属主不是 1000 | `chown -R 1000:1000 /opt/qqbot/data` |
 | 面板「登录」「网络」显示未配置 | `etc/env` 里 `WEBUI_TOKEN` 没被读到 | 代码会把短名归一成 `QQBOT_` 前缀；确认 `etc/env` 有 `WEBUI_TOKEN=` 且容器已重启 |
 | 扫码成功但机器人显示未连接 | 3001 反向 WS 没启用 | 等 20s（服务端心跳会自动补），仍不行去「登录」页点「修正反向 WS」 |
