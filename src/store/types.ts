@@ -51,6 +51,21 @@ export interface ProactiveSettings {
   echo_daily_limit: number;
 }
 
+/**
+ * 图池配置。
+ *
+ * 图池是数据目录下的 images/ 文件夹，用户放图进去即可。
+ * 模型在回复里用 [图:文件名] 标记表达"想发图"，由引擎解析发送。
+ * 池子为空时功能天然无效，但开关仍默认关闭——
+ * 与回声式跟进同一哲学：新能力出厂全关，让用户自己决定。
+ */
+export interface ImageSettings {
+  /** 是否允许模型在回复里发图。 */
+  enabled: boolean;
+  /** 单条回复最多发几张图（标记超出部分丢弃）。 */
+  max_per_reply: number;
+}
+
 /** 上下文窗口配置。 */
 export interface ContextSettings {
   max_turns: number;
@@ -70,6 +85,7 @@ export interface Settings {
   llm: LLMSettings;
   bot: BotSettings;
   proactive: ProactiveSettings;
+  images: ImageSettings;
   context: ContextSettings;
   panel: PanelSettings;
 }
@@ -83,6 +99,14 @@ export function defaultProactive(): ProactiveSettings {
     echo_max_sec: 90,
     echo_cooldown_min: 30,
     echo_daily_limit: 5,
+  };
+}
+
+/** 图池的出厂默认值。功能关闭，单条回复至多一张图。 */
+export function defaultImages(): ImageSettings {
+  return {
+    enabled: false,
+    max_per_reply: 1,
   };
 }
 
@@ -111,6 +135,7 @@ export function defaultSettings(): Settings {
       quote_reply: true,
     },
     proactive: defaultProactive(),
+    images: defaultImages(),
     context: {
       max_turns: 10,
       token_budget: 3000,
@@ -139,6 +164,10 @@ export function normalizeSettings(v: Settings): Settings {
   if (v.proactive === undefined || v.proactive === null || typeof v.proactive !== 'object') {
     v.proactive = defaultProactive();
   }
+  // 旧库没有 images 块：整个补成默认值，理由同 proactive。
+  if (v.images === undefined || v.images === null || typeof v.images !== 'object') {
+    v.images = defaultImages();
+  }
   return v;
 }
 
@@ -153,6 +182,7 @@ export function cloneSettings(v: Settings): Settings {
       blacklist_users: [...v.bot.blacklist_users],
     },
     proactive: { ...v.proactive },
+    images: { ...v.images },
     context: { ...v.context },
     panel: { ...v.panel },
   };

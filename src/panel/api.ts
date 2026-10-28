@@ -2,6 +2,8 @@
 //
 // 与 Go 版 internal/panel/api.go 一一对应：路由、状态码、中文错误文案
 // 全部逐字保留——前端会把 error 字段直接 toast 出来，改一个字就是改产品文案。
+import { readdirSync, statSync } from 'node:fs';
+import { extname, join } from 'node:path';
 import type { LogHub } from '../log/hub';
 import type { Logger } from '../log/logger';
 import type { Store } from '../store';
@@ -49,6 +51,8 @@ export interface ApiDeps {
   qq: QQLoginPort;
   /** 机器人要连的反向 WS 端口（默认 3001），登录后自动补齐用 */
   onebotPort?: number;
+  /** 图池目录；未配置时图池接口返回空列表。 */
+  imagesDir?: string;
 }
 
 /**
@@ -177,6 +181,9 @@ function validateSettings(v: Settings): void {
   }
   if (v.proactive.echo_daily_limit < 0 || v.proactive.echo_daily_limit > 100) {
     throw new HttpError(400, '每日跟进上限应在 0-100 之间');
+  }
+  if (v.images.max_per_reply < 1 || v.images.max_per_reply > 3) {
+    throw new HttpError(400, '单条回复发图上限应在 1-3 张之间');
   }
 }
 
@@ -531,6 +538,7 @@ export class Api {
         };
         v.context = { ...inp.context };
         v.proactive = { ...inp.proactive };
+        v.images = { ...inp.images };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });
@@ -704,6 +712,38 @@ export class Api {
 
     this.store.audit.record('test.send', `${targetType}:${targetID}`, clientIP(ctx.req));
     writeJSON(ctx.res, 200, { ok: true, message_id: id });
+  }
+
+  // ---- 图池 ----
+
+  /**
+   * 图池文件清单，供设置页展示"池里有什么"。
+   *
+   * 只报文件名和大小，不提供预览/上传/删除：
+   * 图是用户自己放进目录的，面板能看一眼就够了，
+   * 做成可写的反而要为一张图引入一套上传与越权防线。
+   */
+  images(ctx: ReqCtx): void {
+    const dir = this.d.imagesDir ?? '';
+    const items: { name: string; size: number }[] = [];
+    if (dir !== '') {
+      try {
+        for (const name of readdirSync(dir)) {
+          if (!['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(extname(name).toLowerCase())) {
+            continue;
+          }
+          try {
+            items.push({ name, size: statSync(join(dir, name)).size });
+          } catch {
+            // 列目录与 stat 之间文件被删了：跳过这一张就行
+          }
+        }
+      } catch {
+        // 目录还没建（用户没放过图）：返回空列表而不是 500
+      }
+    }
+    items.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+    writeJSON(ctx.res, 200, { dir, items });
   }
 
   // ---- 群与好友 ----

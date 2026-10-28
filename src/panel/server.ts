@@ -32,6 +32,8 @@ export interface PanelOptions {
   qq?: QQLoginPort;
   /** 机器人要连的反向 WS 端口；登录成功后自动补齐这条监听。 */
   onebotPort?: number;
+  /** 图池目录（数据目录下的 images/）；不传时图池页显示为空。 */
+  imagesDir?: string;
   hub?: LogHub;
   version?: string;
 }
@@ -62,6 +64,7 @@ export class PanelServer {
       startedAt: this.startedAt,
       qq: opt.qq ?? nullQQLogin(),
       onebotPort: opt.onebotPort,
+      imagesDir: opt.imagesDir,
     });
 
     this.router = this.buildRouter();
@@ -102,6 +105,7 @@ export class PanelServer {
     r.add('GET', '/api/logs', this.wrap((c) => a.logs(c), false));
     r.add('GET', '/api/groups', this.wrap((c) => a.groups(c), false));
     r.add('GET', '/api/friends', this.wrap((c) => a.friends(c), false));
+    r.add('GET', '/api/images', this.wrap((c) => a.images(c), false));
 
     // 扫码登录 QQ（Go 版没有的新增能力）
     r.add('GET', '/api/qq/status', this.wrap((c) => a.qqStatus(c), false));
