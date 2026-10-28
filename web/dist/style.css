@@ -236,6 +236,13 @@ a:hover { text-decoration: underline; }
   margin-top: 3px;
 }
 
+/* 页头右侧的动作组。margin-left:auto：窄屏下换到第二行时仍贴右，
+   否则 space-between 会把它甩回左边，和标题叠在一起看着像两个区。 */
+.page-head .row {
+  margin-left: auto;
+  align-items: center;
+}
+
 /* ---------- 卡片 ---------- */
 
 .card {

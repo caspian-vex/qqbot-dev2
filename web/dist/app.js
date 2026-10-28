@@ -964,9 +964,11 @@
       return;
     }
 
+    // 保存/恢复按钮挂在页头右侧而不是卡片末尾：六张卡片铺下来，
+    // 滚到底才能存，改完上面那几组再滚回来对一眼都费劲。
     el.innerHTML = `<div class="page-head">
         <div><h2>会话设置</h2><div class="desc" id="ss-head">加载中…</div></div>
-        <a class="btn ghost" href="#/sessions">返回会话列表</a>
+        <div class="row" id="ss-acts"><a class="btn ghost" href="#/sessions">返回会话列表</a></div>
       </div>
       <div id="ss-body"><div class="empty">加载中…</div></div>`;
 
@@ -1019,7 +1021,7 @@
             <div class="field">
               <label>使用的人格</label>
               <select id="ss-persona" aria-label="该会话使用的人格">${pOpts}</select>
-              <div class="note">改完即时生效，不用点下面的保存。选「跟随默认」就回到全局启用的那个人格。</div>
+              <div class="note">改完即时生效，不用点右上角的保存。选「跟随默认」就回到全局启用的那个人格。</div>
             </div>
           </div>
         </div>` +
@@ -1047,11 +1049,15 @@
           <div class="grid c2">
             ${ovrNum('f-turns', '保留轮数', ctxVal.max_turns, 0, 50, '一轮 = 用户一句 + 助手一句。0 表示不带历史。')}
             ${ovrNum('f-budget', 'token 预算', ctxVal.token_budget, 200, 100000, '历史按此预算从新到旧裁剪，超出的整轮丢弃。')}
-          </div>`, st) +
-        `<div class="row end">
-          <button class="btn ghost" data-act="ovr-reset">恢复跟随全局</button>
-          <button class="btn" data-act="ovr-save">保存本会话设置</button>
-        </div>`;
+          </div>`, st);
+
+      // 按钮等数据到位才出现：加载中就能点的"保存"，点下去只会报 id 未定义。
+      const acts = $('#ss-acts');
+      if (acts) {
+        acts.insertAdjacentHTML('beforeend',
+          `<button class="btn ghost" data-act="ovr-reset">恢复跟随全局</button>
+           <button class="btn" data-act="ovr-save">保存本会话设置</button>`);
+      }
 
       bindActions(el, {
         'ovr-save': async (btn) => {
