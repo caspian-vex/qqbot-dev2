@@ -554,8 +554,8 @@
             <div class="field">
               <label>唤醒词</label>
               <input type="text" id="f-wake" value="${esc((b.wake_words || []).join('，'))}"
-                     placeholder="小助手，机器人">
-              <div class="note">逗号分隔。消息以唤醒词开头即触发，唤醒词会从正文里剥掉。</div>
+                     placeholder="多个用逗号分隔">
+              <div class="note">消息以唤醒词开头即触发，唤醒词会从正文里剥掉。留空则只响应 @ 与私聊。</div>
             </div>
             <div class="field">
               <label>被动接话概率</label>

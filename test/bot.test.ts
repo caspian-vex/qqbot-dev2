@@ -133,12 +133,12 @@ describe('触发判断', () => {
   });
 
   it('@ 机器人触发，且正文里去掉唤醒词', () => {
-    const s = botSettings({ wake_words: ['小助手'] });
+    const s = botSettings({ wake_words: ['小Q'] });
     const d = decide(
       ev({
         message: [
           { type: 'at', data: { qq: '10000' } },
-          { type: 'text', data: { text: ' 小助手 今天几号' } },
+          { type: 'text', data: { text: ' 小Q 今天几号' } },
         ],
       }),
       s,
@@ -162,9 +162,9 @@ describe('触发判断', () => {
   });
 
   it('唤醒词触发并剥离前缀', () => {
-    const s = botSettings({ wake_words: ['小助手'] });
+    const s = botSettings({ wake_words: ['小Q'] });
     const d = decide(
-      ev({ message: [{ type: 'text', data: { text: '小助手 讲个笑话' } }] }),
+      ev({ message: [{ type: 'text', data: { text: '小Q 讲个笑话' } }] }),
       s,
       10000,
       new Cooldown(),
