@@ -677,6 +677,72 @@ describe('会话与用量接口', () => {
     }
   });
 
+  it('会话人格绑定：列表回带绑定，未绑定时给全局默认，解绑后回落', async () => {
+    const h = await harness();
+    try {
+      h.store.sessions.touch('private:1', 'private', 1);
+      h.store.sessions.touch('group:2', 'group', 2);
+      const coder = h.store.personas.upsert('coder', 'you write code');
+
+      const c = await authed(h);
+      const list = async () =>
+        (await (
+          await fetch(`${h.base}/api/sessions`, { headers: { Cookie: c.header } })
+        ).json()) as {
+          items: { id: string; persona_id: number; persona_name: string }[];
+          default_persona: { id: number; name: string };
+        };
+      const bind = (payload: unknown): Promise<Response> =>
+        fetch(`${h.base}/api/sessions/persona`, {
+          method: 'POST',
+          headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+          body: JSON.stringify(payload),
+        });
+
+      // 初始：全部跟随全局默认
+      const before = await list();
+      assert.equal(before.default_persona.name, 'default');
+      assert.ok(before.items.every((s) => s.persona_id === 0 && s.persona_name === ''));
+
+      assert.equal((await bind({ id: 'private:1', persona_id: coder.id })).status, 200);
+
+      const after = await list();
+      const one = after.items.find((s) => s.id === 'private:1');
+      assert.equal(one?.persona_id, coder.id);
+      assert.equal(one?.persona_name, 'coder');
+      assert.equal(after.items.find((s) => s.id === 'group:2')?.persona_id, 0, '别的会话不受影响');
+
+      // 0 = 解除绑定
+      assert.equal((await bind({ id: 'private:1', persona_id: 0 })).status, 200);
+      assert.equal((await list()).items.find((s) => s.id === 'private:1')?.persona_id, 0);
+
+      // 非法输入
+      const noPersona = await bind({ id: 'private:1', persona_id: 99999 });
+      assert.equal(noPersona.status, 400);
+      assert.deepEqual(await noPersona.json(), { error: '人格不存在' });
+      const noId = await bind({ id: '  ', persona_id: coder.id });
+      assert.equal(noId.status, 400);
+      assert.deepEqual(await noId.json(), { error: '会话 ID 不能为空' });
+      const badPid = await bind({ id: 'private:1', persona_id: -3 });
+      assert.equal(badPid.status, 400);
+      assert.deepEqual(await badPid.json(), { error: '人格 ID 不合法' });
+      // 字符串数字不能被当成 0（那会静默变成"解绑"）
+      const strPid = await bind({ id: 'private:1', persona_id: '3' });
+      assert.equal(strPid.status, 400);
+      assert.deepEqual(await strPid.json(), { error: '人格 ID 不合法' });
+
+      // 未登录不能改
+      const anon = await fetch(`${h.base}/api/sessions/persona`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'private:1', persona_id: coder.id }),
+      });
+      assert.equal(anon.status, 401);
+    } finally {
+      await h.stop();
+    }
+  });
+
   it('用量接口默认 7 天且 today 恒为对象', async () => {
     const h = await harness();
     try {

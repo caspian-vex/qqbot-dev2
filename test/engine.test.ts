@@ -382,3 +382,65 @@ describe('跟进里的图标记', () => {
     }
   });
 });
+
+describe('按会话指定人格', () => {
+  const say = (content: string): Result => ({
+    content,
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    firstTokenMs: 1,
+  });
+
+  it('绑定过人格的会话用自己的提示词，没绑的仍跟随全局', async () => {
+    const prompts: string[] = [];
+    const h = makeHarness({
+      llm: async (msgs) => {
+        prompts.push(contentText(msgs[0]!.content));
+        return say('好吧。');
+      },
+    });
+    try {
+      const tsun = h.store.personas.upsert('tsundere', '你嘴上嫌弃，其实很在意对方，句尾爱带"哼"');
+      h.store.personas.bind('private:20001', tsun.id);
+
+      h.engine.handleEvent(privateEv(20001, 1));
+      await waitFor(() => h.sent.length >= 1);
+      h.engine.handleEvent(privateEv(20002, 2));
+      await waitFor(() => h.sent.length >= 2);
+
+      assert.equal(prompts.length, 2);
+      assert.ok(prompts[0]!.includes('句尾爱带"哼"'), '绑定的人格要进 system');
+      assert.ok(!prompts[0]!.includes('You are a helpful assistant'), '不该再叠默认人格');
+      assert.ok(prompts[1]!.includes('You are a helpful assistant'), '没绑定的会话跟随全局');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('解绑后立即回到全局人格（不必重启）', async () => {
+    const prompts: string[] = [];
+    const h = makeHarness({
+      llm: async (msgs) => {
+        prompts.push(contentText(msgs[0]!.content));
+        return say('嗯。');
+      },
+    });
+    try {
+      // 用群消息而不是私聊连发：私聊有 3 秒直聊冷却，
+      // 这里要验的是"绑定读得新不新"，不是去等冷却。
+      const tsun = h.store.personas.upsert('tsundere', '傲娇人格标记');
+      h.store.personas.bind('group:30000', tsun.id);
+
+      h.engine.handleEvent(groupEv({ message_id: 1 }));
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(prompts[0]!.includes('傲娇人格标记'));
+
+      h.store.personas.bind('group:30000', 0);
+      h.engine.handleEvent(groupEv({ message_id: 2 }));
+      await waitFor(() => h.sent.length >= 2);
+      assert.ok(!prompts[1]!.includes('傲娇人格标记'), '解绑后不该再用原人格');
+      assert.ok(prompts[1]!.includes('You are a helpful assistant'));
+    } finally {
+      h.cleanup();
+    }
+  });
+});

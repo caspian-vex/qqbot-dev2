@@ -1061,7 +1061,13 @@
         <div><h2>人格</h2><div class="desc">系统提示词；格式约束由程序强制追加，不可编辑</div></div>
         <button class="btn ghost" data-act="new">新建人格</button>
       </div>
-      <div class="card"><div id="ps-list"><div class="empty">加载中…</div></div></div>
+      <div class="card">
+        <div id="ps-list"><div class="empty">加载中…</div></div>
+        <div class="note" style="margin-top:10px">
+          想给不同的群 / 私聊配不同人格？到「会话」页，在每行右侧的人格下拉里直接指定。
+          标着「使用中」的是全局默认人格，没有单独指定的会话都用它。
+        </div>
+      </div>
       <div class="card" id="ps-editor" style="display:none">
         <h3 id="ps-ed-title">编辑人格</h3>
         <div class="field">
@@ -1216,9 +1222,19 @@
     return sameDay ? hm : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
   }
 
+  // 会话 → 人格的下拉。value=0 表示"跟随默认"，也就是全局启用的那个人格。
+  function personaPick(s, personas, fallback) {
+    const on = (v) => (Number(s.persona_id) === Number(v) ? ' selected' : '');
+    const opts = [
+      `<option value="0"${on(0)}>跟随默认${fallback.name ? `（${esc(fallback.name)}）` : ''}</option>`,
+      ...personas.map((p) => `<option value="${p.id}"${on(p.id)}>${esc(p.name)}</option>`),
+    ];
+    return `<select class="sel" data-sess="${esc(s.id)}" aria-label="该会话使用的人格">${opts.join('')}</select>`;
+  }
+
   function viewSessions(el) {
     el.innerHTML = `<div class="page-head">
-        <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录</div></div>
+        <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录；每个人格可以单独指定</div></div>
       </div>
       <div class="card"><div id="ss-list"><div class="empty">加载中…</div></div></div>
       <div class="card" id="ss-detail" style="display:none">
@@ -1227,21 +1243,28 @@
       </div>`;
 
     const load = async () => {
-      const d = await api('/api/sessions');
+      // 人格清单和会话一起取：下拉里只有人名不够，没有选项时用户就不知道该建人格
+      const [d, dp] = await Promise.all([
+        api('/api/sessions'),
+        api('/api/personas').catch(() => ({ items: [] })),
+      ]);
       if (!$('#ss-list')) return; // 用户已经切走
       const items = d.items || [];
       if (!items.length) {
         $('#ss-list').innerHTML = '<div class="empty">还没有任何会话</div>';
         return;
       }
+      const personas = dp.items || [];
+      const fallback = d.default_persona || { id: 0, name: '' };
       $('#ss-list').innerHTML = `
         <table>
-          <thead><tr><th>会话</th><th>类型</th><th>消息数</th><th>最后活跃</th><th style="width:150px"></th></tr></thead>
+          <thead><tr><th>会话</th><th>类型</th><th>人格</th><th>消息数</th><th>最后活跃</th><th style="width:150px"></th></tr></thead>
           <tbody>
             ${items.map((s) => `
               <tr>
                 <td class="mono">${esc(s.id)}</td>
                 <td>${s.kind === 'group' ? '<span class="tag">群聊</span>' : '<span class="tag">私聊</span>'}</td>
+                <td>${personaPick(s, personas, fallback)}</td>
                 <td class="dim">${fmtInt(s.messages)}</td>
                 <td class="dim nowrap">${esc(fmtTime(s.updated_at))}</td>
                 <td class="nowrap">
@@ -1252,6 +1275,24 @@
           </tbody>
         </table>`;
     };
+
+    // 下拉是 change 而不是 click，bindActions 只管点击，这里单独委托一次。
+    // 挂在 el 上：路由切页会换掉整个 main，监听器跟着走，不会累积。
+    el.addEventListener('change', async (e) => {
+      const sel = e.target.closest('select[data-sess]');
+      if (!sel) return;
+      const id = sel.dataset.sess;
+      const pid = Number(sel.value);
+      sel.disabled = true;
+      try {
+        await api('/api/sessions/persona', { method: 'POST', body: { id, persona_id: pid } });
+        ok(pid === 0 ? '已改为跟随默认人格' : '已为该会话指定人格');
+        await load();
+      } catch (err) {
+        bad(err.message);
+        await load(); // 失败时把下拉拨回真实状态
+      }
+    });
 
     bindActions(el, {
       peek: async (btn) => {

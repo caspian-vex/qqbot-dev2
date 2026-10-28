@@ -18,6 +18,8 @@ interface SessionRow {
   target_id: number;
   updated_at: number;
   cnt: number;
+  persona_id: number;
+  persona_name: string;
 }
 
 export class SessionRepo {
@@ -92,13 +94,18 @@ export class SessionRepo {
     });
   }
 
-  /** 会话列表，按最近活跃排序。 */
+  /** 会话列表，按最近活跃排序。附带该会话绑定的人格（未绑定为 0/''）。 */
   list(limit = 200): SessionInfo[] {
     return this.db
       .all<SessionRow>(
         `SELECT s.id, s.kind, s.target_id, s.updated_at,
-                (SELECT COUNT(1) FROM messages m WHERE m.session_id = s.id) AS cnt
-           FROM sessions s ORDER BY s.updated_at DESC LIMIT ?`,
+                (SELECT COUNT(1) FROM messages m WHERE m.session_id = s.id) AS cnt,
+                COALESCE(b.persona_id, 0)  AS persona_id,
+                COALESCE(p.name, '')       AS persona_name
+           FROM sessions s
+           LEFT JOIN session_personas b ON b.session_id = s.id
+           LEFT JOIN personas p         ON p.id = b.persona_id
+          ORDER BY s.updated_at DESC LIMIT ?`,
         limit,
       )
       .map((r) => ({
@@ -107,6 +114,8 @@ export class SessionRepo {
         target_id: Number(r.target_id),
         messages: Number(r.cnt),
         updated_at: new Date(Number(r.updated_at) * 1000),
+        persona_id: Number(r.persona_id),
+        persona_name: r.persona_name,
       }));
   }
 

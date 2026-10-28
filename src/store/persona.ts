@@ -88,6 +88,66 @@ export class PersonaRepo {
     });
   }
 
+  /**
+   * 某个会话实际生效的人格。
+   *
+   * 绑定过就用绑定的，没绑定就用全局启用的那个——这样"按会话分人格"
+   * 是可选增强，不改变只有一个会话时的行为。
+   * 绑定指向的人格若已不存在（理论上被 CASCADE 清掉了），同样回落到全局，
+   * 绝不能让一条脏绑定把回复链路打断。
+   */
+  forSession(sessionID: string): Persona {
+    if (sessionID !== '') {
+      const row = this.db.get<PersonaRow>(
+        `SELECT p.id, p.name, p.system_prompt, p.active, p.created_at, p.updated_at
+           FROM session_personas b
+           JOIN personas p ON p.id = b.persona_id
+          WHERE b.session_id = ?`,
+        sessionID,
+      );
+      if (row) return toPersona(row);
+    }
+    return this.active();
+  }
+
+  /** 会话绑定的人格 id；未绑定返回 0。 */
+  bindingOf(sessionID: string): number {
+    const row = this.db.get<{ persona_id: number }>(
+      `SELECT persona_id FROM session_personas WHERE session_id = ?`,
+      sessionID,
+    );
+    return row ? Number(row.persona_id) : 0;
+  }
+
+  /**
+   * 绑定会话到某个人格；personaID <= 0 表示解除绑定（回到跟随全局）。
+   * 人格不存在时抛错，避免前端把 id 传错后留下一条永远回落的死绑定。
+   */
+  bind(sessionID: string, personaID: number): void {
+    if (sessionID === '') throw new Error('会话 ID 不能为空');
+    if (personaID <= 0) {
+      this.db.run(`DELETE FROM session_personas WHERE session_id = ?`, sessionID);
+      return;
+    }
+    const exists = this.db.get<{ id: number }>(`SELECT id FROM personas WHERE id = ?`, personaID);
+    if (!exists) throw new Error('人格不存在');
+    this.db.run(
+      `INSERT INTO session_personas (session_id, persona_id, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET persona_id = excluded.persona_id,
+                                             updated_at = excluded.updated_at`,
+      sessionID,
+      personaID,
+      nowSec(),
+    );
+  }
+
+  /** 绑定关系总数（面板/自检用）。 */
+  bindingCount(): number {
+    const row = this.db.get<{ n: number }>(`SELECT COUNT(1) AS n FROM session_personas`);
+    return row ? Number(row.n) : 0;
+  }
+
   private byName(name: string): Persona | undefined {
     const row = this.db.get<PersonaRow>(
       `SELECT ${SELECT_COLS} FROM personas WHERE name = ?`,

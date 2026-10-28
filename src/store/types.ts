@@ -255,6 +255,10 @@ export interface SessionInfo {
   target_id: number;
   messages: number;
   updated_at: Date;
+  /** 绑定的 人格 id；0 表示跟随全局启用的人格。 */
+  persona_id: number;
+  /** 绑定的人格名；未绑定时为空串（前端据此显示"跟随默认"）。 */
+  persona_name: string;
 }
 
 /** 某一天的用量汇总。 */

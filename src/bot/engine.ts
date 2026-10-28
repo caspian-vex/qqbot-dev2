@@ -266,10 +266,13 @@ export class Engine implements EnginePort {
     const historyText = images.length === 0 ? rawText : `${rawText}${imageMarker(images.length)}`;
 
     let personaPrompt: string;
+    // 人格按会话取，不是全局单例：同一个人在不同群里可以是不同角色。
+    // 会话 ID 在这里就得算出来——下面 touch 会话表用的也是它，提前算没有副作用。
+    const sid = sessionId(kindOf(ev), targetOf(ev));
     try {
-      personaPrompt = this.store.personas.active().system_prompt;
+      personaPrompt = this.store.personas.forSession(sid).system_prompt;
     } catch (e) {
-      this.log.error('读取人格失败', { err: e });
+      this.log.error('读取人格失败', { err: e, session: sid });
       this.counters.errors++;
       return;
     }
@@ -297,7 +300,6 @@ export class Engine implements EnginePort {
     // 自己刚才收到了图，开始描述一张不存在的画面。
     if (images.length > 0) system += `\n${VISION_HINT}`;
 
-    const sid = sessionId(kindOf(ev), targetOf(ev));
     try {
       this.store.sessions.touch(sid, kindOf(ev), targetOf(ev));
     } catch {
@@ -476,9 +478,11 @@ export class Engine implements EnginePort {
 
     let personaPrompt: string;
     try {
-      personaPrompt = this.store.personas.active().system_prompt;
+      // 跟进同样按会话取人格：群里刚用傲娇人格说完话，
+      // 三分钟后跟进一句正经的，人设会当场崩掉。
+      personaPrompt = this.store.personas.forSession(sid).system_prompt;
     } catch (e) {
-      this.log.warn('跟进读取人格失败', { err: e });
+      this.log.warn('跟进读取人格失败', { err: e, session: sid });
       return;
     }
 

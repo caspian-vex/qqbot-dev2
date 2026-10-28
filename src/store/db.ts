@@ -78,6 +78,23 @@ const MIGRATIONS: string[] = [
     created_at INTEGER NOT NULL
   );
   `,
+  // v3：会话 → 人格绑定。
+  //
+  // 为什么单开一张表而不是给 sessions 加列：
+  //   1. sessions 的行是「收到第一条消息」时才 touch 出来的，加列的话
+  //      还没说过话的群就没地方预置人格；这张表不依赖 sessions 存在。
+  //   2. 绑定关系可能指向任意会话 ID，与 sessions 的生命周期（清理、
+  //      删除）解耦；会话被删了，绑定留着也不会有害。
+  // persona_id 上加 ON DELETE CASCADE：人格被删时绑定一并清掉，
+  // 否则会留下指向不存在人格的死绑定，查询直接返回空。
+  `
+  CREATE TABLE session_personas (
+    session_id TEXT    PRIMARY KEY,
+    persona_id INTEGER NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX ix_session_personas_pid ON session_personas(persona_id);
+  `,
 ];
 
 export class Db {

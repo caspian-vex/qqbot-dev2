@@ -698,7 +698,47 @@ export class Api {
       this.d.log.error('读取会话失败', { err: e });
       throw new HttpError(500, '读取会话失败');
     }
-    writeJSON(ctx.res, 200, { items });
+    // 一并回全局默认人格：面板要把"跟随默认"显示成「跟随默认（毒舌）」，
+    // 否则用户看到一个空选项，不知道自己到底在用哪套提示词。
+    let fallback = { id: 0, name: '' };
+    try {
+      const a = this.store.personas.active();
+      fallback = { id: a.id, name: a.name };
+    } catch {
+      // 读不到人格不影响列会话
+    }
+    writeJSON(ctx.res, 200, { items, default_persona: fallback });
+  }
+
+  /**
+   * 把某个会话绑定到指定人格；persona_id 传 0 解除绑定。
+   *
+   * 绑定的粒度是「对话对象」而不是「聊天窗口」：群 1 和群 2 各绑各的，
+   * 私聊 1 和私聊 2 互不影响，这正是需求里举的那四个例子。
+   */
+  async bindSessionPersona(ctx: ReqCtx): Promise<void> {
+    const req = (await body(ctx, 1024)) as { id?: unknown; persona_id?: unknown };
+    const id = typeof req.id === 'string' ? req.id.trim() : '';
+    if (id === '') throw new HttpError(400, '会话 ID 不能为空');
+    // 必须是数字：把 "3" 这种字符串当成 0 处理会静默变成"解绑"，
+    // 用户以为指定了人格，实际是被清掉了。
+    const pid = req.persona_id;
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid < 0) {
+      throw new HttpError(400, '人格 ID 不合法');
+    }
+
+    try {
+      this.store.personas.bind(id, pid);
+    } catch (e) {
+      this.d.log.warn('绑定会话人格失败', { id, pid, err: e });
+      throw new HttpError(400, e instanceof Error ? e.message : '绑定失败');
+    }
+    this.store.audit.record(
+      'session.persona',
+      `${id} -> ${pid === 0 ? 'default(global)' : pid}`,
+      clientIP(ctx.req),
+    );
+    writeJSON(ctx.res, 200, { ok: true, persona_id: pid });
   }
 
   /** 某会话最近的对话记录，供面板查看上下文。 */

@@ -87,13 +87,13 @@ test('generateToken/safeEqual', () => {
   assert.equal(safeEqual(t, t.slice(1)), false);
 });
 
-test('迁移幂等，且 user_version 为 2（v2 = 图池标签）', () => {
+test('迁移幂等，且 user_version 为 3（v3 = 会话人格绑定）', () => {
   const { store, dir } = tempDb();
-  assert.equal(store.db.userVersion(), 2);
+  assert.equal(store.db.userVersion(), 3);
   store.close();
   // 再打开一次：不应重复执行迁移，也不应报错
   const again = new Store(join(dir, 'qqbot.db'));
-  assert.equal(again.db.userVersion(), 2);
+  assert.equal(again.db.userVersion(), 3);
   again.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -129,6 +129,53 @@ test('设置默认值与持久化，敏感字段加密落库', () => {
   // 换了密钥，解密必须失败——这里用同一个密钥再验一次
   reopened.close();
 
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('会话人格绑定：未绑定跟随全局，绑定后互不影响，解绑回落', () => {
+  const { store, dir } = tempDb();
+  const def = store.personas.active(); // 触发默认人格落库
+  const coder = store.personas.upsert('coder', 'you write code');
+  const tsun = store.personas.upsert('tsundere', '你嘴上嫌弃但其实很关心对方');
+
+  // 没绑定 → 跟随全局（默认 default）
+  assert.equal(store.personas.forSession('private:1').name, 'default');
+  assert.equal(store.personas.bindingOf('private:1'), 0);
+
+  // 两个会话绑不同人格，互不影响
+  store.personas.bind('private:1', coder.id);
+  store.personas.bind('private:2', tsun.id);
+  assert.equal(store.personas.forSession('private:1').name, 'coder');
+  assert.equal(store.personas.forSession('private:2').name, 'tsundere');
+  assert.equal(store.personas.forSession('group:9').name, 'default');
+  assert.equal(store.personas.bindingCount(), 2);
+
+  // 绑定是"固定"的：全局默认切走后，绑定的会话仍用原人格
+  store.personas.activate(tsun.id);
+  assert.equal(store.personas.active().name, 'tsundere');
+  assert.equal(store.personas.forSession('private:1').name, 'coder');
+
+  // bind(0) 解绑 → 回到跟随全局
+  store.personas.bind('private:1', 0);
+  assert.equal(store.personas.bindingOf('private:1'), 0);
+  assert.equal(store.personas.forSession('private:1').name, 'tsundere');
+
+  // 绑定不存在的人格要报错，不能留下一条永远回落的死绑定
+  assert.throws(() => store.personas.bind('private:3', 99999), /人格不存在/);
+  assert.throws(() => store.personas.bind('', coder.id), /会话 ID 不能为空/);
+
+  // 会话列表带出绑定信息
+  store.sessions.touch('private:2', 'private', 2);
+  store.sessions.touch('group:9', 'group', 9);
+  const list = store.sessions.list();
+  const byId = new Map(list.map((s) => [s.id, s]));
+  assert.equal(byId.get('private:2')?.persona_id, tsun.id);
+  assert.equal(byId.get('private:2')?.persona_name, 'tsundere');
+  assert.equal(byId.get('group:9')?.persona_id, 0);
+  assert.equal(byId.get('group:9')?.persona_name, '');
+
+  assert.equal(def.name, 'default');
+  store.close();
   rmSync(dir, { recursive: true, force: true });
 });
 

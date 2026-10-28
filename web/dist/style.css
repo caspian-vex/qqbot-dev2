@@ -377,6 +377,16 @@ textarea { resize: vertical; min-height: 90px; font-family: var(--mono); font-si
 
 select { cursor: pointer; }
 
+/* 表格里的紧凑下拉：默认 100% 宽会把单元格撑开，会话页每行都要放一个 */
+select.sel {
+  width: auto;
+  max-width: 180px;
+  padding: 3px 6px;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--bg-input);
+}
+
 .check {
   display: flex;
   align-items: flex-start;
