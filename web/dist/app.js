@@ -260,7 +260,7 @@
           <div id="login-err"></div>
           <div class="field">
             <label>用户名</label>
-            <input type="text" id="lg-user" value="admin" autocomplete="username">
+            <input type="text" id="lg-user" autocomplete="username">
           </div>
           <div class="field">
             <label>密码</label>
@@ -313,7 +313,13 @@
     $('.login-card').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') submit();
     });
-    setTimeout(() => $('#lg-pass') && $('#lg-pass').focus(), 30);
+    // 用户名不预填：默认账号虽然叫 admin，但它可以在设置里改名，
+    // 预填一个"看起来像答案"的 admin，改过名的人只会先撞一次登录失败。
+    setTimeout(() => {
+      const u = $('#lg-user');
+      if (u && u.value === '') u.focus();
+      else $('#lg-pass')?.focus();
+    }, 30);
   }
 
   /* ================= 外壳 ================= */
