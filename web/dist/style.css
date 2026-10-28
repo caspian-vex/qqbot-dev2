@@ -3,6 +3,10 @@
    为它拉一个 Tailwind/Element 进来会让二进制和心智负担都变重。 */
 
 :root {
+  /* 默认暗色：面板上线以来就是这个配色，老用户升级后视觉不变。
+     浅色由 [data-theme='light'] 覆盖；data-theme 由 theme.js 在首帧前写入。 */
+  color-scheme: dark;
+
   --bg: #0e1117;
   --bg-soft: #151922;
   --bg-input: #0a0d13;
@@ -18,6 +22,78 @@
   --bad: #f85149;
   --radius: 10px;
   --mono: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace;
+
+  /* 交互态与零散色块。以前这些都写死成暗色值，做浅色主题时必须抽出来，
+     否则一换主题就会出现「白底上的深灰按钮」这类局部不跟队。 */
+  --hover: #1b202b;
+  --row-hover: #1a1f29;
+  --nav-on: #1d2534;
+  --nav-on-fg: #ffffff;
+  --soft: #1c222d;          /* ghost 按钮、toast 背景 */
+  --tag-bg: #1e2531;
+  --tag-on-bg: #16301d;
+  --tag-on-bd: #245c33;
+  --tag-on-fg: #7ee08a;
+  --tag-off-bg: #2a1e1e;
+  --tag-off-bd: #4a2a2a;
+  --tag-off-fg: #e8a09a;
+  --danger-bg: #3a1d1d;
+  --danger-bd: #5a2a2a;
+  --danger-fg: #ff9b95;
+  --danger-hover: #4a2222;
+  --bubble-user-bg: #1e3a63;
+  --bubble-user-bd: #2b4d80;
+  --bubble-as-bg: #1a1f29;
+  --err-bg: #2a1a1a;
+  --err-bd: #4a2a2a;
+  --err-fg: #ffb3ad;
+  --log-info: #6cb6ff;
+  --shadow: 0 8px 24px rgba(0, 0, 0, .4);
+}
+
+/* 浅色。不是把暗色反相：底色用中性灰而不是纯白（大面积纯白在运维界面里刺眼），
+   文字用带蓝的深灰，强调色压深保证白底上对比度够。 */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #f4f5f7;
+  --bg-soft: #ffffff;
+  --bg-input: #f7f8fa;
+  --line: #d9dde4;
+  --line-soft: #e7eaef;
+  --fg: #1f2430;
+  --fg-dim: #4c5468;
+  --fg-mute: #8a92a3;
+  --accent: #2563eb;
+  --accent-dim: #a5c0f7;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --bad: #cf222e;
+
+  --hover: #eef1f6;
+  --row-hover: #f3f5f9;
+  --nav-on: #e3ebfc;
+  --nav-on-fg: #1d4ed8;
+  --soft: #e9edf4;
+  --tag-bg: #eceff4;
+  --tag-on-bg: #e2f5e8;
+  --tag-on-bd: #a9dcb8;
+  --tag-on-fg: #176a2f;
+  --tag-off-bg: #fceeee;
+  --tag-off-bd: #efb9b4;
+  --tag-off-fg: #a94a42;
+  --danger-bg: #fceeee;
+  --danger-bd: #efb9b4;
+  --danger-fg: #a94a42;
+  --danger-hover: #f9e0df;
+  --bubble-user-bg: #dfeafe;
+  --bubble-user-bd: #bcd4f6;
+  --bubble-as-bg: #f1f3f7;
+  --err-bg: #fceeee;
+  --err-bd: #efb9b4;
+  --err-fg: #a94a42;
+  --log-info: #1a6fd4;
+  --shadow: 0 8px 24px rgba(31, 36, 48, .12);
 }
 
 * { box-sizing: border-box; }
@@ -121,8 +197,8 @@ a:hover { text-decoration: underline; }
   user-select: none;
 }
 
-.nav-item:hover { background: #1b202b; color: var(--fg); text-decoration: none; }
-.nav-item.on { background: #1d2534; color: #fff; }
+.nav-item:hover { background: var(--hover); color: var(--fg); text-decoration: none; }
+.nav-item.on { background: var(--nav-on); color: var(--nav-on-fg); }
 .nav-item .ico { width: 15px; text-align: center; opacity: .85; }
 
 .side-foot {
@@ -324,13 +400,13 @@ select { cursor: pointer; }
 .btn:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 
 .btn.ghost {
-  background: #1c222d;
+  background: var(--soft);
   border-color: var(--line);
   color: var(--fg);
 }
 
-.btn.danger { background: #3a1d1d; border-color: #5a2a2a; color: #ff9b95; }
-.btn.danger:hover { background: #4a2222; }
+.btn.danger { background: var(--danger-bg); border-color: var(--danger-bd); color: var(--danger-fg); }
+.btn.danger:hover { background: var(--danger-hover); }
 
 .btn.sm { padding: 4px 10px; font-size: 12px; }
 
@@ -363,7 +439,7 @@ td {
 }
 
 tr:last-child td { border-bottom: 0; }
-tbody tr:hover { background: #1a1f29; }
+tbody tr:hover { background: var(--row-hover); }
 
 .mono { font-family: var(--mono); font-size: 12.5px; }
 .dim { color: var(--fg-dim); }
@@ -372,7 +448,7 @@ tbody tr:hover { background: #1a1f29; }
 
 .tag {
   display: inline-block;
-  background: #1e2531;
+  background: var(--tag-bg);
   border: 1px solid var(--line);
   border-radius: 5px;
   padding: 1px 7px;
@@ -381,8 +457,8 @@ tbody tr:hover { background: #1a1f29; }
   white-space: nowrap;
 }
 
-.tag.on { background: #16301d; border-color: #245c33; color: #7ee08a; }
-.tag.off { background: #2a1e1e; border-color: #4a2a2a; color: #e8a09a; }
+.tag.on { background: var(--tag-on-bg); border-color: var(--tag-on-bd); color: var(--tag-on-fg); }
+.tag.off { background: var(--tag-off-bg); border-color: var(--tag-off-bd); color: var(--tag-off-fg); }
 
 /* ---------- 日志 ---------- */
 
@@ -402,7 +478,7 @@ tbody tr:hover { background: #1a1f29; }
 .logline .t { color: var(--fg-mute); flex: none; }
 .logline .lv { flex: none; width: 44px; }
 .logline .lv.DEBUG { color: var(--fg-mute); }
-.logline .lv.INFO { color: #6cb6ff; }
+.logline .lv.INFO { color: var(--log-info); }
 .logline .lv.WARN { color: var(--warn); }
 .logline .lv.ERROR { color: var(--bad); }
 .logline .m { color: var(--fg-dim); }
@@ -453,8 +529,8 @@ tbody tr:hover { background: #1a1f29; }
   word-break: break-word;
 }
 
-.bubble.user { align-self: flex-end; background: #1e3a63; border: 1px solid #2b4d80; }
-.bubble.assistant { align-self: flex-start; background: #1a1f29; border: 1px solid var(--line); }
+.bubble.user { align-self: flex-end; background: var(--bubble-user-bg); border: 1px solid var(--bubble-user-bd); }
+.bubble.assistant { align-self: flex-start; background: var(--bubble-as-bg); border: 1px solid var(--line); }
 .bubble .meta { font-size: 10.5px; color: var(--fg-mute); margin-top: 4px; }
 
 /* ---------- 提示 ---------- */
@@ -471,13 +547,13 @@ tbody tr:hover { background: #1a1f29; }
 }
 
 .toast {
-  background: #1c222d;
+  background: var(--soft);
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
   border-radius: 8px;
   padding: 10px 14px;
   font-size: 13px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+  box-shadow: var(--shadow);
   animation: toast-in .18s ease-out;
 }
 
@@ -499,11 +575,44 @@ tbody tr:hover { background: #1a1f29; }
 .hr { height: 1px; background: var(--line-soft); margin: 18px 0; }
 
 .err-inline {
-  background: #2a1a1a;
-  border: 1px solid #4a2a2a;
-  color: #ffb3ad;
+  background: var(--err-bg);
+  border: 1px solid var(--err-bd);
+  color: var(--err-fg);
   border-radius: 7px;
   padding: 8px 11px;
   font-size: 12.5px;
   margin-bottom: 14px;
 }
+
+/* ---------- 外观切换（浅色 / 暗色 / 跟随系统） ---------- */
+
+.theme-pick {
+  display: flex;
+  gap: 4px;
+}
+
+.theme-pick button {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 0;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg-mute);
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+
+.theme-pick button:hover { color: var(--fg); background: var(--hover); }
+
+.theme-pick button.on {
+  background: var(--nav-on);
+  border-color: var(--accent-dim);
+  color: var(--nav-on-fg);
+}
+
+/* 登录页的切换器贴在卡片底部，和侧栏里的不是同一个位置 */
+.login-card .theme-pick { margin: 16px 0 0; }

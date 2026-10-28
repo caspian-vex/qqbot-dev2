@@ -178,6 +178,60 @@
     });
   }
 
+  /* ================= 外观 ================= */
+
+  // 'light' | 'dark' | 'system'，存 localStorage。
+  // 首帧已经由 theme.js 处理过，这里负责切换、跟随系统与控件的选中态。
+  const THEME_KEY = 'qqbot-theme';
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)');
+
+  function themeMode() {
+    try {
+      return localStorage.getItem(THEME_KEY) || 'dark';
+    } catch (_) {
+      return 'dark';
+    }
+  }
+
+  function applyTheme() {
+    const m = themeMode();
+    document.documentElement.dataset.theme =
+      m === 'system' ? (prefersDark.matches ? 'dark' : 'light') : m;
+  }
+
+  // 系统主题变化时只有「跟随系统」需要跟着变
+  prefersDark.addEventListener('change', () => {
+    if (themeMode() === 'system') applyTheme();
+  });
+
+  // theme.js 理论上已经设好了；这里再跑一次，保证它被缓存或加载失败时也不至于没主题
+  applyTheme();
+
+  function themePickHTML() {
+    const m = themeMode();
+    const item = (v, label) =>
+      `<button data-act="theme" data-v="${v}" class="${m === v ? 'on' : ''}">${label}</button>`;
+    return `<div class="theme-pick" role="group" aria-label="外观">${
+      item('light', '浅色')}${item('dark', '暗色')}${item('system', '跟随系统')}</div>`;
+  }
+
+  function syncThemePick(v) {
+    $$('.theme-pick button').forEach((b) => b.classList.toggle('on', b.dataset.v === v));
+  }
+
+  // 挂在 document 上：登录页和外壳各有一套切换器，登录页没有 data-act 的公共父级
+  bindActions(document, {
+    theme: (el) => {
+      try {
+        localStorage.setItem(THEME_KEY, el.dataset.v);
+      } catch (_) {
+        /* 存不了就只在本次会话生效 */
+      }
+      applyTheme();
+      syncThemePick(el.dataset.v);
+    },
+  });
+
   /* ================= 登录 ================= */
 
   function renderLogin() {
@@ -206,8 +260,9 @@
           <button class="btn" id="lg-submit" style="width:100%;margin-top:6px">登录</button>
           <div style="margin-top:14px;font-size:11.5px;color:var(--fg-mute);line-height:1.6">
             初始密码在首次启动时打印在服务日志里，只显示一次。<br>
-            忘记密码：停掉服务后删除 data/qqbot.db 中的设置行会重新生成（会丢配置）。
+            忘记密码：服务器上执行 <code>qqbot reset-password</code>。
           </div>
+          ${themePickHTML()}
         </div>
       </div>`;
 
@@ -258,7 +313,8 @@
             `<a class="nav-item" data-nav="${k}" href="#/${k}"><span class="ico">${r.icon}</span>${r.title}</a>`
           ).join('')}
           <div class="side-foot">
-            <div style="margin-bottom:6px">${esc(app.user || '')}</div>
+            ${themePickHTML()}
+            <div style="margin:8px 0 6px">${esc(app.user || '')}</div>
             <a href="#/" data-act="logout" style="color:var(--fg-dim)">退出登录</a>
           </div>
         </aside>
