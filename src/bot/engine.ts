@@ -7,9 +7,10 @@ import { build as buildSystem, emptyVars, expand } from '../persona';
 import type { Store } from '../store';
 import type { Settings } from '../store/types';
 import { sessionId } from '../store/types';
-import { isPeak, rfc3339, ZERO_TIME } from '../util/time';
+import { isPeak, localDay, rfc3339, ZERO_TIME } from '../util/time';
 import type { Event, Segment } from '../onebot/types';
 import { at, isGroup, isMessage, isPrivate, reply, text } from '../onebot/types';
+import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
 import { decide, type Decision } from './filter';
 import { Cooldown, Dedupe, TaskQueue } from './queue';
 import { split, stripMarkdown } from './split';
@@ -39,6 +40,13 @@ interface Counters {
   lastReplyAt: number;
 }
 
+/** 一个已排定、尚未执行的跟进。 */
+interface PendingEcho {
+  kind: string;
+  target: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class Engine implements EnginePort {
   private readonly store: Store;
   private readonly log: Logger;
@@ -49,6 +57,15 @@ export class Engine implements EnginePort {
   private readonly dedupe = new Dedupe(5 * 60_000);
   private readonly queue = new TaskQueue(3, 3);
   private readonly cool = new Cooldown();
+
+  // ---- 回声式跟进的状态 ----
+  /** 每个会话至多挂一个待执行的跟进。 */
+  private readonly pendingEcho = new Map<string, PendingEcho>();
+  /** 最近一次实际发出跟进的时间（毫秒），用于会话冷却。 */
+  private readonly echoSentAt = new Map<string, number>();
+  /** 今日已发跟进条数；跨天在 rollEchoDay 里清零。进程重启即归零，方向是保守的。 */
+  private echoCount = 0;
+  private echoDay = localDay();
 
   private selfId = 0;
   private botName = '';
@@ -68,6 +85,8 @@ export class Engine implements EnginePort {
     this.log = opt.log.with({ component: 'bot' });
     this.llm = opt.llm ?? new LlmClient();
     this.ctx = new ContextManager(opt.store);
+    // 退出时拆掉所有未执行的跟进，别让进程死前还发一条消息
+    opt.signal?.addEventListener('abort', () => this.cancelAllEchoes(), { once: true });
   }
 
   /** 注入协议端。允许先建引擎再建客户端，打破循环依赖。 */
@@ -126,6 +145,10 @@ export class Engine implements EnginePort {
       this.log.debug('重复消息，已跳过', { message_id: ev.message_id ?? 0 });
       return;
     }
+
+    // 用户有新消息，之前排的跟进立刻作废——
+    // 否则会出现"对方刚开口，机器人却先补上一句刚才的茬"的错位
+    this.cancelEcho(sessionKey(ev));
 
     let settings: Settings;
     try {
@@ -278,6 +301,8 @@ export class Engine implements EnginePort {
       segments: segs.length,
       first_token: `${res.firstTokenMs}ms`,
     });
+
+    this.scheduleEcho(sid, kindOf(ev), targetOf(ev), settings);
   }
 
   /** 模型调用失败时给一句兜底回复，避免用户干等。 */
@@ -288,6 +313,157 @@ export class Engine implements EnginePort {
     } catch {
       // 故意忽略
     }
+  }
+
+  // ---- 回声式跟进 ----
+  //
+  // 主动消息里风险最低的一种：对话刚发生、对方明确在聊，
+  // 隔一小会儿补一句相关的话。所以把它做成第一个落地的主动功能。
+
+  /** 回复成功后按概率排一个延迟跟进。 */
+  private scheduleEcho(sid: string, kind: string, target: number, s: Settings): void {
+    this.rollEchoDay();
+    const cdMs = Math.max(0, s.proactive.echo_cooldown_min) * 60_000;
+    const last = this.echoSentAt.get(sid) ?? 0;
+    const ok = shouldEcho(s.proactive, {
+      sentToday: this.echoCount,
+      cooldownOk: cdMs === 0 || last === 0 || Date.now() - last >= cdMs,
+    });
+    if (!ok) return;
+
+    // 同一会话同时只挂一个跟进；重排时先拆旧的
+    this.cancelEcho(sid);
+    const delay = echoDelayMs(s.proactive);
+    const timer = setTimeout(() => this.fireEcho(sid), delay);
+    this.pendingEcho.set(sid, { kind, target, timer });
+    this.log.debug('已排跟进', { session: sid, delay_ms: delay });
+  }
+
+  /** 延迟到期：把跟进投进与会话回复相同的队列，保证写历史不与真回复交叉。 */
+  private fireEcho(sid: string): void {
+    const entry = this.pendingEcho.get(sid);
+    if (!entry) return;
+    const accepted = this.queue.submit(sid, () => this.runEcho(sid, entry));
+    if (!accepted) {
+      this.pendingEcho.delete(sid);
+      this.log.debug('跟进排队已满，丢弃', { session: sid });
+    }
+  }
+
+  private async runEcho(sid: string, entry: PendingEcho): Promise<void> {
+    // 排队期间用户又说了话（cancelEcho 已删条目）或跟进被重排 → 放弃
+    if (this.pendingEcho.get(sid) !== entry) return;
+    this.pendingEcho.delete(sid);
+
+    let settings: Settings;
+    try {
+      settings = this.store.settings.get();
+    } catch {
+      return;
+    }
+    const p = settings.proactive;
+    // 从排定到执行可能隔了很久，硬闸执行时再验一遍（设置可能已被关掉或调小）
+    this.rollEchoDay();
+    const cdMs = Math.max(0, p.echo_cooldown_min) * 60_000;
+    const last = this.echoSentAt.get(sid) ?? 0;
+    if (!p.echo_enabled) return;
+    if (p.echo_daily_limit <= 0 || this.echoCount >= p.echo_daily_limit) return;
+    if (cdMs > 0 && last !== 0 && Date.now() - last < cdMs) return;
+
+    let personaPrompt: string;
+    try {
+      personaPrompt = this.store.personas.active().system_prompt;
+    } catch (e) {
+      this.log.warn('跟进读取人格失败', { err: e });
+      return;
+    }
+
+    try {
+      const vars = {
+        ...emptyVars(),
+        time: formatLocalMinute(new Date()),
+        botName: this.botName,
+        groupName: entry.kind === 'group' ? await this.groupName(entry.target) : '',
+        nickname: '',
+      };
+      const system = buildSystem(expand(personaPrompt, vars), vars);
+      // 指令以 user 角色进请求但从不落库；真正发出的内容事后补记为 assistant
+      const msgs = this.ctx.build(sid, settings.context, system, ECHO_INSTRUCTION);
+      const cfg: LlmConfig = {
+        baseURL: settings.llm.base_url,
+        apiKey: settings.llm.api_key,
+        model: settings.llm.model,
+        temperature: settings.llm.temperature,
+        maxTokens: settings.llm.max_tokens,
+        thinking: settings.llm.thinking,
+        timeoutMs: settings.llm.timeout_sec * 1000,
+      };
+      const res = await this.llm.chat(cfg, msgs, this.opt.signal);
+      const echoText = stripMarkdown(res.content);
+
+      // 空输出是模型行使"闭嘴权"，正常放弃而不是错误
+      if (echoText === '') {
+        this.log.debug('跟进没有想说的，放弃', { session: sid });
+        return;
+      }
+
+      const segs = split(echoText, { maxSegments: 2, maxRunes: 80 });
+      if (segs.length === 0) return;
+
+      await this.sendTo(entry.kind, entry.target, segs, settings);
+
+      this.ctx.record(sid, 'assistant', echoText, estimateTokens(echoText));
+      this.echoSentAt.set(sid, Date.now());
+      this.echoCount++;
+      this.log.info('已跟进', { session: sid, segments: segs.length });
+    } catch (e) {
+      // 跟进是锦上添花：失败不重试、不兜底、不记 error
+      this.log.debug('跟进失败，放弃', { session: sid, err: e });
+    }
+  }
+
+  /**
+   * 无事件发送：跟进没有原始消息可引用，也不 @，直接说话。
+   * 段间延迟读设置（回复链路的 sendText 历史上写死了 300-800，这里不再复刻）。
+   */
+  private async sendTo(kind: string, target: number, segs: string[], s: Settings): Promise<void> {
+    const sender = this.sender;
+    if (!sender) throw new Error('协议端未连接');
+    for (let i = 0; i < segs.length; i++) {
+      const parts: Segment[] = [text(segs[i]!)];
+      if (kind === 'group') await sender.sendGroup(target, parts, this.opt.signal);
+      else await sender.sendPrivate(target, parts, this.opt.signal);
+      if (i < segs.length - 1) {
+        const min = Math.max(0, s.bot.seg_delay_min_ms);
+        const max = Math.max(min, s.bot.seg_delay_max_ms);
+        await sleep(min + Math.floor(Math.random() * (max - min)), this.opt.signal);
+      }
+    }
+  }
+
+  private cancelEcho(sid: string): void {
+    const p = this.pendingEcho.get(sid);
+    if (!p) return;
+    clearTimeout(p.timer);
+    this.pendingEcho.delete(sid);
+  }
+
+  private cancelAllEchoes(): void {
+    for (const sid of [...this.pendingEcho.keys()]) this.cancelEcho(sid);
+  }
+
+  /** 跨天清零跟进计数。 */
+  private rollEchoDay(): void {
+    const day = localDay();
+    if (day !== this.echoDay) {
+      this.echoDay = day;
+      this.echoCount = 0;
+    }
+  }
+
+  /** 当前挂起的跟进数（诊断与测试用）。 */
+  pendingEchoCount(): number {
+    return this.pendingEcho.size;
   }
 
   /**

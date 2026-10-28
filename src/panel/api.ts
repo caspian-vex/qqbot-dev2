@@ -161,6 +161,23 @@ function validateSettings(v: Settings): void {
   if (v.context.token_budget < 200 || v.context.token_budget > 100000) {
     throw new HttpError(400, '上下文 token 预算应在 200-100000 之间');
   }
+  if (v.proactive.echo_rate < 0 || v.proactive.echo_rate > 1) {
+    throw new HttpError(400, '跟进概率应在 0-1 之间');
+  }
+  if (
+    v.proactive.echo_min_sec < 5 ||
+    v.proactive.echo_min_sec > 3600 ||
+    v.proactive.echo_max_sec < v.proactive.echo_min_sec ||
+    v.proactive.echo_max_sec > 3600
+  ) {
+    throw new HttpError(400, '跟进延迟应在 5-3600 秒之间，且上限不小于下限');
+  }
+  if (v.proactive.echo_cooldown_min < 0 || v.proactive.echo_cooldown_min > 1440) {
+    throw new HttpError(400, '跟进冷却应在 0-1440 分钟之间');
+  }
+  if (v.proactive.echo_daily_limit < 0 || v.proactive.echo_daily_limit > 100) {
+    throw new HttpError(400, '每日跟进上限应在 0-100 之间');
+  }
 }
 
 /**
@@ -513,6 +530,7 @@ export class Api {
           blacklist_users: [...inp.bot.blacklist_users],
         };
         v.context = { ...inp.context };
+        v.proactive = { ...inp.proactive };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });

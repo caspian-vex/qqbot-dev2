@@ -507,7 +507,7 @@
 
     api('/api/settings').then((s) => {
       if (!$('#set-body')) return; // 用户已经切走
-      const l = s.llm, b = s.bot, c = s.context;
+      const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
@@ -592,6 +592,43 @@
         </div>
 
         <div class="card">
+          <h3>主动发言 <span class="hint">回复后隔一小会儿主动补一句相关的话</span></h3>
+          <label class="check">
+            <input type="checkbox" id="f-echo" ${(p.echo_enabled ? 'checked' : '')}>
+            <span>开启回声式跟进
+              <span class="note">回复完用户后，按概率延迟补一句相关的话或小问题。
+              对方有任何新消息都会立即取消未发出的跟进；连续不接话会自然停住。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>触发概率</label>
+              <input type="number" id="f-echo-rate" step="0.05" min="0" max="1" value="${p.echo_rate ?? 0.35}">
+              <div class="note">每次回复后有多大概率安排跟进，0.35 表示三次里约有一次。</div>
+            </div>
+            <div class="field">
+              <label>延迟范围（秒）</label>
+              <div class="row" style="gap:8px">
+                <input type="number" id="f-echo-min" min="5" max="3600" value="${p.echo_min_sec ?? 30}" aria-label="延迟下限">
+                <span>至</span>
+                <input type="number" id="f-echo-max" min="5" max="3600" value="${p.echo_max_sec ?? 90}" aria-label="延迟上限">
+              </div>
+              <div class="note">实际延迟在范围内随机取值；秒级整点或固定间隔一眼就是机器。</div>
+            </div>
+            <div class="field">
+              <label>同一会话冷却（分钟）</label>
+              <input type="number" id="f-echo-cd" min="0" max="1440" value="${p.echo_cooldown_min ?? 30}">
+              <div class="note">两次跟进的最小间隔，防止对一个话题穷追不舍。</div>
+            </div>
+            <div class="field">
+              <label>每日上限（条）</label>
+              <input type="number" id="f-echo-limit" min="0" max="100" value="${p.echo_daily_limit ?? 5}">
+              <div class="note">全部会话共享的全局硬闸，防刷屏也是防风控。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>上下文</h3>
           <div class="grid c2">
             <div class="field">
@@ -642,6 +679,14 @@
                 context: {
                   max_turns: Number($('#f-turns').value),
                   token_budget: Number($('#f-budget').value),
+                },
+                proactive: {
+                  echo_enabled: $('#f-echo').checked,
+                  echo_rate: Number($('#f-echo-rate').value),
+                  echo_min_sec: Number($('#f-echo-min').value),
+                  echo_max_sec: Number($('#f-echo-max').value),
+                  echo_cooldown_min: Number($('#f-echo-cd').value),
+                  echo_daily_limit: Number($('#f-echo-limit').value),
                 },
               },
             });

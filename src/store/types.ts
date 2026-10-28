@@ -29,6 +29,28 @@ export interface BotSettings {
   quote_reply: boolean;
 }
 
+/**
+ * 主动发言配置。
+ *
+ * 目前只有「回声式跟进」：回复完用户后隔一小会儿，主动补一句相关的话。
+ * 这是主动消息里风险最低的一种——对话刚发生、对方明确在聊，
+ * 所以敢做成默认可开的功能（但出厂仍是关的，让用户自己决定）。
+ */
+export interface ProactiveSettings {
+  /** 是否允许回复后延迟补一句。 */
+  echo_enabled: boolean;
+  /** 每次回复后触发跟进的概率，0-1。 */
+  echo_rate: number;
+  /** 延迟下限（秒）。真人不会秒回自己，也不会掐着整点补话。 */
+  echo_min_sec: number;
+  /** 延迟上限（秒），实际延迟在 [min, max] 内均匀采样。 */
+  echo_max_sec: number;
+  /** 同一会话两次跟进的最小间隔（分钟），0 表示不限制。 */
+  echo_cooldown_min: number;
+  /** 全局每日跟进上限（跨会话累计），防刷屏与风控的硬闸。 */
+  echo_daily_limit: number;
+}
+
 /** 上下文窗口配置。 */
 export interface ContextSettings {
   max_turns: number;
@@ -47,8 +69,21 @@ export interface PanelSettings {
 export interface Settings {
   llm: LLMSettings;
   bot: BotSettings;
+  proactive: ProactiveSettings;
   context: ContextSettings;
   panel: PanelSettings;
+}
+
+/** 主动发言的出厂默认值。功能关闭、概率保守、上限收紧。 */
+export function defaultProactive(): ProactiveSettings {
+  return {
+    echo_enabled: false,
+    echo_rate: 0.35,
+    echo_min_sec: 30,
+    echo_max_sec: 90,
+    echo_cooldown_min: 30,
+    echo_daily_limit: 5,
+  };
 }
 
 /** 出厂默认值。刻意保守：被动接话概率低、上下文预算小、思考模式关闭。 */
@@ -75,6 +110,7 @@ export function defaultSettings(): Settings {
       blacklist_users: [],
       quote_reply: true,
     },
+    proactive: defaultProactive(),
     context: {
       max_turns: 10,
       token_budget: 3000,
@@ -98,6 +134,11 @@ export function normalizeSettings(v: Settings): Settings {
   if (!Array.isArray(v.bot.wake_words)) v.bot.wake_words = [];
   if (!Array.isArray(v.bot.whitelist_groups)) v.bot.whitelist_groups = [];
   if (!Array.isArray(v.bot.blacklist_users)) v.bot.blacklist_users = [];
+  // 旧库没有 proactive 块：整个补成默认值。字段级合并没必要——
+  // 这个块只能从面板整块保存，不存在"半新半旧"的中间态。
+  if (v.proactive === undefined || v.proactive === null || typeof v.proactive !== 'object') {
+    v.proactive = defaultProactive();
+  }
   return v;
 }
 
@@ -111,6 +152,7 @@ export function cloneSettings(v: Settings): Settings {
       whitelist_groups: [...v.bot.whitelist_groups],
       blacklist_users: [...v.bot.blacklist_users],
     },
+    proactive: { ...v.proactive },
     context: { ...v.context },
     panel: { ...v.panel },
   };
