@@ -19,7 +19,6 @@ import {
   type ReqCtx,
 } from './http';
 import { nullEngine, nullOneBot, nullQQLogin, type EnginePort, type OneBotPort, type QQLoginPort } from './ports';
-import { applyWebUICSP, makeWebUIProxy, type ProxyTarget } from './napcat-proxy';
 import { SessionStore, type SessionInfo } from './session-store';
 
 export interface PanelOptions {
@@ -31,8 +30,6 @@ export interface PanelOptions {
   client?: OneBotPort;
   /** 协议端 WebUI 控制能力；不传时扫码登录入口显示为未配置。 */
   qq?: QQLoginPort;
-  /** 协议端 WebUI 反代目标；不传时 /webui 一路不挂载。 */
-  napcatWebUI?: ProxyTarget;
   /** 机器人要连的反向 WS 端口；登录成功后自动补齐这条监听。 */
   onebotPort?: number;
   hub?: LogHub;
@@ -45,7 +42,6 @@ export class PanelServer {
 
   private readonly api: Api;
   private readonly router: Router;
-  private readonly webuiProxy: Handler | null;
   private readonly log: Logger;
   private readonly startedAt = Date.now();
   private server: Server | null = null;
@@ -69,7 +65,6 @@ export class PanelServer {
     });
 
     this.router = this.buildRouter();
-    this.webuiProxy = opt.napcatWebUI ? applyWebUICSP(makeWebUIProxy(opt.napcatWebUI)) : null;
   }
 
   // ---- 路由 ----
@@ -217,31 +212,17 @@ export class PanelServer {
   }
 
   /**
-   * 选处理器：面板自己的路由优先，命不中的才考虑反代给协议端。
+   * 协议端原生 WebUI 的反代已移除。
    *
-   * /webui 整条子树归协议端（它的前端资源是绝对路径 /webui/assets/…）。
-   * /api 只转发面板没注册过的路径——两边都有 /api/auth/login，谁先谁后
-   * 决定了面板还能不能登录，所以必须用注册表判断而不是前缀判断。
-   *
-   * 反代一路同样要求面板会话：否则等于把协议端裸奔到公网，
-   * 而 /webui 里能改 WS 配置、能重启进程。
+   * 原先 /webui/* 与未注册的 /api/* 会转给 NapCat，等于把它的整套管理界面
+   * （网络配置、进程控制、插件）挂到面板后面。现在只保留"让机器人保持在线"
+   * 所需的能力，全部收在面板自己的 /api/qq/* 里——浏览器拿不到 NapCat 凭据，
+   * 也就不需要为那份前端产物放宽 CSP 了。
    */
   private resolveHandler(ctx: ReqCtx): Handler | null {
-    const p = ctx.path;
-    const wantWebUI = this.webuiProxy !== null && (p === '/webui' || p.startsWith('/webui/'));
-    const wantAPI =
-      this.webuiProxy !== null && p.startsWith('/api/') && !this.router.has(p);
-
-    if (!wantWebUI && !wantAPI) return this.router.dispatch(ctx);
-
-    const proxy = this.webuiProxy as Handler;
-    return (c) => {
-      if (!this.currentSession(c.req)) {
-        writeErr(c.res, 401, '未登录或会话已过期');
-        return;
-      }
-      return proxy(c);
-    };
+    // 未命中的路径仍按 Go ServeMux 的语义回落到静态兜底：
+    // 前端只有一个页面，/anything 都该出 index.html。
+    return this.router.dispatch(ctx);
   }
 
   // ---- 生命周期 ----

@@ -915,6 +915,42 @@ describe('用户名修改', () => {
   });
 });
 
+describe('协议端原生界面已移除', () => {
+  // 反代一旦被"顺手"加回来，等于把 NapCat 的整套管理权限挂到面板后面，
+  // 所以把这两条钉成契约：/webui 与未注册的 /api/* 都不能再转给协议端。
+  it('/webui 不再反代，只会落到面板自己的单页应用', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await fetch(`${h.base}/webui/`, { headers: { Cookie: c.header } });
+      const body = await res.text();
+      // 未命中的路径回 index.html（SPA 兜底），但绝不能是 NapCat 的界面
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+      assert.match(body, /qqbot 控制台/);
+      assert.ok(!/napcat/i.test(body), '不应再出现 NapCat 的页面');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('协议端自己的 /api/QQLogin/* 不再被转发', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      // 面板没注册这个路径 → 走 SPA 兜底，而不是转给 NapCat 拿 code:0
+      const res = await fetch(`${h.base}/api/QQLogin/CheckLoginStatus`, {
+        headers: { Cookie: c.header },
+      });
+      assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+      const body = await res.text();
+      assert.ok(!body.includes('"code"'), '不应透出协议端的 JSON 响应');
+    } finally {
+      await h.stop();
+    }
+  });
+});
+
 describe('协议端未连接时的行为', () => {
   it('群列表拉取失败返回 502 并带原始错误', async () => {
     const h = await harness();

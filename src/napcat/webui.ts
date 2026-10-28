@@ -139,17 +139,6 @@ export class NapCatWebUI {
     return this.baseUrl !== '' && this.token !== '';
   }
 
-  /**
-   * 取一个有效的 Credential，供 /webui 反向代理注入 Authorization。
-   *
-   * 这是「token 不下发浏览器」的最后一环：WebUI 前端在 localStorage 里
-   * 只有一个占位串，真正能操作协议端的凭据始终留在服务端进程内存里。
-   */
-  async bearer(): Promise<string> {
-    if (!this.configured) return '';
-    return this.ensureCredential();
-  }
-
   private get base(): string {
     return this.baseUrl.replace(/\/+$/, '');
   }

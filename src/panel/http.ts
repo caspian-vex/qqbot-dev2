@@ -287,16 +287,6 @@ export class Router {
     return this;
   }
 
-  /**
-   * 该路径是否由面板自己处理（不论方法）。
-   *
-   * 反代 NapCat 的 /api 时需要它：面板的接口必须优先命中，
-   * 剩下的才转给协议端——否则 /api/auth/login 会被协议端抢走。
-   */
-  has(path: string): boolean {
-    return this.table.has(path);
-  }
-
   dispatch(ctx: ReqCtx): Handler | null {
     const method = ctx.req.method ?? 'GET';
     const entries = this.table.get(ctx.path);

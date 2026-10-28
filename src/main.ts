@@ -164,8 +164,6 @@ async function cmdRun(argv: string[]): Promise<void> {
       engine,
       client: portOf(client),
       qq,
-      // WebUI 反代：浏览器拿到的是面板的会话，凭据由服务端注入（见 napcat-proxy.ts）
-      napcatWebUI: { base: config.napcat.webui, bearer: () => qq.bearer() },
       // 登录成功后自动补齐这条反向 WS，省掉「去网络页点一下」的手工步骤
       onebotPort: onebotPortOf(config.onebot.url),
       version: versionString(),

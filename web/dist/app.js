@@ -1278,48 +1278,184 @@
    * 实测约束：OB11Config 要求 QQ 已登录（未登录协议端返回 Not Login），
    * 所以先查登录状态，未登录就把编辑区藏起来，引导去「登录」页。
    */
-  /* ================= 协议端（内嵌 NapCat WebUI） ================= */
+  /* ================= 协议端（保活面板） ================= */
 
-  /* 为什么是内嵌而不是重画一遍：
-   *   协议端除了 OneBot 的几个监听，还有 WebUIConfig、日志流、进程重启、
-   *   插件、文件管理……这些是低频运维面，在面板里重画一遍既慢又容易跟版本脱节。
-   *   服务端把 /webui 反代过来并注入凭据，这里只要挂个 iframe 就够。
+  /* 这里原本内嵌 NapCat 原生 WebUI。
    *
-   * 注意：真正的 Authorization 由服务端注入，localStorage 里的 "token"
-   * 只是一个占位串，仅用来让 WebUI 认为「已登录」，不会发到协议端生效。 */
+   * 现在只留"让机器人保持在线"的几项：账号在线状态、上不去时去扫码、
+   * 换号能退出、3001 反向 WS 有没有开、连不上时能看到最近一次错误。
+   * 插件、HTTP 客户端、上报格式、文件管理这些运维面一律不进来——
+   * 把整套原生界面挂在 5666 上，等于把协议端的全部权限都挂在面板会话后面，
+   * 而日常保活一件都用不到。真要改底层配置，用「网络」页，或者直接改
+   * data/napcat 下的文件后重启容器。
+   */
   function viewNapcat(el) {
-    try {
-      if (!localStorage.getItem('token')) {
-        localStorage.setItem('token', JSON.stringify('panel-proxy'));
-      }
-    } catch (_) {
-      /* 隐私模式写不进 localStorage 也不影响：凭据在后端加上 */
-    }
-
     el.innerHTML = `
       <div class="page-head">
         <div>
           <h2>协议端</h2>
-          <div class="desc">NapCat 原生界面：高级网络配置（HTTP / WS 客户端等）、日志、进程与插件</div>
+          <div class="desc">只看保持在线所需的状态；NapCat 原生管理界面已不再内嵌</div>
         </div>
-        <button class="btn ghost" data-act="nc-reload">刷新</button>
+        <button class="btn ghost" data-act="nc-check">重新检测</button>
       </div>
 
-      <div class="card" style="padding:0;overflow:hidden">
-        <iframe id="nc-frame" src="/webui/" title="NapCat WebUI"
-                style="display:block;width:100%;height:calc(100vh - 200px);min-height:560px;border:0;background:#fff"></iframe>
+      <div class="grid c2" style="margin-bottom:16px">
+        <div class="card">
+          <h3>QQ 账号</h3>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span class="dot" id="nc-dot"></span>
+            <span id="nc-state" style="font-size:13px">检测中…</span>
+            <span class="mono" id="nc-uin" style="color:var(--fg-dim);font-size:12px"></span>
+          </div>
+          <div id="nc-hint" style="margin-top:10px;font-size:11.5px;color:var(--fg-mute);line-height:1.8"></div>
+        </div>
+
+        <div class="card">
+          <h3>连接</h3>
+          <div id="nc-links" style="display:flex;flex-direction:column;gap:10px;font-size:12.5px">
+            <div class="empty">检测中…</div>
+          </div>
+        </div>
       </div>
 
-      <div style="margin-top:12px;font-size:11.5px;color:var(--fg-mute);line-height:1.9">
-        这里的改动直接写进协议端配置，保存后 OneBot 服务会重启，面板上的「协议端」会短暂显示未连接。<br>
-        只改 OneBot 的监听端口，用左侧「网络」页更快；改 HTTP 客户端、token、上报格式这些再用这一页。
+      <div class="card">
+        <h3>操作</h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" data-act="nc-login">去扫码登录</button>
+          <button class="btn ghost" data-act="nc-logout" id="nc-logout" style="display:none">退出登录</button>
+          <button class="btn ghost" data-act="nc-net">网络配置（改反向 WS）</button>
+        </div>
+        <div style="margin-top:12px;font-size:11.5px;color:var(--fg-mute);line-height:1.9">
+          退出登录会让机器人立刻离线，之后必须重新扫码。<br>
+          反向 WS 没开、或者要改上报格式与 token，都在「网络」页——它只动 OneBot 那一段配置。
+        </div>
       </div>`;
 
+    let alive = true;
+    let qq = null;
+
+    const setDot = (sel, kind) => {
+      const n = $(sel);
+      if (n) n.className = 'dot ' + kind;
+    };
+
+    /** 3001 反向 WS 是否开着。必须 QQ 已登录才读得到协议端配置。 */
+    async function detectWs(q) {
+      if (!q.configured) return { text: '—', ok: null };
+      if (!q.login) return { text: '登录后可检测', ok: null };
+      try {
+        const d = await api('/api/qq/network');
+        const list = d.config && Array.isArray(d.config.websocketServers) ? d.config.websocketServers : [];
+        const hit = list.find(
+          (s) => s && Number(s.port) === 3001 && s.enable !== false && s.enabled !== false,
+        );
+        return hit ? { text: '已开启 3001', ok: true } : { text: '未开启', ok: false };
+      } catch (_) {
+        return { text: '读取失败', ok: false };
+      }
+    }
+
+    function renderQQ(q) {
+      if (!q) {
+        setDot('#nc-dot', 'bad');
+        $('#nc-state').textContent = '无法查询';
+        $('#nc-hint').textContent = '面板接口没有返回状态，稍后点「重新检测」。';
+        return;
+      }
+      $('#nc-logout').style.display = q.login ? '' : 'none';
+      $('#nc-uin').textContent = q.uin ? `${q.nick || ''} (${q.uin})` : '';
+
+      if (!q.configured) {
+        setDot('#nc-dot', 'bad');
+        $('#nc-state').textContent = '未配置协议端';
+        $('#nc-hint').innerHTML =
+          '服务端没有 QQBOT_WEBUI_TOKEN，或 <code>napcat.webui</code> 地址不对。' +
+          '这类问题只能改 <code>etc/env</code> 后重启容器，面板里修不了。';
+        return;
+      }
+      if (q.login && !q.offline) {
+        setDot('#nc-dot', 'ok');
+        $('#nc-state').textContent = '在线';
+        $('#nc-hint').textContent = '账号在线，机器人可以正常收发消息。';
+        return;
+      }
+      if (q.offline) {
+        setDot('#nc-dot', 'warn');
+        $('#nc-state').textContent = '已登录但离线';
+        $('#nc-hint').textContent = 'QQ 侧掉线了，去「登录」页重新扫码。';
+        return;
+      }
+      setDot('#nc-dot', 'bad');
+      $('#nc-state').textContent = q.error ? '登录失败' : '未登录';
+      $('#nc-hint').textContent = q.error
+        ? `协议端返回：${q.error}。按上面提示处理后重新扫码。`
+        : '去「登录」页扫码，登录成功后会自动开反向 WS。';
+    }
+
+    function renderLinks(ov, ws) {
+      const box = $('#nc-links');
+      if (!box) return;
+      const row = (k, text, ok) =>
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">' +
+        `<span style="color:var(--fg-dim)">${k}</span>` +
+        '<span style="display:flex;align-items:center;gap:6px">' +
+        (ok === null || ok === undefined ? '' : `<span class="dot ${ok ? 'ok' : 'bad'}"></span>`) +
+        `<span>${esc(text)}</span></span></div>`;
+
+      const parts = [];
+      if (ov) {
+        parts.push(row('OneBot 客户端', ov.connected ? '已连接' : '未连接', ov.connected));
+        parts.push(row('机器人 QQ', ov.online ? '在线' : '离线', ov.online));
+        parts.push(row('重连次数', String(ov.reconnects ?? 0), null));
+        if (ov.last_error) parts.push(row('最近错误', ov.last_error, false));
+      } else {
+        parts.push(row('OneBot 客户端', '无法查询', false));
+      }
+      parts.push(row('反向 WS :3001', ws.text, ws.ok));
+      box.innerHTML = parts.join('');
+    }
+
+    async function refresh(showToast) {
+      const [a, b] = await Promise.allSettled([api('/api/qq/status'), api('/api/overview')]);
+      if (!alive) return;
+      qq = a.status === 'fulfilled' ? a.value : null;
+      const ov = b.status === 'fulfilled' ? b.value : null;
+      const ws = await detectWs(qq || { configured: false, login: false });
+      if (!alive) return;
+      renderQQ(qq);
+      renderLinks(ov, ws);
+      if (showToast) ok('已刷新');
+    }
+
     bindActions(el, {
-      'nc-reload': () => {
-        const f = $('#nc-frame');
-        if (f) f.src = '/webui/';
+      'nc-check': () => refresh(true),
+      'nc-login': () => {
+        location.hash = '#/qq';
       },
+      'nc-net': () => {
+        location.hash = '#/network';
+      },
+      'nc-logout': async (btn) => {
+        if (!confirm('退出后机器人会离线，需要重新扫码才能恢复。确定退出？')) return;
+        btn.disabled = true;
+        try {
+          await api('/api/qq/logout', { method: 'POST' });
+          ok('已退出登录');
+          await refresh();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+    });
+
+    refresh();
+    // 慢轮询：这一页只是"看一眼还活着吗"，10 秒足够，也不必像登录页那样频繁
+    const timer = setInterval(() => refresh(), 10_000);
+    stops.push(() => clearInterval(timer));
+    stops.push(() => {
+      alive = false;
     });
   }
 
@@ -1371,7 +1507,7 @@
           <button class="btn ghost" data-act="nw-fix">修正反向 WS（:3001）</button>
         </div>
         <div style="margin-top:14px;font-size:11.5px;color:var(--fg-mute);line-height:1.9">
-          保存后协议端会重启 OneBot 服务，本页「协议端」会短暂显示未连接，几秒后自动恢复。<br>
+          保存后协议端会重启 OneBot 服务，「总览」与「协议端」会短暂显示未连接，几秒后自动恢复。<br>
           机器人默认连 <code>ws://napcat:3001</code>，所以至少要有一条<strong>启用</strong>的
           <code>websocketServers</code> 监听 3001。<br>
           不确定改什么就点「修正反向 WS」——它只补这一条，不动其它配置。

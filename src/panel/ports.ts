@@ -72,8 +72,6 @@ export interface EnginePort {
 export interface QQLoginPort {
   /** 是否配置了 WebUI 地址与 token。 */
   readonly configured: boolean;
-  /** 取一个可用的 WebUI 凭据（/webui 反代注入用）。未配置时返回空串。 */
-  bearer(): Promise<string>;
   status(): Promise<QQLoginStatus>;
   qrcode(): Promise<{ image: string; content: string }>;
   loginInfo(): Promise<QQInfo>;
@@ -90,7 +88,6 @@ export function nullQQLogin(): QQLoginPort {
   const fail = (): Promise<never> => Promise.reject(new Error('未配置协议端 WebUI'));
   return {
     configured: false,
-    bearer: () => Promise.resolve(''),
     status: () =>
       Promise.resolve({ login: false, offline: false, uin: '', nick: '', phase: '', error: '' }),
     qrcode: fail,

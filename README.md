@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main/install
 - **单端口对外**：只有面板 `5666` 暴露。NapCat 的 6099（WebUI）和 3001（OneBot WS）只在 compose 内网，公网扫不到。
 - **扫码即登录**：面板「登录」页内嵌 NapCat 登录流程，扫码/快捷登录都由服务端代理，WebUI token 不下发浏览器。
 - **登录后自动接线**：检测到 QQ 登录成功，自动在协议端补一条启用的 3001 反向 WS，不需要手工点按钮。
-- **完整协议端控制台**：面板「协议端」页反代 NapCat 原生 WebUI，高级网络配置、插件、日志、进程都在里面。
+- **不内嵌协议端管理界面**：NapCat 原生 WebUI 不通过面板暴露；「协议端」页只保留保活所需的状态与操作（在线状态、扫码入口、退出登录、3001 反向 WS）。
 - **原生手写前端**：`web/dist/app.js` 单文件、无构建步骤，改一行刷新就生效。
 - **外观三态**：浅色 / 暗色 / 跟随系统，侧栏底部与登录页可切换，记在浏览器本地，默认暗色。
 - **零编译部署**：CI 在 GitHub Actions 上构建 `linux/amd64` + `linux/arm64` 镜像推到 GHCR，服务器只 pull。
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main/install
 ```
 浏览器 ──:5666──▶  qqbot-core  ──ws://napcat:3001──▶  qqbot-napcat ──▶  QQ
                      │  (OneBot v11 正向 WS)
-                     └──/webui 反代──http://napcat:6099──▶ NapCat WebUI
+                     └──/api/qq/*（扫码、状态、网络配置）──http://napcat:6099──▶ NapCat WebUI API
 ```
 
 | 容器 | 镜像 | 对外 | 职责 |
@@ -186,7 +186,7 @@ qqbot status
 | 总览 | 连接状态、版本、今日用量、最近日志 |
 | 登录 | 扫码 / 快捷登录、退出登录、3001 反向 WS 体检与修正 |
 | 网络 | OneBot 网络配置（HTTP 服务/客户端、WS 服务/客户端、上报格式） |
-| 协议端 | 反代 NapCat 原生 WebUI：高级网络配置、插件、日志、进程 |
+| 协议端 | 保活面板：QQ 在线状态、OneBot 连接、3001 反向 WS、退出登录。**不再内嵌 NapCat 原生界面** |
 | 设置 | 模型接入、触发规则（唤醒词默认空、被动概率、白名单、冷却）、上下文窗口 |
 | 人格 | 系统提示词与人设，多套可切换 |
 | 会话 | 上下文、清空会话 |
@@ -194,7 +194,7 @@ qqbot status
 | 账号 | 改面板用户名与密码、TOTP 两步验证 |
 | 外观 | 浅色 / 暗色 / 跟随系统，切换器在侧栏底部和登录页 |
 
-面板自身的 `/api/*` 优先匹配，没注册的才转给协议端 —— `/api/auth/login` 两边同名，这条边界不能改成前缀判断。
+面板不转发任何请求给 NapCat 的 WebUI：扫码与网络配置都走面板自己的 `/api/qq/*`，由服务端持 token 调 NapCat API。
 
 ---
 
@@ -295,10 +295,9 @@ npm run build        # esbuild 打包到 dist/（server.js + argon-worker.js）
 | `qqbot-core` 反复重启，日志 `unable to open database file` | `data/` 属主不是 1000 | `chown -R 1000:1000 /opt/qqbot/data` |
 | 面板「登录」「网络」显示未配置 | `etc/env` 里 `WEBUI_TOKEN` 没被读到 | 代码会把短名归一成 `QQBOT_` 前缀；确认 `etc/env` 有 `WEBUI_TOKEN=` 且容器已重启 |
 | 扫码成功但机器人显示未连接 | 3001 反向 WS 没启用 | 等 20s（服务端心跳会自动补），仍不行去「登录」页点「修正反向 WS」 |
-| `/webui` 401 | 正常：反代要求面板会话 | 先登录面板 |
 | 拉镜像 `denied` | 镜像名写错，或包是私有的 | 核对 `ghcr.io/<owner>/qqbot-dev2`；私有包带 `GHCR_TOKEN` |
 | 容器重启后浏览器要重新登录 | 会话存在内存里，不在磁盘 | 预期行为，不是 cookie 问题 |
-| 改 `/webui` 里的 WS 配置后短暂断连 | 协议端重载网络配置 | 预期，几秒后自愈 |
+| 改「网络」页保存后短暂断连 | 协议端重载 OneBot 服务 | 预期，几秒后自愈 |
 | NapCat 随机崩、容器 OOM | `/dev/shm` 太小或内存不足 | compose 已给 256MB shm；低于 2GB 内存请加 swap |
 
 ---
@@ -309,7 +308,7 @@ npm run build        # esbuild 打包到 dist/（server.js + argon-worker.js）
 - WebUI token 只存在于服务端进程内，浏览器拿到的是占位串。
 - 面板密码用 argon2id 哈希（放 worker 里算，1 核机器不阻塞主线程），登录失败按 IP 退避并写审计；支持 TOTP。
 - `etc/env` 权限 `0600`，只随 `qqbot backup` 备份；`etc/qqbot.toml` 不含任何密钥。
-- `/webui` 的 CSP 单独放宽（NapCat 前端产物需要），面板自身仍用严格 CSP。
+- NapCat 原生 WebUI 不经面板暴露（6099 只在 compose 内网），因此 CSP 无需为它放宽，面板全程严格 CSP。
 
 ---
 
