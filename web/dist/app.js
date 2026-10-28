@@ -1234,13 +1234,67 @@
 
   function viewSessions(el) {
     el.innerHTML = `<div class="page-head">
-        <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录；每个人格可以单独指定</div></div>
+        <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录；每个对话对象可以单独指定人格</div></div>
+        <button class="btn ghost" data-act="toggle-preset">添加对话对象</button>
+      </div>
+      <div class="card" id="ss-preset" style="display:none">
+        <h3>给还没说过话的群 / 好友预设人格</h3>
+        <div class="preset-form">
+          <div class="cell">
+            <span>筛选</span>
+            <input id="ss-search" placeholder="搜群名、昵称或号码" autocomplete="off">
+          </div>
+          <div class="cell">
+            <span>对话对象</span>
+            <select id="ss-target"></select>
+          </div>
+          <div class="cell">
+            <span>人格</span>
+            <select id="ss-persona"></select>
+          </div>
+          <button class="btn" data-act="save-preset">指定</button>
+        </div>
+        <p class="note" id="ss-preset-note">列表里只有还没产生过消息的对象；已经在下面会话表里的，直接改那一行的人格即可。</p>
+        <div class="preset-form">
+          <div class="cell">
+            <span>手动填写会话 ID（列表里找不到时用）</span>
+            <input id="ss-manual" placeholder="group:群号 或 private:QQ号" autocomplete="off">
+          </div>
+        </div>
       </div>
       <div class="card"><div id="ss-list"><div class="empty">加载中…</div></div></div>
       <div class="card" id="ss-detail" style="display:none">
         <h3 id="ss-detail-title">对话记录</h3>
         <div class="chat" id="ss-chat"></div>
       </div>`;
+
+    // 这三份状态要在 load 与预设表单之间共享：候选人要知道哪些已经有会话了，
+    // 表格要知道人格清单。放在闭包里而不是每次重新取，是因为打开预设面板
+    // 会连着调 /api/groups，协议端拉一次群列表可能要几百毫秒。
+    let personas = [];
+    let fallback = { id: 0, name: '' };
+    let knownIds = new Set();
+    let candidates = [];
+
+    const rowOf = (s) => {
+      const preset = s.preset === true;
+      // 预设行只有绑定表里的名字快照；没有名字（老数据、手填）就退回显示 ID
+      const who = s.name
+        ? `<div class="sess-name">${esc(s.name)}</div><div class="sess-id">${esc(s.id)}</div>`
+        : `<span class="mono">${esc(s.id)}</span>`;
+      const acts = preset
+        ? `<button class="btn ghost sm" data-act="unbind" data-id="${esc(s.id)}">取消预设</button>`
+        : `<button class="btn ghost sm" data-act="peek" data-id="${esc(s.id)}">查看</button>
+           <button class="btn danger sm" data-act="clear" data-id="${esc(s.id)}">清空</button>`;
+      return `<tr>
+        <td>${who}</td>
+        <td>${s.kind === 'group' ? '<span class="tag">群聊</span>' : '<span class="tag">私聊</span>'}</td>
+        <td>${personaPick(s, personas, fallback)}</td>
+        <td class="dim">${preset ? '—' : fmtInt(s.messages)}</td>
+        <td class="dim nowrap">${preset ? '<span class="tag on">尚未对话</span>' : esc(fmtTime(s.updated_at))}</td>
+        <td class="nowrap">${acts}</td>
+      </tr>`;
+    };
 
     const load = async () => {
       // 人格清单和会话一起取：下拉里只有人名不够，没有选项时用户就不知道该建人格
@@ -1250,31 +1304,90 @@
       ]);
       if (!$('#ss-list')) return; // 用户已经切走
       const items = d.items || [];
+      personas = dp.items || [];
+      fallback = d.default_persona || { id: 0, name: '' };
+      knownIds = new Set(items.map((s) => s.id));
+      fillPersonas();
       if (!items.length) {
-        $('#ss-list').innerHTML = '<div class="empty">还没有任何会话</div>';
+        $('#ss-list').innerHTML =
+          '<div class="empty">还没有任何会话。点右上角「添加对话对象」，可以给还没说过话的群或好友预设人格。</div>';
         return;
       }
-      const personas = dp.items || [];
-      const fallback = d.default_persona || { id: 0, name: '' };
       $('#ss-list').innerHTML = `
         <table>
           <thead><tr><th>会话</th><th>类型</th><th>人格</th><th>消息数</th><th>最后活跃</th><th style="width:150px"></th></tr></thead>
-          <tbody>
-            ${items.map((s) => `
-              <tr>
-                <td class="mono">${esc(s.id)}</td>
-                <td>${s.kind === 'group' ? '<span class="tag">群聊</span>' : '<span class="tag">私聊</span>'}</td>
-                <td>${personaPick(s, personas, fallback)}</td>
-                <td class="dim">${fmtInt(s.messages)}</td>
-                <td class="dim nowrap">${esc(fmtTime(s.updated_at))}</td>
-                <td class="nowrap">
-                  <button class="btn ghost sm" data-act="peek" data-id="${esc(s.id)}">查看</button>
-                  <button class="btn danger sm" data-act="clear" data-id="${esc(s.id)}">清空</button>
-                </td>
-              </tr>`).join('')}
-          </tbody>
+          <tbody>${items.map(rowOf).join('')}</tbody>
         </table>`;
     };
+
+    // 已加入的群 / 已加的好友，减去已经有会话的，剩下的就是可以预设的对象。
+    // 差集在前端做：后端只回原始列表，不必为"还没说话"再造一份数据。
+    const renderTargets = () => {
+      const sel = $('#ss-target');
+      const search = $('#ss-search');
+      // 拉列表是异步的，回来时用户可能已经切页了；这里和 load() 一样要能空跑
+      if (!sel || !search) return;
+      const q = (search.value || '').trim().toLowerCase();
+      const avail = candidates.filter(
+        (c) =>
+          !knownIds.has(c.id) &&
+          (q === '' || c.name.toLowerCase().includes(q) || c.id.includes(q)),
+      );
+      if (!avail.length) {
+        sel.innerHTML = `<option value="">${
+          candidates.length ? '都已有会话了，可直接改下面表里的人格' : '没有可用对象'
+        }</option>`;
+        return;
+      }
+      const keep = sel.value;
+      sel.innerHTML = avail
+        .map(
+          (c) =>
+            `<option value="${esc(c.id)}">${c.kind === 'group' ? '群' : '好友'} · ${esc(c.name)}${
+              c.hint ? `（${esc(c.hint)}）` : ''
+            }</option>`,
+        )
+        .join('');
+      // 刷新后尽量停在原来那一项：用户搜完还没来得及点，重排不该把他选的东西换掉
+      if (avail.some((c) => c.id === keep)) sel.value = keep;
+    };
+
+    const loadCandidates = async () => {
+      const [gs, fs] = await Promise.all([
+        api('/api/groups').catch((e) => ({ items: [], err: e.message })),
+        api('/api/friends').catch((e) => ({ items: [], err: e.message })),
+      ]);
+      candidates = [
+        ...(gs.items || []).map((g) => ({
+          id: 'group:' + g.group_id,
+          kind: 'group',
+          name: g.group_name || String(g.group_id),
+          hint: g.member_count ? `${g.member_count} 人` : '',
+        })),
+        ...(fs.items || []).map((f) => ({
+          id: 'private:' + f.user_id,
+          kind: 'private',
+          name: f.remark || f.nickname || String(f.user_id),
+          hint: f.remark && f.nickname ? f.nickname : '',
+        })),
+      ];
+      const err = gs.err || fs.err;
+      if (err) {
+        // 协议端掉线时这两个接口是 502，不是前端 bug，把话说清楚
+        $('#ss-preset-note').textContent = `拉取群 / 好友列表失败（${err}）——可以手动填写会话 ID。`;
+      }
+      renderTargets();
+    };
+
+    // 人格下拉要等 load 拿到清单才能填；单独抽出来是因为预设面板
+    // 通常在 load 之后才被点开
+    const fillPersonas = () => {
+      $('#ss-persona').innerHTML = personas.length
+        ? personas.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
+        : '<option value="">没有可选人格</option>';
+    };
+    $('#ss-search').addEventListener('input', renderTargets);
+
 
     // 下拉是 change 而不是 click，bindActions 只管点击，这里单独委托一次。
     // 挂在 el 上：路由切页会换掉整个 main，监听器跟着走，不会累积。
@@ -1295,6 +1408,70 @@
     });
 
     bindActions(el, {
+      'toggle-preset': async () => {
+        const box = $('#ss-preset');
+        if (box.style.display !== 'none') {
+          box.style.display = 'none';
+          return;
+        }
+        box.style.display = '';
+        if (candidates.length > 0) {
+          // 之前拉过，但候选的"已有会话"状态可能已经变了（刚绑完就重开面板）
+          renderTargets();
+          return;
+        }
+        $('#ss-target').innerHTML = '<option value="">加载中…</option>';
+        try {
+          await loadCandidates();
+        } catch (e) {
+          $('#ss-target').innerHTML = '<option value="">加载失败</option>';
+          $('#ss-preset-note').textContent = `拉取失败（${e.message}）——可以手动填写会话 ID。`;
+        }
+      },
+      'save-preset': async () => {
+        // 手填优先：列表里没有的对象（临时会话、非好友私聊）只能这么加
+        const manual = $('#ss-manual').value.trim();
+        const id = manual !== '' ? manual : $('#ss-target').value;
+        if (id === '') {
+          bad('先选一个对话对象，或手动填写会话 ID');
+          return;
+        }
+        // 前端挡一道，省一次请求；真正把关的是接口（主键写错会永远匹配不上）
+        if (!/^(group|private):\d+$/.test(id)) {
+          bad('会话 ID 格式应为 group:群号 或 private:QQ号');
+          return;
+        }
+        const pid = Number($('#ss-persona').value);
+        if (!Number.isInteger(pid) || pid <= 0) {
+          bad('先选一个人格');
+          return;
+        }
+        const hit = candidates.find((c) => c.id === id);
+        try {
+          await api('/api/sessions/persona', {
+            method: 'POST',
+            body: { id, persona_id: pid, name: hit ? hit.name : '' },
+          });
+          ok(hit ? `已为「${hit.name}」指定人格` : '已指定人格');
+          $('#ss-manual').value = '';
+          await load();
+          renderTargets();
+        } catch (e) {
+          bad(e.message);
+        }
+      },
+      unbind: async (btn) => {
+        const id = btn.dataset.id;
+        if (!confirm(`取消 ${id} 的人格预设？它会回到跟随默认人格。`)) return;
+        try {
+          await api('/api/sessions/persona', { method: 'POST', body: { id, persona_id: 0 } });
+          ok('已取消预设');
+          await load();
+          renderTargets();
+        } catch (e) {
+          bad(e.message);
+        }
+      },
       peek: async (btn) => {
         const id = btn.dataset.id;
         $('#ss-detail').style.display = '';

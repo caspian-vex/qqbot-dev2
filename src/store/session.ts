@@ -20,6 +20,7 @@ interface SessionRow {
   cnt: number;
   persona_id: number;
   persona_name: string;
+  target_name: string;
 }
 
 export class SessionRepo {
@@ -101,7 +102,8 @@ export class SessionRepo {
         `SELECT s.id, s.kind, s.target_id, s.updated_at,
                 (SELECT COUNT(1) FROM messages m WHERE m.session_id = s.id) AS cnt,
                 COALESCE(b.persona_id, 0)  AS persona_id,
-                COALESCE(p.name, '')       AS persona_name
+                COALESCE(p.name, '')       AS persona_name,
+                COALESCE(b.target_name, '') AS target_name
            FROM sessions s
            LEFT JOIN session_personas b ON b.session_id = s.id
            LEFT JOIN personas p         ON p.id = b.persona_id
@@ -116,6 +118,9 @@ export class SessionRepo {
         updated_at: new Date(Number(r.updated_at) * 1000),
         persona_id: Number(r.persona_id),
         persona_name: r.persona_name,
+        // 预设时存下的群名/昵称。会话真来过消息后，如果这里为空，
+        // 面板就退回显示号码——预设行不能因为"开口说话"就丢掉名字。
+        name: r.target_name === '' ? undefined : r.target_name,
       }));
   }
 

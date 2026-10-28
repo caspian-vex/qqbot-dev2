@@ -11,7 +11,7 @@ import { formatGoDuration, rfc3339, ZERO_TIME, localDay } from '../src/util/time
 import { Box, generateKey, generateToken, safeEqual } from '../src/secret/box';
 import { Store } from '../src/store/index';
 import { loadSecrets } from '../src/config';
-import { defaultSettings } from '../src/store/types';
+import { defaultSettings, parseSessionId } from '../src/store/types';
 
 function tempDb(): { store: Store; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-test-'));
@@ -87,13 +87,13 @@ test('generateToken/safeEqual', () => {
   assert.equal(safeEqual(t, t.slice(1)), false);
 });
 
-test('迁移幂等，且 user_version 为 3（v3 = 会话人格绑定）', () => {
+test('迁移幂等，且 user_version 为 4（v4 = 绑定补对话对象快照）', () => {
   const { store, dir } = tempDb();
-  assert.equal(store.db.userVersion(), 3);
+  assert.equal(store.db.userVersion(), 4);
   store.close();
   // 再打开一次：不应重复执行迁移，也不应报错
   const again = new Store(join(dir, 'qqbot.db'));
-  assert.equal(again.db.userVersion(), 3);
+  assert.equal(again.db.userVersion(), 4);
   again.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -260,5 +260,65 @@ test('密钥文件里的短名要归一到 QQBOT_ 前缀', () => {
   // 短名本身也保留，排障时有人会直接 grep 它
   assert.equal(s['WEBUI_TOKEN'], 'bbb');
 
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('会话 ID 解析：只认 group/private + 纯数字', () => {
+  assert.deepEqual(parseSessionId('group:1101472600'), { kind: 'group', targetId: 1101472600 });
+  assert.deepEqual(parseSessionId('private:2083882365'), { kind: 'private', targetId: 2083882365 });
+
+  // 这些都会变成数据库主键，一律不能放过——放过去就是一条永远匹配不上的绑定，
+  // 而用户在面板上看到的反馈是"成功"
+  assert.equal(parseSessionId(''), null);
+  assert.equal(parseSessionId('group'), null);
+  assert.equal(parseSessionId(':123'), null);
+  assert.equal(parseSessionId('group:'), null);
+  assert.equal(parseSessionId('group:abc'), null);
+  assert.equal(parseSessionId('group:12abc'), null);
+  assert.equal(parseSessionId('group:-5'), null);
+  assert.equal(parseSessionId('group:0'), null);
+  assert.equal(parseSessionId('group: 12 '), null);
+  assert.equal(parseSessionId('friend:12'), null);
+  // 大小写不对也不认：引擎拼出来的一定是小写
+  assert.equal(parseSessionId('Group:12'), null);
+  // 超出安全整数范围会被 Number 悄悄截断，宁可拒绝
+  assert.equal(parseSessionId('group:99999999999999999999'), null);
+});
+
+test('预设人格：没产生过消息的对话对象也能绑，并留下名字快照', () => {
+  const { store, dir } = tempDb();
+  const coder = store.personas.upsert('coder', 'you write code');
+  const tsun = store.personas.upsert('tsundere', '你嘴上嫌弃');
+
+  // group:7 从来没来过消息，sessions 里没有这一行
+  assert.equal(store.sessions.list().length, 0);
+  store.personas.bind('group:7', tsun.id, { kind: 'group', name: '家庭群' });
+
+  // 引擎那条路径（forSession）立刻就能取到，不必等它说话
+  assert.equal(store.personas.forSession('group:7').name, 'tsundere');
+
+  const bindings = store.personas.bindings();
+  assert.equal(bindings.length, 1);
+  assert.equal(bindings[0]!.session_id, 'group:7');
+  assert.equal(bindings[0]!.kind, 'group');
+  assert.equal(bindings[0]!.target_name, '家庭群');
+  assert.equal(bindings[0]!.persona_name, 'tsundere');
+
+  // 只改人格、不带快照时，名字要保留（否则列表里那行会退化成一串号码）
+  store.personas.bind('group:7', coder.id);
+  const again = store.personas.bindings()[0]!;
+  assert.equal(again.persona_name, 'coder');
+  assert.equal(again.target_name, '家庭群');
+  assert.equal(again.kind, 'group');
+
+  // 带了新名字就覆盖
+  store.personas.bind('group:7', coder.id, { kind: 'group', name: '家庭群（改名了）' });
+  assert.equal(store.personas.bindings()[0]!.target_name, '家庭群（改名了）');
+
+  // 解绑后 bindings 里不再有它（预设行随之从面板消失）
+  store.personas.bind('group:7', 0);
+  assert.equal(store.personas.bindings().length, 0);
+
+  store.close();
   rmSync(dir, { recursive: true, force: true });
 });

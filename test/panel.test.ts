@@ -743,6 +743,87 @@ describe('会话与用量接口', () => {
     }
   });
 
+  it('预设人格：还没说过话的群也能绑，列表里带名字显示', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const coder = h.store.personas.upsert('coder', 'you write code');
+      const bind = (payload: unknown): Promise<Response> =>
+        fetch(`${h.base}/api/sessions/persona`, {
+          method: 'POST',
+          headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+          body: JSON.stringify(payload),
+        });
+      const list = async () =>
+        (await (
+          await fetch(`${h.base}/api/sessions`, { headers: { Cookie: c.header } })
+        ).json()) as {
+          items: {
+            id: string;
+            kind: string;
+            target_id: number;
+            messages: number;
+            persona_id: number;
+            persona_name: string;
+            name?: string;
+            preset?: boolean;
+          }[];
+        };
+
+      // 一条消息都没有：sessions 是空的
+      assert.equal((await list()).items.length, 0);
+
+      assert.equal(
+        (await bind({ id: 'group:987654321', persona_id: coder.id, name: '夜猫子群' })).status,
+        200,
+      );
+
+      // 补出来的预设行：有名字、有 kind、有目标号，能直接喂给表格渲染
+      const row = (await list()).items.find((s) => s.id === 'group:987654321');
+      assert.equal(row?.preset, true);
+      assert.equal(row?.name, '夜猫子群');
+      assert.equal(row?.kind, 'group');
+      assert.equal(row?.target_id, 987654321);
+      assert.equal(row?.messages, 0);
+      assert.equal(row?.persona_name, 'coder');
+
+      // 真的来过消息之后，它变成普通会话行，绑定继续生效，且不会出现两行
+      h.store.sessions.touch('group:987654321', 'group', 987654321);
+      const items = (await list()).items.filter((s) => s.id === 'group:987654321');
+      assert.equal(items.length, 1);
+      assert.equal(items[0]!.preset, undefined);
+      assert.equal(items[0]!.persona_id, coder.id);
+      // 名字快照要跟着走：说过话之后那一行不能突然从「夜猫子群」变回号码
+      assert.equal(items[0]!.name, '夜猫子群');
+
+      // kind 只从 id 前缀推导，入参里塞一个矛盾的 kind 也不会被采信
+      assert.equal(
+        (await bind({ id: 'group:5', persona_id: coder.id, kind: 'private' })).status,
+        200,
+      );
+      assert.equal((await list()).items.find((s) => s.id === 'group:5')?.kind, 'group');
+
+      // name 不是字符串时按"没有名字"处理，而不是存成 "123"
+      assert.equal((await bind({ id: 'private:5', persona_id: coder.id, name: 123 })).status, 200);
+      assert.equal((await list()).items.find((s) => s.id === 'private:5')?.name, '');
+
+      // ID 格式错了要当场拒绝：绑进去就是一条永远匹配不上的行
+      for (const id of ['家庭群', 'group:abc', 'friend:12', 'group:', 'group:0']) {
+        const r = await bind({ id, persona_id: coder.id });
+        assert.equal(r.status, 400, `应拒绝 ${id}`);
+        assert.deepEqual(await r.json(), { error: '会话 ID 格式应为 group:群号 或 private:QQ号' });
+      }
+
+      // 解绑后预设行从列表里消失
+      assert.equal((await bind({ id: 'group:987654321', persona_id: 0 })).status, 200);
+      const after = (await list()).items.find((s) => s.id === 'group:987654321');
+      // 此时它已经有会话行了（上面 touch 过），所以只是人格回到跟随默认
+      assert.equal(after?.persona_id, 0);
+    } finally {
+      await h.stop();
+    }
+  });
+
   it('用量接口默认 7 天且 today 恒为对象', async () => {
     const h = await harness();
     try {

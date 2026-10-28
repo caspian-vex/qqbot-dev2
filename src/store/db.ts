@@ -95,6 +95,20 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX ix_session_personas_pid ON session_personas(persona_id);
   `,
+  // v4：给绑定补「对话对象快照」。
+  //
+  // 预设人格时那个群/好友可能一条消息都没有，sessions 里没有对应的行，
+  // 面板就只能显示 group:1101472600 这样一串号码——三十个群号谁也认不出。
+  // 所以绑定时把群名/昵称一并存下来。
+  // 附带的好处：协议端掉线时 /api/groups 会 502，有快照的话已预设的
+  // 列表照样能列出来、能改、能解绑，不会因为拉不到列表就变成一片空白。
+  //
+  // 允许默认空串而不是回填：老库里的绑定本来就没存名字，回填不了；
+  // 面板对空名字退化成显示 ID，行为跟升级前一致。
+  `
+  ALTER TABLE session_personas ADD COLUMN kind TEXT NOT NULL DEFAULT '';
+  ALTER TABLE session_personas ADD COLUMN target_name TEXT NOT NULL DEFAULT '';
+  `,
 ];
 
 export class Db {

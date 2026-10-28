@@ -259,6 +259,22 @@ export interface SessionInfo {
   persona_id: number;
   /** 绑定的人格名；未绑定时为空串（前端据此显示"跟随默认"）。 */
   persona_name: string;
+  /**
+   * 群名 / 好友昵称的绑定快照。
+   *
+   * 只有预设行（还没说过话的对象）一定有值；普通会话留空，前端按需
+   * 显示 ID。两条来源不同：普通会话的 kind/target_id 来自 sessions 表，
+   * 预设行只有绑定表里的快照。
+   */
+  name?: string;
+  /**
+   * 尚未产生任何消息、只预置了人格的对话对象。
+   *
+   * sessions 里没有它的行（那张表要收到第一条消息才 touch 出来），
+   * 面板得靠这个标记区分"从没说过话"和"清空过的会话"——后者虽然
+   * 也是 0 条消息，但会话本身是存在的，能查看能清空。
+   */
+  preset?: boolean;
 }
 
 /** 某一天的用量汇总。 */
@@ -283,4 +299,26 @@ export interface AuditEntry {
 /** 拼接会话标识。群与私聊分开，避免同号冲突。 */
 export function sessionId(kind: string, targetId: number): string {
   return `${kind}:${targetId}`;
+}
+
+/**
+ * 反解会话标识，非法返回 null。
+ *
+ * 只在"用户填进来的 ID"上用（面板预设人格、接口入参）。引擎自己拼的 ID
+ * 不必再解一遍，那里从事件直接拿 kind/target 更可靠。
+ *
+ * 严格到这个程度是因为它的输出会直接变成数据库主键：放过一个
+ * `group:abc`，就会留下一条永远匹配不上的行，而用户看到的反馈是"成功"。
+ */
+export function parseSessionId(id: string): { kind: string; targetId: number } | null {
+  const i = id.indexOf(':');
+  if (i <= 0) return null;
+  const kind = id.slice(0, i);
+  if (kind !== 'group' && kind !== 'private') return null;
+  const raw = id.slice(i + 1);
+  // 只收纯数字：Number(' 12 ') 和 Number('12abc') 都能过，但这里不该放过
+  if (!/^\d+$/.test(raw)) return null;
+  const targetId = Number(raw);
+  if (!Number.isSafeInteger(targetId) || targetId <= 0) return null;
+  return { kind, targetId };
 }

@@ -29,7 +29,14 @@ import {
 import type { LogHub } from '../log/hub';
 import type { Logger } from '../log/logger';
 import type { Store } from '../store';
-import { cloneSettings, type Settings } from '../store/types';
+// 注意别名：SessionInfo 在本文件里已经指「面板登录会话」（./session-store），
+// 而 store/types 里同名的是「聊天会话列表项」，两者毫无关系。
+import {
+  cloneSettings,
+  parseSessionId,
+  type SessionInfo as ChatSessionInfo,
+  type Settings,
+} from '../store/types';
 import { formatGoDuration, localDay } from '../util/time';
 import {
   hashPassword,
@@ -691,13 +698,48 @@ export class Api {
   // ---- 会话 ----
 
   listSessions(ctx: ReqCtx): void {
-    let items;
+    let items: ChatSessionInfo[];
     try {
       items = this.store.sessions.list();
     } catch (e) {
       this.d.log.error('读取会话失败', { err: e });
       throw new HttpError(500, '读取会话失败');
     }
+
+    // 补出「已经绑了人格、但还没产生过消息」的对话对象。
+    //
+    // sessions 的行要收到第一条消息才 touch 出来，所以给一个安静的群预设完
+    // 人格，那个群在 sessions 里根本不存在——不补出来的话，用户绑完刷新一下
+    // 那行就消失了，只能以为没保存上再来一遍。
+    //
+    // 失败不影响列会话：这段只是锦上添花，读不到绑定照样能看有消息的会话。
+    try {
+      const known = new Set(items.map((s) => s.id));
+      const presets: ChatSessionInfo[] = [];
+      for (const b of this.store.personas.bindings()) {
+        if (known.has(b.session_id)) continue;
+        const parsed = parseSessionId(b.session_id);
+        // 历史脏数据（手改过库、旧版本写坏）解析不出来就跳过，不要在
+        // 列表里塞一行点不动的怪物
+        if (!parsed) continue;
+        presets.push({
+          id: b.session_id,
+          kind: b.kind !== '' ? b.kind : parsed.kind,
+          target_id: parsed.targetId,
+          messages: 0,
+          updated_at: b.updated_at,
+          persona_id: b.persona_id,
+          persona_name: b.persona_name,
+          name: b.target_name,
+          preset: true,
+        });
+      }
+      // 预设排最前：它们本来就是「待生效」，用户刚绑完应该在顶上看见
+      if (presets.length > 0) items = [...presets, ...items];
+    } catch (e) {
+      this.d.log.warn('读取预设人格失败', { err: e });
+    }
+
     // 一并回全局默认人格：面板要把"跟随默认"显示成「跟随默认（毒舌）」，
     // 否则用户看到一个空选项，不知道自己到底在用哪套提示词。
     let fallback = { id: 0, name: '' };
@@ -715,9 +757,16 @@ export class Api {
    *
    * 绑定的粒度是「对话对象」而不是「聊天窗口」：群 1 和群 2 各绑各的，
    * 私聊 1 和私聊 2 互不影响，这正是需求里举的那四个例子。
+   *
+   * 不要求这个会话产生过消息——id 是 group:群号 / private:QQ号，
+   * 绑定表也不依赖 sessions 存在，所以可以给还没说过话的群/好友预设。
    */
   async bindSessionPersona(ctx: ReqCtx): Promise<void> {
-    const req = (await body(ctx, 1024)) as { id?: unknown; persona_id?: unknown };
+    const req = (await body(ctx, 1024)) as {
+      id?: unknown;
+      persona_id?: unknown;
+      name?: unknown;
+    };
     const id = typeof req.id === 'string' ? req.id.trim() : '';
     if (id === '') throw new HttpError(400, '会话 ID 不能为空');
     // 必须是数字：把 "3" 这种字符串当成 0 处理会静默变成"解绑"，
@@ -726,16 +775,25 @@ export class Api {
     if (typeof pid !== 'number' || !Number.isInteger(pid) || pid < 0) {
       throw new HttpError(400, '人格 ID 不合法');
     }
+    // ID 格式在这里把关：绑的是主键，写错一条就永远匹配不上，而用户看到
+    // 的反馈是"成功"。
+    const parsed = parseSessionId(id);
+    if (!parsed) {
+      throw new HttpError(400, '会话 ID 格式应为 group:群号 或 private:QQ号');
+    }
 
+    // kind 一律用 id 前缀推导，不信任入参：前端要是传来 id=group:1 却
+    // kind=private，存下去就是一条自相矛盾的快照，面板会显示成私聊。
+    const name = typeof req.name === 'string' ? req.name.trim().slice(0, 64) : '';
     try {
-      this.store.personas.bind(id, pid);
+      this.store.personas.bind(id, pid, { kind: parsed.kind, name });
     } catch (e) {
       this.d.log.warn('绑定会话人格失败', { id, pid, err: e });
       throw new HttpError(400, e instanceof Error ? e.message : '绑定失败');
     }
     this.store.audit.record(
       'session.persona',
-      `${id} -> ${pid === 0 ? 'default(global)' : pid}`,
+      `${id}${name === '' ? '' : ` (${name})`} -> ${pid === 0 ? 'default(global)' : pid}`,
       clientIP(ctx.req),
     );
     writeJSON(ctx.res, 200, { ok: true, persona_id: pid });
