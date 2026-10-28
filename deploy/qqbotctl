@@ -347,7 +347,7 @@ qqbot — 运维命令
   logs [-f] [服务]        查看日志（服务：qqbot / napcat）
   up / down               启动 / 停止
   restart                 重启
-  upgrade [--src <目录>]  重建镜像并切过去，失败自动回滚（走源码构建，约 2 分钟）
+  upgrade [--src <目录>]  重建镜像并切过去，失败自动回滚（走源码构建，约 2 分钟；别名 update）
   rollback <版本>         回滚到指定镜像版本
   backup                  备份数据与密钥（先停容器，保证一致性）
   restore <文件>          从备份恢复
@@ -367,6 +367,8 @@ case "${1:-}" in
   down)      shift; dc down ;;
   restart)   shift; dc restart ;;
   upgrade)   shift; cmd_upgrade "$@" ;;
+  # 别名：install.sh 的旧版提示写过 qqbot update，肌肉记忆也常见
+  update)    shift; cmd_upgrade "$@" ;;
   rollback)  shift; cmd_rollback "$@" ;;
   backup)    shift; cmd_backup "$@" ;;
   restore)   shift; cmd_restore "$@" ;;

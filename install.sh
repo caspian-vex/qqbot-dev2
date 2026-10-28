@@ -369,7 +369,7 @@ cat <<EOF
   qqbot logs        跟踪日志
   qqbot restart     重启
   qqbot reset-password  重置面板密码（忘记密码时用）
-  qqbot update      拉新镜像并重启
+  qqbot upgrade     拉新镜像并重启
 
 安装目录: ${QQBOT_DIR}
   配置   ${QQBOT_DIR}/etc/qqbot.toml
