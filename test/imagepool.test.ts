@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { after, describe, it } from 'node:test';
 import {
   UNTAGGED,
@@ -339,9 +340,17 @@ describe('上传辅助', () => {
 // ---- 其它纯函数 ----
 
 describe('图池辅助函数', () => {
-  it('file:// URI 与 pathToFileURL 一致（Windows 盘符不拼错）', () => {
+  it('file:// URI 用 pathToFileURL 拼，反解回来还是原路径', () => {
     const dir = join(tempDir(), 'images');
-    assert.equal(imageUri(dir, '猫.png'), `file:///${dir.replace(/\\/g, '/')}/%E7%8C%AB.png`);
+    const uri = imageUri(dir, '猫.png');
+
+    // 反解回文件路径必须与原路径逐字相等——这一条同时覆盖 Windows 盘符
+    // 与 POSIX 绝对路径，比硬编码 "file:///" + dir 靠谱：后者在 Linux 上
+    // 会拼出四个斜杠（file:////tmp/...），CI 就是这么红的。
+    assert.equal(fileURLToPath(uri), join(dir, '猫.png'));
+    // 中文必须百分号编码，否则 QQ 客户端那边会拿到一个坏路径
+    assert.ok(uri.endsWith('/%E7%8C%AB.png'), uri);
+    assert.ok(!uri.startsWith('file:////'), `不能出现四个斜杠：${uri}`);
   });
 
   it('去重保序', () => {
