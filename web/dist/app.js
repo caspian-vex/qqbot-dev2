@@ -514,7 +514,7 @@
       if (!$('#set-body')) return; // 用户已经切走
       const imgDir = pool.dir || '';
       const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {},
-            vis = s.vision || {};
+            vis = s.vision || {}, sr = s.search || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
@@ -682,6 +682,31 @@
         </div>
 
         <div class="card">
+          <h3>联网搜索 <span class="hint">模型拿不准时自己去查一下</span></h3>
+          <label class="check">
+            <input type="checkbox" id="f-search" ${(sr.enabled ? 'checked' : '')}>
+            <span>允许模型联网搜索
+              <span class="note">开启后把 web_search 作为工具交给模型，由它判断这句话要不要查：
+              新闻、价格、比分、天气、最近发生的事会去查，闲聊不会。查的是 DeepSeek 官方搜索，
+              与上面的模型共用同一把 API Key，不用再配搜索源；按成功请求计费（约 ¥5 / 千次，无结果不计费）。
+              需要模型支持工具调用（function calling），不支持时会自动退回普通对话，不影响回复。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>每次取几条结果</label>
+              <input type="number" id="f-search-results" min="1" max="10" value="${sr.max_results ?? 5}">
+              <div class="note">取多了会把上下文预算挤满，3-5 条通常够用。</div>
+            </div>
+            <div class="field">
+              <label>每条消息最多搜几次</label>
+              <input type="number" id="f-search-calls" min="1" max="3" value="${sr.max_calls ?? 2}">
+              <div class="note">成本硬闸：每多一次就是一次模型请求加一次搜索请求。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>上下文</h3>
           <div class="grid c2">
             <div class="field">
@@ -748,6 +773,13 @@
                 vision: {
                   enabled: $('#f-vision').checked,
                   max_images: Number($('#f-vision-max').value),
+                },
+                search: {
+                  enabled: $('#f-search').checked,
+                  max_results: Number($('#f-search-results').value),
+                  // 超时不放到界面上：8 秒已经比用户耐心长，调它多半是自找麻烦
+                  timeout_sec: sr.timeout_sec ?? 8,
+                  max_calls: Number($('#f-search-calls').value),
                 },
               },
             });

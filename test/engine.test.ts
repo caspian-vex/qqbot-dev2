@@ -9,7 +9,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { Engine, type Sender } from '../src/bot';
-import { contentText, type LlmClient, type Message as LlmMessage, type Result } from '../src/llm/client';
+import {
+  contentText,
+  type LlmClient,
+  type Message as LlmMessage,
+  type Result,
+  type ToolDef,
+} from '../src/llm/client';
 import { Logger } from '../src/log/logger';
 import type { Event, Segment } from '../src/onebot/types';
 import { Store } from '../src/store';
@@ -46,7 +52,10 @@ function makeHarness(opts: {
   patch?: (v: Settings) => void;
   reply?: string;
   echo?: string;
-  llm?: (msgs: LlmMessage[]) => Promise<Result>;
+  /** 第二参数是本次请求带的工具：联网搜索用例靠它断言"带没带 web_search"。 */
+  llm?: (msgs: LlmMessage[], tools?: ToolDef[]) => Promise<Result>;
+  /** 联网搜索用的 fetch。不传就是真的全局 fetch——用例必须都传。 */
+  searchFetch?: typeof fetch;
 } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-engine-'));
   tmpDirs.push(dir);
@@ -75,8 +84,8 @@ function makeHarness(opts: {
   };
 
   const llm = {
-    chat: async (_cfg: unknown, msgs: LlmMessage[]) => {
-      if (opts.llm) return opts.llm(msgs);
+    chat: async (_cfg: unknown, msgs: LlmMessage[], _signal?: AbortSignal, tools?: ToolDef[]) => {
+      if (opts.llm) return opts.llm(msgs, tools);
       const last = contentText(msgs[msgs.length - 1]!.content);
       const isEcho = last.includes('内部指令');
       return {
@@ -91,6 +100,7 @@ function makeHarness(opts: {
     store,
     log: Logger.create({ level: 'error', format: 'text' }),
     llm,
+    searchFetch: opts.searchFetch,
   });
   engine.setSender(sender);
   engine.setSelf(10000, 'bot');
@@ -481,6 +491,202 @@ describe('会话列表里的对话对象名字', () => {
       await waitFor(() => h.sent.length >= 2);
       const anon = h.store.sessions.list().find((s) => s.id === 'private:20002')!;
       assert.equal(anon.name, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('联网搜索', () => {
+  const say = (content: string, extra: Partial<Result> = {}): Result => ({
+    content,
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    firstTokenMs: 1,
+    ...extra,
+  });
+
+  const callOf = (id: string, query: string) => ({
+    id,
+    type: 'function',
+    function: { name: 'web_search', arguments: JSON.stringify({ query }) },
+  });
+
+  /** 假的搜索后端：按 DeepSeek Search API 的形状回结果，并记录被调了几次。 */
+  function searchStub(hits: unknown[] = [], status = 200): { fetchImpl: typeof fetch; calls: string[] } {
+    const calls: string[] = [];
+    const f = (async (url: string) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ results: hits }), { status });
+    }) as unknown as typeof fetch;
+    return { fetchImpl: f, calls };
+  }
+
+  /** 开启搜索的一组设置。搜索复用模型 Key，所以顺手把模型 Key 也配上。 */
+  const onSearch = (v: Settings): void => {
+    v.llm.api_key = 'sk-test';
+    v.search.enabled = true;
+    v.search.max_calls = 2;
+    v.search.max_results = 3;
+  };
+
+  it('模型要查时执行搜索，把结果作为 tool 消息回填后再问一次', async () => {
+    const seen: { msgs: LlmMessage[]; tools?: ToolDef[] }[] = [];
+    const s = searchStub([{ title: '天气网', url: 'https://w.test/bj', summary: '北京今晚晴，12 度' }]);
+    const h = makeHarness({
+      patch: onSearch,
+      searchFetch: s.fetchImpl,
+      llm: async (msgs, tools) => {
+        seen.push({ msgs, tools });
+        return seen.length === 1 ? say('', { toolCalls: [callOf('call_1', '北京 今晚 天气')] }) : say('北京今晚晴，12 度左右。');
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+
+      assert.equal(textOf(h.sent[0]!.segs), '北京今晚晴，12 度左右。');
+      assert.equal(s.calls.length, 1, '应该只搜一次');
+      assert.equal(seen.length, 2, '搜完必须再问一次模型');
+
+      // 第一轮把工具递了过去
+      assert.equal(seen[0]!.tools?.[0]?.function.name, 'web_search');
+
+      // 第二轮要带上 assistant(tool_calls) 与配对的 tool 结果，否则端点会 400
+      const second = seen[1]!.msgs;
+      const toolMsg = second.find((m) => m.role === 'tool');
+      assert.ok(toolMsg, '必须有 role=tool 的消息');
+      assert.equal(toolMsg!.tool_call_id, 'call_1');
+      assert.ok(contentText(toolMsg!.content).includes('天气网'), '工具结果里要有搜到的标题');
+      const asstMsg = second.find((m) => m.role === 'assistant');
+      assert.equal(asstMsg!.tool_calls?.[0]!.id, 'call_1');
+
+      // 历史只留用户原话与最终答复，搜索结果不进库（否则每轮都被重新计费）
+      const rows = h.store.sessions.recent('group:30000', 10);
+      assert.equal(rows.length, 2);
+      assert.equal(rows[1]!.content, '北京今晚晴，12 度左右。');
+      assert.ok(!rows.some((r) => r.content.includes('天气网')));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('开关关着时不带 tools、也不碰搜索源', async () => {
+    const tools: (ToolDef[] | undefined)[] = [];
+    const s = searchStub();
+    const h = makeHarness({
+      searchFetch: s.fetchImpl,
+      llm: async (_msgs, t) => {
+        tools.push(t);
+        return say('在的。');
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(tools.length, 1);
+      assert.equal(tools[0], undefined, '关着就不该带 tools 字段');
+      assert.equal(s.calls.length, 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('搜索源报错时把失败原话交给模型，回复照发', async () => {
+    const s = searchStub([], 500);
+    let sawFailure = false;
+    const h = makeHarness({
+      patch: onSearch,
+      searchFetch: s.fetchImpl,
+      llm: async (msgs) => {
+        const tool = msgs.find((m) => m.role === 'tool');
+        if (!tool) return say('', { toolCalls: [callOf('c1', 'q')] });
+        sawFailure = contentText(tool.content).includes('搜索失败');
+        return say('查不到，可能网不好。');
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(textOf(h.sent[0]!.segs), '查不到，可能网不好。');
+      assert.ok(sawFailure, '工具结果里要说清楚是搜索失败，别让模型当成"没结果"');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('端点不认 tools 时降级成普通对话，用户照样收到回复', async () => {
+    const tools: (ToolDef[] | undefined)[] = [];
+    let n = 0;
+    const h = makeHarness({
+      patch: onSearch,
+      searchFetch: searchStub().fetchImpl,
+      llm: async (_msgs, t) => {
+        tools.push(t);
+        n++;
+        if (n === 1) throw new Error('模型返回 HTTP 400: {"error":{"message":"tools is not supported"}}');
+        return say('好吧，我不查了。');
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(textOf(h.sent[0]!.segs), '好吧，我不查了。');
+      assert.equal(tools.length, 2);
+      assert.equal(tools[0]!.length, 1, '第一次带工具');
+      assert.equal(tools[1], undefined, '降级后不再带工具');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('一次要查两条但额度只剩一条时，多出来的明确拒绝而不是偷偷多花钱', async () => {
+    const s = searchStub([{ title: 'a', url: 'https://a.test', summary: 'c' }]);
+    const seen: LlmMessage[][] = [];
+    const h = makeHarness({
+      patch: (v) => {
+        onSearch(v);
+        v.search.max_calls = 1;
+      },
+      searchFetch: s.fetchImpl,
+      llm: async (msgs) => {
+        seen.push(msgs);
+        if (msgs.some((m) => m.role === 'tool')) return say('好。');
+        return say('', { toolCalls: [callOf('c1', 'q1'), callOf('c2', 'q2')] });
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+
+      assert.equal(s.calls.length, 1, '额度是 1 就只能发一次搜索请求');
+      const toolMsgs = seen[1]!.filter((m) => m.role === 'tool');
+      assert.equal(toolMsgs.length, 2, '每个 tool_call_id 都必须有回复，漏一个就 400');
+      assert.ok(toolMsgs.some((m) => contentText(m.content).includes('搜索次数已用完')));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('模型只提工具不查（额度已尽）时，不再给工具也不算失败', async () => {
+    let n = 0;
+    const tools: (ToolDef[] | undefined)[] = [];
+    const h = makeHarness({
+      patch: (v) => {
+        onSearch(v);
+        v.search.max_calls = 1;
+      },
+      searchFetch: searchStub([{ title: 'a', url: 'https://a.test', summary: 'c' }]).fetchImpl,
+      llm: async (_msgs, t) => {
+        tools.push(t);
+        n++;
+        return n === 1 ? say('', { toolCalls: [callOf('c1', 'q1')] }) : say('就这些。');
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(textOf(h.sent[0]!.segs), '就这些。');
+      assert.equal(tools[1], undefined, '额度用完后这一轮不再带工具');
     } finally {
       h.cleanup();
     }

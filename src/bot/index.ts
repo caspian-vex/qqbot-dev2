@@ -43,4 +43,19 @@ export {
   type LoadOptions,
 } from './vision';
 export { split, stripMarkdown, truncate, defaultSplit, type SplitOptions } from './split';
+export {
+  SEARCH_MAX_CHARS,
+  SEARCH_MAX_QUERY,
+  SEARCH_MAX_RESULTS,
+  SEARCH_TOOL_NAME,
+  WEB_SEARCH_TOOL,
+  formatHits,
+  normalizeQuery,
+  searchEndpoint,
+  searchPromptBlock,
+  toolQuery,
+  webSearch,
+  type SearchConfig,
+  type SearchHit,
+} from './search';
 export { Cooldown, Dedupe, TaskQueue } from './queue';

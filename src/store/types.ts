@@ -86,6 +86,30 @@ export interface VisionSettings {
   max_images: number;
 }
 
+/**
+ * 联网搜索配置。
+ *
+ * 走的是 OpenAI 兼容的 function calling：把 web_search 作为一个工具交给模型，
+ * 由它判断"这句话要不要查"。不做关键词猜谜——猜错了要么把闲聊变成念新闻，
+ * 要么该查的时候不查。代价是模型侧必须支持工具调用（主流模型都已经支持，
+ * 不支持时会自动退回普通对话，不会把回复链路搞挂）。
+ *
+ * 搜索后端固定用 DeepSeek 官方 Search API，和模型共用一个 API Key，
+ * 所以这里没有 provider / api_key / base_url——没得选，也就不需要配。
+ *
+ * 出厂关闭：每次搜索都单独计费，默认替用户花钱不合适。
+ */
+export interface SearchSettings {
+  /** 是否允许模型联网搜索。 */
+  enabled: boolean;
+  /** 每次搜索取几条结果（1-10）。 */
+  max_results: number;
+  /** 单次搜索的超时（秒）。搜索是回复链路里的串行等待，别给太久。 */
+  timeout_sec: number;
+  /** 一条回复里最多搜几次（1-3）。这是成本的硬闸。 */
+  max_calls: number;
+}
+
 /** 面板凭据配置。 */
 export interface PanelSettings {
   admin_user: string;
@@ -101,6 +125,7 @@ export interface Settings {
   proactive: ProactiveSettings;
   images: ImageSettings;
   vision: VisionSettings;
+  search: SearchSettings;
   context: ContextSettings;
   panel: PanelSettings;
 }
@@ -139,6 +164,21 @@ export function defaultVision(): VisionSettings {
   };
 }
 
+/**
+ * 联网搜索的出厂默认值。
+ *
+ * 关着，而且除 provider 外都是保守值：搜索是一次额外的外部请求，
+ * 既花钱又多一跳延迟，该由用户明确开启。
+ */
+export function defaultSearch(): SearchSettings {
+  return {
+    enabled: false,
+    max_results: 5,
+    timeout_sec: 8,
+    max_calls: 2,
+  };
+}
+
 /** 出厂默认值。刻意保守：被动接话概率低、上下文预算小、思考模式关闭。 */
 export function defaultSettings(): Settings {
   return {
@@ -166,6 +206,7 @@ export function defaultSettings(): Settings {
     proactive: defaultProactive(),
     images: defaultImages(),
     vision: defaultVision(),
+    search: defaultSearch(),
     context: {
       max_turns: 10,
       token_budget: 3000,
@@ -204,6 +245,25 @@ export function normalizeSettings(v: Settings): Settings {
   if (v.vision === undefined || v.vision === null || typeof v.vision !== 'object') {
     v.vision = defaultVision();
   }
+  // 旧库没有 search 块：整块补默认值（关着的），升级不会突然开始对外发请求。
+  if (v.search === undefined || v.search === null || typeof v.search !== 'object') {
+    v.search = defaultSearch();
+  } else {
+    // 块在但字段缺（手改过库、跨版本升级）：逐字段兜。别的块缺字段最坏是
+    // 显示难看，这里缺 max_calls 会让引擎算出 NaN，工具循环直接转会死。
+    const ds = defaultSearch();
+    if (typeof v.search.enabled !== 'boolean') v.search.enabled = ds.enabled;
+    // 老库里可能留着 provider / api_key / base_url（上一版接第三方搜索源时写的）。
+    // 留着不会报错，但会把已经作废的凭证继续写进 JSON，下次读还得再兜一遍，
+    // 索性在这里清掉：搜索后端只剩一家，这几个字段已经没有含义了。
+    const legacy = v.search as unknown as Record<string, unknown>;
+    delete legacy['provider'];
+    delete legacy['api_key'];
+    delete legacy['base_url'];
+    if (!Number.isFinite(v.search.max_results)) v.search.max_results = ds.max_results;
+    if (!Number.isFinite(v.search.timeout_sec)) v.search.timeout_sec = ds.timeout_sec;
+    if (!Number.isFinite(v.search.max_calls)) v.search.max_calls = ds.max_calls;
+  }
   return v;
 }
 
@@ -220,6 +280,7 @@ export function cloneSettings(v: Settings): Settings {
     proactive: { ...v.proactive },
     images: { ...v.images },
     vision: { ...v.vision },
+    search: { ...v.search },
     context: { ...v.context },
     panel: { ...v.panel },
   };

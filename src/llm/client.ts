@@ -20,10 +20,37 @@ export type ContentPart =
  *
  * 纯文本时 content 仍然是字符串——不是所有 OpenAI 兼容端点都吃数组，
  * 能发字符串就发字符串；只有带图才升级成内容块数组。
+ *
+ * tool_calls / tool_call_id 是 function calling 的两端：
+ *   - assistant 消息带 tool_calls，表示"我要调这些函数"
+ *   - role='tool' 的消息带 tool_call_id，表示"这是那次调用返回的结果"
+ * 两者必须成对出现，缺一条端点会直接 400。
  */
 export interface Message {
   role: string;
   content: string | ContentPart[];
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  /** role='tool' 时带上函数名，个别中转要求，不填也不该报错。 */
+  name?: string;
+}
+
+/** 声明给模型的一个工具。 */
+export interface ToolDef {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    /** JSON Schema。 */
+    parameters: Record<string, unknown>;
+  };
+}
+
+/** 模型请求的一次工具调用。arguments 是 JSON 字符串，不是对象。 */
+export interface ToolCall {
+  id: string;
+  type?: string;
+  function: { name: string; arguments: string };
 }
 
 /**
@@ -92,6 +119,8 @@ export interface Result {
   usage: Usage;
   /** 首字延迟，用于验证思考模式是否真的关掉了。 */
   firstTokenMs: number;
+  /** 模型要求调用的工具；空表示这轮给了最终答案。 */
+  toolCalls?: ToolCall[];
 }
 
 interface ChatRequest {
@@ -102,11 +131,13 @@ interface ChatRequest {
   max_tokens?: number;
   thinking: { type: 'enabled' | 'disabled' };
   stream_options?: { include_usage: boolean };
+  tools?: ToolDef[];
+  tool_choice?: 'auto';
 }
 
 interface ChatResponse {
   choices?: {
-    message?: { content?: string };
+    message?: { content?: string; tool_calls?: ToolCall[] };
     delta?: { content?: string };
     finish_reason?: string;
   }[];
@@ -127,7 +158,12 @@ function emptyUsage(): Usage {
   return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 }
 
-function buildRequest(cfg: LlmConfig, msgs: Message[], stream: boolean): ChatRequest {
+function buildRequest(
+  cfg: LlmConfig,
+  msgs: Message[],
+  stream: boolean,
+  tools?: ToolDef[],
+): ChatRequest {
   const req: ChatRequest = {
     model: cfg.model,
     messages: msgs,
@@ -140,6 +176,12 @@ function buildRequest(cfg: LlmConfig, msgs: Message[], stream: boolean): ChatReq
     req.temperature = cfg.temperature;
   }
   if (stream) req.stream_options = { include_usage: true };
+  // 没有工具就不带这两个字段：部分端点对空数组也当成"要工具"，
+  // 或者干脆不认 tools 字段而直接 400。
+  if (tools !== undefined && tools.length > 0) {
+    req.tools = tools;
+    req.tool_choice = 'auto';
+  }
   return req;
 }
 
@@ -157,9 +199,19 @@ export function endpoint(baseURL: string): string {
 }
 
 export class LlmClient {
-  /** 发起一次非流式对话，返回完整文本。 */
-  async chat(cfg: LlmConfig, msgs: Message[], signal?: AbortSignal): Promise<Result> {
-    return this.do(cfg, msgs, false, undefined, signal);
+  /**
+   * 发起一次非流式对话，返回完整文本。
+   *
+   * tools 只在需要 function calling 时传（联网搜索）。不传就完全不带这两个字段，
+   * 让"普通对话"的请求形状与加这个功能之前一模一样。
+   */
+  async chat(
+    cfg: LlmConfig,
+    msgs: Message[],
+    signal?: AbortSignal,
+    tools?: ToolDef[],
+  ): Promise<Result> {
+    return this.do(cfg, msgs, false, undefined, signal, tools);
   }
 
   /** 发起流式对话，每收到一段增量就回调 onDelta。 */
@@ -184,6 +236,7 @@ export class LlmClient {
     stream: boolean,
     onDelta: ((d: string) => void) | undefined,
     signal?: AbortSignal,
+    tools?: ToolDef[],
   ): Promise<Result> {
     if (cfg.apiKey === '') throw new Error('未配置模型 API Key');
     if (cfg.model === '') throw new Error('未配置模型名称');
@@ -200,7 +253,7 @@ export class LlmClient {
         backoff *= 2;
       }
       try {
-        return await this.once(cfg, msgs, stream, onDelta, timeoutMs, signal);
+        return await this.once(cfg, msgs, stream, onDelta, timeoutMs, signal, tools);
       } catch (e) {
         lastErr = e;
         if (!isRetryable(e)) break;
@@ -216,6 +269,7 @@ export class LlmClient {
     onDelta: ((d: string) => void) | undefined,
     timeoutMs: number,
     signal?: AbortSignal,
+    tools?: ToolDef[],
   ): Promise<Result> {
     const timeout = AbortSignal.timeout(timeoutMs);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -232,7 +286,7 @@ export class LlmClient {
       resp = await fetch(endpoint(cfg.baseURL), {
         method: 'POST',
         headers,
-        body: JSON.stringify(buildRequest(cfg, msgs, stream)),
+        body: JSON.stringify(buildRequest(cfg, msgs, stream, tools)),
         signal: combined,
       });
     } catch (e) {
@@ -264,10 +318,17 @@ export class LlmClient {
       if (out.choices === undefined || out.choices.length === 0) {
         throw new Error('模型返回空结果');
       }
+      // content 可能是 null（只回工具调用时），也可能空串。
+      // 这时不能当"空结果"报错——那会让带工具的第一轮直接失败。
+      const toolCalls = out.choices[0]?.message?.tool_calls ?? [];
+      if (content === '' && toolCalls.length === 0) {
+        throw new Error('模型返回空结果');
+      }
       return {
         content,
         usage: out.usage ?? emptyUsage(),
         firstTokenMs: Date.now() - start,
+        toolCalls,
       };
     }
 

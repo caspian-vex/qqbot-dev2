@@ -235,6 +235,20 @@ function validateSettings(v: Settings): void {
   if (v.vision.max_images < 1 || v.vision.max_images > 4) {
     throw new HttpError(400, '单条消息识图上限应在 1-4 张之间');
   }
+  if (v.search.max_results < 1 || v.search.max_results > 10) {
+    throw new HttpError(400, '每次搜索取几条应在 1-10 之间');
+  }
+  if (v.search.timeout_sec < 3 || v.search.timeout_sec > 30) {
+    throw new HttpError(400, '搜索超时应在 3-30 秒之间');
+  }
+  if (v.search.max_calls < 1 || v.search.max_calls > 3) {
+    throw new HttpError(400, '每条消息最多搜几次应在 1-3 之间');
+  }
+  // 搜索复用模型 Key。开着搜索却没配 Key，每次都要走一趟注定 401 的请求，
+  // 而用户以为功能已经配好了——这种"静默不生效"比直接报错难查得多。
+  if (v.search.enabled && v.llm.api_key === '') {
+    throw new HttpError(400, '开启联网搜索需要先填写模型 API Key（搜索与模型共用同一把）');
+  }
 
   // 名单类的元素类型必须一起校验。只查数组形状是不够的：
   // 传 ["30000"] 这种字符串数组能过 assignOnto，但引擎是拿 number 去
@@ -628,6 +642,7 @@ export class Api {
         v.proactive = { ...inp.proactive };
         v.images = { ...inp.images };
         v.vision = { ...inp.vision };
+        v.search = { ...inp.search };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });

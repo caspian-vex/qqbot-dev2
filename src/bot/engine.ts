@@ -2,11 +2,14 @@
 import { Manager as ContextManager } from '../ctxmgr';
 import {
   LlmClient,
+  contentText,
   contentTokens,
   estimateTokens,
   type ContentPart,
   type LlmConfig,
   type Message as LlmMessage,
+  type Result,
+  type ToolCall,
 } from '../llm/client';
 import type { Logger } from '../log/logger';
 import type { BotStatus, EnginePort, EngineStats } from '../panel/ports';
@@ -32,6 +35,14 @@ import {
 } from './imagepool';
 import { decide, type Decision } from './filter';
 import { Cooldown, Dedupe, TaskQueue } from './queue';
+import {
+  SEARCH_TOOL_NAME,
+  WEB_SEARCH_TOOL,
+  formatHits,
+  searchPromptBlock,
+  toolQuery,
+  webSearch,
+} from './search';
 import { split, stripMarkdown } from './split';
 import {
   VISION_HINT,
@@ -56,7 +67,22 @@ export interface EngineOptions {
   signal?: AbortSignal;
   /** 图池目录（数据目录下的 images/）。空串或未传时图池功能整体关闭。 */
   imagesDir?: string;
+  /**
+   * 联网搜索用的 fetch。测试注入用；线上不传即全局 fetch。
+   *
+   * 之所以留这个口子而不是让测试去起一个本地 HTTP 服务：搜索是回复链路
+   * 中间的一跳，用真网络跑用例既慢又不稳定，而这里要验的是"搜到了怎么用"。
+   */
+  searchFetch?: typeof fetch;
 }
+
+/**
+ * 工具循环最多几轮（含第一轮）。
+ *
+ * 3 轮 = 初次 + 两批搜索。实际几乎用不到第三批——模型通常搜一次就够。
+ * 给上限是因为每多一轮就是一次完整的模型请求，费用和延迟都线性涨。
+ */
+const SEARCH_MAX_ROUNDS = 3;
 
 interface Counters {
   received: number;
@@ -300,6 +326,10 @@ export class Engine implements EnginePort {
     // 自己刚才收到了图，开始描述一张不存在的画面。
     if (images.length > 0) system += `\n${VISION_HINT}`;
 
+    // 搜索规则只在开着时注入：关掉还告诉模型"你可以搜"，
+    // 它会在回复里编出"我查了一下"，用户直接被误导。
+    if (settings.search.enabled) system += `\n${searchPromptBlock(settings.search.max_calls)}`;
+
     try {
       // 名字只用于面板显示，拿不到就回空串（touch 不会因此擦掉旧值）。
       // 群名在算 vars 时已经拉过一次，这里直接用缓存里的结果，不多发请求。
@@ -327,9 +357,9 @@ export class Engine implements EnginePort {
       timeoutMs: settings.llm.timeout_sec * 1000,
     };
 
-    let res;
+    let res: Result;
     try {
-      res = await this.llm.chat(cfg, msgs, this.opt.signal);
+      res = await this.ask(settings, cfg, msgs);
     } catch (e) {
       this.log.error('调用模型失败', { err: e });
       this.counters.errors++;
@@ -411,6 +441,164 @@ export class Engine implements EnginePort {
     });
 
     this.scheduleEcho(sid, kindOf(ev), targetOf(ev), settings);
+  }
+
+  /**
+   * 问模型，必要时让它先联网查一轮。
+   *
+   * 开关关着时就是一个普通的 chat 调用——请求形状与加这个功能之前完全一样，
+   * 不带 tools 字段，老端点不会因为多出来的字段挂掉。
+   *
+   * 开着时走工具循环：
+   *   请求(带 tools) → 模型要调 web_search → 我们执行 → 把结果作为 role=tool
+   *   消息塞回去 → 再请求一次 → 直到它给出文本或轮数用尽。
+   *
+   * 三类降级都必须有，否则这个功能会变成"回复不可用"的新原因：
+   *   1. 端点不支持 function calling → 退回不带工具的普通请求
+   *   2. 搜索源报错/超时 → 错误文本作为工具结果给它，由它自己决定怎么说
+   *   3. 轮数或次数用尽 → 不再给工具，逼它用已有信息作答
+   */
+  private async ask(s: Settings, cfg: LlmConfig, msgs: LlmMessage[]): Promise<Result> {
+    if (!s.search.enabled) return this.llm.chat(cfg, msgs, this.opt.signal);
+
+    // 模型写 query 时常常省掉主语（「那场比赛」），把用户原话一起交给 Search API
+    // 能让它补上语境。取最后一条 user 消息：历史里的旧提问与这次搜索无关。
+    const ori = lastUserText(msgs);
+
+    // max_calls 是成本硬闸。NaN 时 Math.max(1, NaN) 还是 NaN，
+    // 比较恒为假会让工具一次都不给；normalize 已经兜过一层，这里再兜一层。
+    const limit = Number.isFinite(s.search.max_calls)
+      ? Math.max(1, Math.floor(s.search.max_calls))
+      : 2;
+    let convo = msgs;
+    let used = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let firstTokenMs = 0;
+
+    const sum = (r: Result): void => {
+      promptTokens += r.usage.prompt_tokens;
+      completionTokens += r.usage.completion_tokens;
+      if (firstTokenMs === 0) firstTokenMs = r.firstTokenMs;
+    };
+    // 多轮请求的用量必须累加：只记最后一轮会让面板上的 token 统计少一半，
+    // 而搜索带来的 prompt 膨胀恰恰是最需要被看见的成本。
+    const pack = (content: string): Result => ({
+      content,
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+      firstTokenMs,
+    });
+
+    for (let round = 0; round < SEARCH_MAX_ROUNDS; round++) {
+      const allowTools = used < limit;
+      let res: Result;
+      try {
+        res = await this.llm.chat(
+          cfg,
+          convo,
+          this.opt.signal,
+          allowTools ? [WEB_SEARCH_TOOL] : undefined,
+        );
+      } catch (e) {
+        if (round === 0 && toolsUnsupported(e)) {
+          this.log.warn('当前模型不支持工具调用，本次跳过联网搜索', { err: e });
+          return this.llm.chat(cfg, msgs, this.opt.signal);
+        }
+        throw e;
+      }
+
+      sum(res);
+      const calls = res.toolCalls ?? [];
+      if (!allowTools || calls.length === 0) return pack(res.content);
+
+      const ran = await this.runTools(calls, limit - used, s, cfg, ori);
+      used += ran.count;
+      convo = [
+        ...convo,
+        // 这条 assistant 消息必须原样回填：端点是按 tool_call_id 配对结果的，
+        // 少了它，后面那些 role=tool 的消息会变成"来路不明的工具结果"。
+        { role: 'assistant', content: res.content, tool_calls: calls },
+        ...ran.msgs,
+      ];
+    }
+
+    // 轮数用尽还在要工具：不给工具再问一次，让它用已经查到的内容收尾
+    const last = await this.llm.chat(cfg, convo, this.opt.signal);
+    sum(last);
+    return pack(last.content);
+  }
+
+  /** 执行模型请求的工具调用，每个 call_id 都必须回一条消息。 */
+  private async runTools(
+    calls: ToolCall[],
+    remain: number,
+    s: Settings,
+    cfg: LlmConfig,
+    ori: string,
+  ): Promise<{ msgs: LlmMessage[]; count: number }> {
+    const msgs: LlmMessage[] = [];
+    let count = 0;
+
+    for (const c of calls) {
+      const name = c.function?.name ?? '';
+      const id = c.id;
+      if (name !== SEARCH_TOOL_NAME) {
+        msgs.push({ role: 'tool', tool_call_id: id, name, content: `没有名为 ${name} 的工具。` });
+        continue;
+      }
+      if (count >= remain) {
+        // 超预算也要回一条：漏掉任何一个 tool_call_id，下一次请求就是 400
+        msgs.push({
+          role: 'tool',
+          tool_call_id: id,
+          name,
+          content: '本次的搜索次数已用完，请直接用现有信息回答。',
+        });
+        continue;
+      }
+      const query = toolQuery(c.function?.arguments ?? '');
+      if (query === '') {
+        msgs.push({
+          role: 'tool',
+          tool_call_id: id,
+          name,
+          content: '搜索词为空。请给出具体的 query 再来一次。',
+        });
+        continue;
+      }
+
+      count++;
+      try {
+        const hits = await webSearch(query, {
+          // 搜索走 DeepSeek 官方 Search API，与模型共用同一把 Key、同一个域名：
+          // 面板上少一份配置，也就少一处会配错的地方。
+          apiKey: cfg.apiKey,
+          baseURL: cfg.baseURL,
+          maxResults: s.search.max_results,
+          timeoutMs: s.search.timeout_sec * 1000,
+          oriQuestion: ori,
+          signal: this.opt.signal,
+          fetchImpl: this.opt.searchFetch,
+        });
+        this.log.info('已联网搜索', { query, hits: hits.length });
+        msgs.push({ role: 'tool', tool_call_id: id, name, content: formatHits(hits) });
+      } catch (e) {
+        // 搜不到不等于答不了：把失败原话交给模型，它通常能老实说"没查到"
+        this.log.warn('联网搜索失败', { query, err: e });
+        msgs.push({
+          role: 'tool',
+          tool_call_id: id,
+          name,
+          content: `搜索失败（${(e as Error).message}）。不要编造搜索结果，直接说明没查到，或按你已知的信息回答。`,
+        });
+      }
+    }
+
+    return { msgs, count };
   }
 
   /** 模型调用失败时给一句兜底回复，避免用户干等。 */
@@ -737,6 +925,36 @@ function formatLocalMinute(d: Date): string {
     `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
     `${p(d.getHours())}:${p(d.getMinutes())}`
   );
+}
+
+/**
+ * 取最后一条 user 消息的纯文本。
+ *
+ * 用作 Search API 的 ori_question：查询理解靠它补主语。带图的消息里
+ * 图片块直接跳过——搜索接口只认文本，塞 data URL 进去既没用又超长。
+ */
+function lastUserText(msgs: LlmMessage[]): string {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]!;
+    if (m.role !== 'user') continue;
+    const t = contentText(m.content).trim();
+    if (t !== '') return t;
+  }
+  return '';
+}
+
+/**
+ * 判断错误是不是"端点不认 tools 字段"。
+ *
+ * 各家措辞不一样（unknown field `tools` / function calling is not supported /
+ * tools is not supported），但都是 400 段位加文本里带 tool 或 function。
+ * 只在这个特征上降级：换成余额不足、模型名写错这类 400，重试一次毫无意义，
+ * 还会把真正的错误信息掩盖成一次多余请求。
+ */
+function toolsUnsupported(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (!/HTTP 4\d\d/.test(msg)) return false;
+  return /tool|function/i.test(msg);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

@@ -1202,3 +1202,66 @@ describe('协议端未连接时的行为', () => {
     }
   });
 });
+
+describe('联网搜索的设置', () => {
+  /** 带 CSRF 的 PUT。 */
+  async function put(h: Awaited<ReturnType<typeof harness>>, c: { header: string; csrf: string }, body: unknown) {
+    return fetch(`${h.base}/api/settings`, {
+      method: 'PUT',
+      headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('开着却连模型 Key 都没有，直接 400，不要存成"看起来配好了"', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await put(h, c, { search: { enabled: true } });
+      assert.equal(res.status, 400);
+      assert.deepEqual(await res.json(), {
+        error: '开启联网搜索需要先填写模型 API Key（搜索与模型共用同一把）',
+      });
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('搜索次数与条数上限要卡住', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ search: { max_calls: 0 } }, '每条消息最多搜几次应在 1-3 之间'],
+        [{ search: { max_calls: 9 } }, '每条消息最多搜几次应在 1-3 之间'],
+        [{ search: { max_results: 99 } }, '每次搜索取几条应在 1-10 之间'],
+        [{ search: { timeout_sec: 1 } }, '搜索超时应在 3-30 秒之间'],
+      ];
+      for (const [payload, msg] of cases) {
+        const res = await put(h, c, payload);
+        assert.equal(res.status, 400, JSON.stringify(payload));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('搜索不再有独立凭证：GET 里没有 provider / api_key / base_url', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const got = (await (await fetch(`${h.base}/api/settings`, { headers: { Cookie: c.header } })).json()) as {
+        search: Record<string, unknown>;
+      };
+      assert.deepEqual(Object.keys(got.search).sort(), [
+        'enabled',
+        'max_calls',
+        'max_results',
+        'timeout_sec',
+      ]);
+    } finally {
+      await h.stop();
+    }
+  });
+});

@@ -11,7 +11,7 @@ import { formatGoDuration, rfc3339, ZERO_TIME, localDay } from '../src/util/time
 import { Box, generateKey, generateToken, safeEqual } from '../src/secret/box';
 import { Store } from '../src/store/index';
 import { loadSecrets } from '../src/config';
-import { defaultSettings, parseSessionId } from '../src/store/types';
+import { defaultSettings, normalizeSettings, parseSessionId, type Settings } from '../src/store/types';
 
 function tempDb(): { store: Store; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-test-'));
@@ -352,4 +352,46 @@ test('会话名：说话时记下，空值不擦旧名，且优先于预设快�
 
   store.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('联网搜索：出厂关闭，缺块与缺字段都要能自己补齐', () => {
+  const { store, dir } = tempDb();
+  const s = store.settings.get();
+  assert.equal(s.search.enabled, false, '要花钱的能力不能默认开');
+  assert.equal(s.search.max_calls, 2);
+  assert.equal(s.search.timeout_sec, 8);
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+
+  // 老库：整个 search 块不存在（v5 之前的 JSON）
+  const old = defaultSettings() as unknown as Record<string, unknown>;
+  delete old.search;
+  const filled = normalizeSettings(old as unknown as Settings);
+  assert.equal(filled.search.enabled, false);
+  assert.equal(filled.search.max_calls, 2);
+
+  // 块在但字段被写坏：max_calls 缺失会让引擎的额度比较永远为假。
+  // 这是"功能开了但一点反应没有"的典型来源，必须在读取时兜住。
+  const broken = defaultSettings();
+  const raw = broken.search as unknown as Record<string, unknown>;
+  delete raw.max_calls;
+  raw.enabled = true;
+  normalizeSettings(broken);
+  assert.equal(broken.search.max_calls, 2);
+  assert.equal(broken.search.enabled, true, '已有的值不能被兜底覆盖');
+});
+
+test('联网搜索：上一版留下的第三方搜索源字段会被清掉', () => {
+  // 从"接 Tavily/博查"那版升级上来的库会带着 provider/api_key/base_url。
+  // 搜索后端已经改成 DeepSeek 官方，这几项没有含义了；留着的话
+  // 已作废的搜索凭证会一直被写进 JSON，看着像还在用。
+  const v = defaultSettings();
+  const legacy = v.search as unknown as Record<string, unknown>;
+  legacy['provider'] = 'tavily';
+  legacy['api_key'] = 'ENC:garbage';
+  legacy['base_url'] = 'https://api.tavily.com/search';
+
+  normalizeSettings(v);
+  const keys = Object.keys(v.search).sort();
+  assert.deepEqual(keys, ['enabled', 'max_calls', 'max_results', 'timeout_sec']);
 });
