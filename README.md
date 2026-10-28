@@ -19,6 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main/install
 - **登录后自动接线**：检测到 QQ 登录成功，自动在协议端补一条启用的 3001 反向 WS，不需要手工点按钮。
 - **完整协议端控制台**：面板「协议端」页反代 NapCat 原生 WebUI，高级网络配置、插件、日志、进程都在里面。
 - **原生手写前端**：`web/dist/app.js` 单文件、无构建步骤，改一行刷新就生效。
+- **外观三态**：浅色 / 暗色 / 跟随系统，侧栏底部与登录页可切换，记在浏览器本地，默认暗色。
 - **零编译部署**：CI 在 GitHub Actions 上构建 `linux/amd64` + `linux/arm64` 镜像推到 GHCR，服务器只 pull。
 - **自带运维命令**：`qqbot status / logs / upgrade / rollback / backup / restore / reset-password`。
 - **为 1 核 2G 设计**：两容器内存上限 1.4G，日志服务级轮转，不碰全局 `daemon.json`。
@@ -191,6 +192,7 @@ qqbot status
 | 会话 | 上下文、清空会话 |
 | 用量 | token 消耗统计 |
 | 账号 | 改面板密码、TOTP 两步验证 |
+| 外观 | 浅色 / 暗色 / 跟随系统，切换器在侧栏底部和登录页 |
 
 面板自身的 `/api/*` 优先匹配，没注册的才转给协议端 —— `/api/auth/login` 两边同名，这条边界不能改成前缀判断。
 
