@@ -20,21 +20,29 @@ interface SessionRow {
   cnt: number;
   persona_id: number;
   persona_name: string;
-  target_name: string;
+  name: string;
 }
 
 export class SessionRepo {
   constructor(private readonly db: Db) {}
 
-  /** 更新会话最后活跃时间（不存在则创建）。 */
-  touch(sessionID: string, kind: string, targetID: number): void {
+  /**
+   * 更新会话最后活跃时间（不存在则创建）。
+   *
+   * name 是「对话对象的名字」（群名 / 好友昵称），只用于面板显示。
+   * 传空串时不会把已有的名字擦掉：群名拉取失败、私聊没带昵称都会传空，
+   * 若照写就会把上一次记下的名字清成空白，列表一夜之间退化成一片号码。
+   */
+  touch(sessionID: string, kind: string, targetID: number, name = ''): void {
     this.db.run(
-      `INSERT INTO sessions (id, kind, target_id, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`,
+      `INSERT INTO sessions (id, kind, target_id, updated_at, name) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at,
+               name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE sessions.name END`,
       sessionID,
       kind,
       targetID,
       nowSec(),
+      name,
     );
   }
 
@@ -95,7 +103,13 @@ export class SessionRepo {
     });
   }
 
-  /** 会话列表，按最近活跃排序。附带该会话绑定的人格（未绑定为 0/''）。 */
+  /**
+   * 会话列表，按最近活跃排序。附带人格绑定与对话对象的名字。
+   *
+   * 名字两个来源，先到先用：会话自己记下的（说话时抓的群名/昵称）优先，
+   * 其次是预设人格时存下的快照。后者只在绑定里存在，会话主动过消息之后
+   * 也该继续用——不能因为"开口说话"就把「夜猫子群」退回成一串号码。
+   */
   list(limit = 200): SessionInfo[] {
     return this.db
       .all<SessionRow>(
@@ -103,7 +117,7 @@ export class SessionRepo {
                 (SELECT COUNT(1) FROM messages m WHERE m.session_id = s.id) AS cnt,
                 COALESCE(b.persona_id, 0)  AS persona_id,
                 COALESCE(p.name, '')       AS persona_name,
-                COALESCE(b.target_name, '') AS target_name
+                COALESCE(NULLIF(s.name, ''), b.target_name, '') AS name
            FROM sessions s
            LEFT JOIN session_personas b ON b.session_id = s.id
            LEFT JOIN personas p         ON p.id = b.persona_id
@@ -118,9 +132,8 @@ export class SessionRepo {
         updated_at: new Date(Number(r.updated_at) * 1000),
         persona_id: Number(r.persona_id),
         persona_name: r.persona_name,
-        // 预设时存下的群名/昵称。会话真来过消息后，如果这里为空，
-        // 面板就退回显示号码——预设行不能因为"开口说话"就丢掉名字。
-        name: r.target_name === '' ? undefined : r.target_name,
+        // 两个来源都空时才让前端自己想办法（实时拉群/好友列表，再不行显示号码）
+        name: r.name === '' ? undefined : r.name,
       }));
   }
 

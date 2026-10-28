@@ -444,3 +444,45 @@ describe('按会话指定人格', () => {
     }
   });
 });
+
+describe('会话列表里的对话对象名字', () => {
+  const say = (content: string): Result => ({
+    content,
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    firstTokenMs: 1,
+  });
+
+  it('群聊记群名（复用算 {{group_name}} 时拉到的结果）', async () => {
+    const h = makeHarness({ llm: async () => say('好。') });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      const row = h.store.sessions.list()[0]!;
+      assert.equal(row.id, 'group:30000');
+      assert.equal(row.name, '测试群');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('私聊记对方昵称；拿不到就留空，不能拿 QQ 号当名字', async () => {
+    const h = makeHarness({ llm: async () => say('嗯。') });
+    try {
+      h.engine.handleEvent({
+        ...privateEv(20001, 1),
+        sender: { user_id: 20001, nickname: '小王', card: '', role: 'friend' },
+      });
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(h.store.sessions.list()[0]!.name, '小王');
+
+      // 事件里没有 sender 时（协议端没带），名字要留空而不是写成一串号码，
+      // 否则面板会出现「2083882365 / private:2083882365」的重复
+      h.engine.handleEvent(privateEv(20002, 2));
+      await waitFor(() => h.sent.length >= 2);
+      const anon = h.store.sessions.list().find((s) => s.id === 'private:20002')!;
+      assert.equal(anon.name, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+});

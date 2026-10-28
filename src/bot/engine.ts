@@ -301,7 +301,9 @@ export class Engine implements EnginePort {
     if (images.length > 0) system += `\n${VISION_HINT}`;
 
     try {
-      this.store.sessions.touch(sid, kindOf(ev), targetOf(ev));
+      // 名字只用于面板显示，拿不到就回空串（touch 不会因此擦掉旧值）。
+      // 群名在算 vars 时已经拉过一次，这里直接用缓存里的结果，不多发请求。
+      this.store.sessions.touch(sid, kindOf(ev), targetOf(ev), targetNameOf(ev, vars.groupName));
     } catch {
       // 会话表写入失败不该挡住回复
     }
@@ -711,6 +713,21 @@ function displayOf(ev: Event): string {
   if (s.card !== '') return s.card;
   if (s.nickname !== '') return s.nickname;
   return String(s.user_id);
+}
+
+/**
+ * 会话表里记的「对话对象名字」，只供面板显示。
+ *
+ * 群聊取群名（调用方传进来的是已经拉过的那次结果）；私聊取对方的
+ * 名片 / 昵称。注意这里跟 displayOf 的区别：拿不到名字时回空串，
+ * 不能退到 QQ 号——那会让面板显示「2083882365」再加一行「private:2083882365」，
+ * 同一个号码出现两遍，还不如干脆只显示 ID。
+ */
+function targetNameOf(ev: Event, groupName: string): string {
+  if (isGroup(ev)) return groupName;
+  const s = ev.sender;
+  if (!s) return '';
+  return s.card !== '' ? s.card : s.nickname;
 }
 
 /** 本地时间 "YYYY-MM-DD HH:mm"，对应 Go 的 Format("2006-01-02 15:04")。 */

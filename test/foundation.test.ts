@@ -87,13 +87,13 @@ test('generateToken/safeEqual', () => {
   assert.equal(safeEqual(t, t.slice(1)), false);
 });
 
-test('迁移幂等，且 user_version 为 4（v4 = 绑定补对话对象快照）', () => {
+test('迁移幂等，且 user_version 为 5（v5 = 会话记对话对象名字）', () => {
   const { store, dir } = tempDb();
-  assert.equal(store.db.userVersion(), 4);
+  assert.equal(store.db.userVersion(), 5);
   store.close();
   // 再打开一次：不应重复执行迁移，也不应报错
   const again = new Store(join(dir, 'qqbot.db'));
-  assert.equal(again.db.userVersion(), 4);
+  assert.equal(again.db.userVersion(), 5);
   again.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -318,6 +318,37 @@ test('预设人格：没产生过消息的对话对象也能绑，并留下名�
   // 解绑后 bindings 里不再有它（预设行随之从面板消失）
   store.personas.bind('group:7', 0);
   assert.equal(store.personas.bindings().length, 0);
+
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('会话名：说话时记下，空值不擦旧名，且优先于预设快照', () => {
+  const { store, dir } = tempDb();
+
+  // 收到群消息时把群名一起写进去
+  store.sessions.touch('group:9', 'group', 9, '夜猫子群');
+  assert.equal(store.sessions.list()[0]!.name, '夜猫子群');
+
+  // 某次 get_group_info 失败、传了空串：不能把名字清成空白，
+  // 否则列表会一夜之间从群名退化成一片号码
+  store.sessions.touch('group:9', 'group', 9);
+  assert.equal(store.sessions.list()[0]!.name, '夜猫子群');
+
+  // 群真改名了就换成新的
+  store.sessions.touch('group:9', 'group', 9, '夜猫子群（新）');
+  assert.equal(store.sessions.list()[0]!.name, '夜猫子群（新）');
+
+  // 预设快照只在会话自己没名字时兜底
+  const p = store.personas.upsert('quiet', '少说话');
+  store.personas.bind('group:10', p.id, { kind: 'group', name: '手填的名字' });
+  // group:10 还没有 sessions 行，此时只是预设行，不会出现在 list() 里
+  assert.equal(store.sessions.list().length, 1);
+  store.sessions.touch('group:10', 'group', 10);
+  assert.equal(store.sessions.list().find((s) => s.id === 'group:10')!.name, '手填的名字');
+  // 真拿到群名后以会话自己记的为准
+  store.sessions.touch('group:10', 'group', 10, '真的群名');
+  assert.equal(store.sessions.list().find((s) => s.id === 'group:10')!.name, '真的群名');
 
   store.close();
   rmSync(dir, { recursive: true, force: true });

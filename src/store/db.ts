@@ -109,6 +109,17 @@ const MIGRATIONS: string[] = [
   ALTER TABLE session_personas ADD COLUMN kind TEXT NOT NULL DEFAULT '';
   ALTER TABLE session_personas ADD COLUMN target_name TEXT NOT NULL DEFAULT '';
   `,
+  // v5：会话表记下对话对象的名字。
+  //
+  // 面板那一列原来显示 group:1101472600 / private:2083882365——号码对不上人，
+  // 群多了根本认不出哪个是哪个。名字有了着落：
+  //   群聊 → get_group_info（引擎算 {{group_name}} 时本来就拉过，缓存里现成）
+  //   私聊 → 消息发送者的名片 / 昵称
+  // 允许空串：老会话没有这个信息，行为退回升级前（显示号码）；
+  // 面板再拿 /api/groups + /api/friends 兜一次，协议端在线时也能补齐。
+  `
+  ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT '';
+  `,
 ];
 
 export class Db {

@@ -1238,7 +1238,9 @@
         <button class="btn ghost" data-act="toggle-preset">添加对话对象</button>
       </div>
       <div class="card" id="ss-preset" style="display:none">
-        <h3>给还没说过话的群 / 好友预设人格</h3>
+        <h3>给还没说过话的群 / 好友预设人格
+          <button class="btn ghost sm" data-act="cancel-preset">取消</button>
+        </h3>
         <div class="preset-form">
           <div class="cell">
             <span>筛选</span>
@@ -1268,19 +1270,34 @@
         <div class="chat" id="ss-chat"></div>
       </div>`;
 
-    // 这三份状态要在 load 与预设表单之间共享：候选人要知道哪些已经有会话了，
+    // 这几份状态要在 load 与预设表单之间共享：候选人要知道哪些已经有会话了，
     // 表格要知道人格清单。放在闭包里而不是每次重新取，是因为打开预设面板
     // 会连着调 /api/groups，协议端拉一次群列表可能要几百毫秒。
     let personas = [];
     let fallback = { id: 0, name: '' };
     let knownIds = new Set();
     let candidates = [];
+    // 会话行与「实时名字表」。sessions 里存的名字是说话那一刻记下的：
+    // 老会话没有，群改过名也还是旧的，所以再拉一次群/好友列表兜底。
+    // 拉不到（协议端离线）就静默用已有快照或号码——这一列不值得拖垮整页。
+    let rows = [];
+    let names = new Map();
+    let namesLoaded = false;
+
+    const nameOf = (s) => s.name || names.get(s.id) || '';
+    // 操作按钮上只挂了会话 ID，提示语/标题里想带名字得回表里查一次
+    const labelOf = (id) => {
+      const hit = rows.find((s) => s.id === id);
+      return hit ? nameOf(hit) : '';
+    };
 
     const rowOf = (s) => {
       const preset = s.preset === true;
-      // 预设行只有绑定表里的名字快照；没有名字（老数据、手填）就退回显示 ID
-      const who = s.name
-        ? `<div class="sess-name">${esc(s.name)}</div><div class="sess-id">${esc(s.id)}</div>`
+      const name = nameOf(s);
+      // 名字在上、号码在下：号码得留着——同名的群、改了备注的好友都可能撞上，
+      // 出问题时用户要能一眼抄出群号去查
+      const who = name
+        ? `<div class="sess-name" title="${esc(name)}">${esc(name)}</div><div class="sess-id">${esc(s.id)}</div>`
         : `<span class="mono">${esc(s.id)}</span>`;
       const acts = preset
         ? `<button class="btn ghost sm" data-act="unbind" data-id="${esc(s.id)}">取消预设</button>`
@@ -1296,19 +1313,9 @@
       </tr>`;
     };
 
-    const load = async () => {
-      // 人格清单和会话一起取：下拉里只有人名不够，没有选项时用户就不知道该建人格
-      const [d, dp] = await Promise.all([
-        api('/api/sessions'),
-        api('/api/personas').catch(() => ({ items: [] })),
-      ]);
+    const paint = () => {
       if (!$('#ss-list')) return; // 用户已经切走
-      const items = d.items || [];
-      personas = dp.items || [];
-      fallback = d.default_persona || { id: 0, name: '' };
-      knownIds = new Set(items.map((s) => s.id));
-      fillPersonas();
-      if (!items.length) {
+      if (!rows.length) {
         $('#ss-list').innerHTML =
           '<div class="empty">还没有任何会话。点右上角「添加对话对象」，可以给还没说过话的群或好友预设人格。</div>';
         return;
@@ -1316,8 +1323,48 @@
       $('#ss-list').innerHTML = `
         <table>
           <thead><tr><th>会话</th><th>类型</th><th>人格</th><th>消息数</th><th>最后活跃</th><th style="width:150px"></th></tr></thead>
-          <tbody>${items.map(rowOf).join('')}</tbody>
+          <tbody>${rows.map(rowOf).join('')}</tbody>
         </table>`;
+    };
+
+    const load = async () => {
+      // 人格清单和会话一起取：下拉里只有人名不够，没有选项时用户就不知道该建人格
+      const [d, dp] = await Promise.all([
+        api('/api/sessions'),
+        api('/api/personas').catch(() => ({ items: [] })),
+      ]);
+      if (!$('#ss-list')) return; // 用户已经切走
+      rows = d.items || [];
+      personas = dp.items || [];
+      fallback = d.default_persona || { id: 0, name: '' };
+      knownIds = new Set(rows.map((s) => s.id));
+      fillPersonas();
+      paint();
+      // 先画再补名字：拉群列表可能几百毫秒（协议端离线时更久），
+      // 放在渲染之前会让整张表跟着一起等
+      loadNames();
+    };
+
+    // 名字的兜底来源。只拉一次：这一页来回操作时不必反复问协议端。
+    const loadNames = async () => {
+      if (namesLoaded) return;
+      namesLoaded = true;
+      const [gs, fs] = await Promise.all([
+        api('/api/groups').catch(() => ({ items: [] })),
+        api('/api/friends').catch(() => ({ items: [] })),
+      ]);
+      const next = new Map();
+      for (const g of gs.items || []) {
+        if (g.group_name) next.set('group:' + g.group_id, g.group_name);
+      }
+      for (const f of fs.items || []) {
+        // 备注优先：自己起的备注比对方昵称好认，跟预设下拉的取法保持一致
+        const n = f.remark || f.nickname || '';
+        if (n) next.set('private:' + f.user_id, n);
+      }
+      if (!next.size) return;
+      names = next;
+      paint();
     };
 
     // 已加入的群 / 已加的好友，减去已经有会话的，剩下的就是可以预设的对象。
@@ -1408,6 +1455,14 @@
     });
 
     bindActions(el, {
+      // 标题右侧的「取消」：跟右上角那个「添加对话对象」是同一个开关的两头，
+      // 面板展开后按钮跑到了卡片里，用户不用再回到页头去找关闭的地方
+      'cancel-preset': () => {
+        $('#ss-preset').style.display = 'none';
+        // 手填框一并清掉：留着上次的号码，下次点开很容易直接按「指定」，
+        // 绑到的是上一个对象
+        $('#ss-manual').value = '';
+      },
       'toggle-preset': async () => {
         const box = $('#ss-preset');
         if (box.style.display !== 'none') {
@@ -1415,6 +1470,7 @@
           return;
         }
         box.style.display = '';
+        $('#ss-search').focus();
         if (candidates.length > 0) {
           // 之前拉过，但候选的"已有会话"状态可能已经变了（刚绑完就重开面板）
           renderTargets();
@@ -1474,8 +1530,9 @@
       },
       peek: async (btn) => {
         const id = btn.dataset.id;
+        const label = labelOf(id);
         $('#ss-detail').style.display = '';
-        $('#ss-detail-title').textContent = '对话记录 · ' + id;
+        $('#ss-detail-title').textContent = label ? `对话记录 · ${label}` : '对话记录 · ' + id;
         $('#ss-chat').innerHTML = '<div class="empty">加载中…</div>';
         try {
           const d = await api('/api/sessions/messages?id=' + encodeURIComponent(id) + '&limit=100');
@@ -1492,7 +1549,8 @@
       },
       clear: async (btn) => {
         const id = btn.dataset.id;
-        if (!confirm(`清空会话 ${id} 的全部上下文？此操作不可撤销。`)) return;
+        const label = labelOf(id);
+        if (!confirm(`清空${label ? `「${label}」` : ''}会话 ${id} 的全部上下文？此操作不可撤销。`)) return;
         try {
           await api('/api/sessions/clear', { method: 'POST', body: { id } });
           ok('已清空');

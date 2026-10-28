@@ -649,17 +649,19 @@ describe('会话与用量接口', () => {
   it('会话列表与消息查询', async () => {
     const h = await harness();
     try {
-      h.store.sessions.touch('group:1', 'group', 1);
+      h.store.sessions.touch('group:1', 'group', 1, '摸鱼群');
       h.store.sessions.append('group:1', 'user', '你好', 0);
       h.store.sessions.append('group:1', 'assistant', '你好呀', 0);
 
       const c = await authed(h);
       const list = (await (
         await fetch(`${h.base}/api/sessions`, { headers: { Cookie: c.header } })
-      ).json()) as { items: { id: string; messages: number }[] };
+      ).json()) as { items: { id: string; messages: number; name?: string }[] };
       assert.equal(list.items.length, 1);
       assert.equal(list.items[0]!.id, 'group:1');
       assert.equal(list.items[0]!.messages, 2);
+      // 名字要跟着回给前端，面板那一列才能显示「摸鱼群」而不是 group:1
+      assert.equal(list.items[0]!.name, '摸鱼群');
 
       const msgs = (await (
         await fetch(`${h.base}/api/sessions/messages?id=group%3A1`, { headers: { Cookie: c.header } })
