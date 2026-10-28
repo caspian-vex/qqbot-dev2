@@ -1285,6 +1285,8 @@ describe('会话级设置（按对话对象覆盖）', () => {
     kind: string;
     target_id: number;
     name: string;
+    persona_id: number;
+    default_persona: { id: number; name: string };
     overrides: Record<string, Record<string, unknown>>;
     global: Record<string, Record<string, unknown>>;
   }
@@ -1543,6 +1545,31 @@ describe('会话级设置（按对话对象覆盖）', () => {
       const row = list.items.find((s) => s.id === 'group:123');
       assert.equal(row?.overrides, true);
       assert.equal(row?.preset, undefined);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('一并回人格绑定与默认人格（面板在同一页改人格要用）', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const def = h.store.personas.active();
+
+      const before = await getCfg(h, c, 'group:321');
+      assert.equal(before.persona_id, 0, '没绑过就是 0，前端据此显示「跟随默认」');
+      assert.equal(before.default_persona.id, def.id);
+      assert.equal(before.default_persona.name, def.name);
+
+      const p = h.store.personas.upsert('傲娇', '哼。');
+      h.store.personas.bind('group:321', p.id, { kind: 'group', name: '测试群' });
+
+      const after = await getCfg(h, c, 'group:321');
+      assert.equal(after.persona_id, p.id);
+      // 绑定不该偷偷改全局 active —— 那会让所有没绑过的会话一起换人格
+      assert.equal(after.default_persona.id, def.id);
+      // 人格与六组覆盖是两套存储，互不干扰
+      assert.deepEqual(after.overrides, {});
     } finally {
       await h.stop();
     }

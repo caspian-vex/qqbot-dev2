@@ -142,7 +142,9 @@
     qq:       { title: '登录', icon: '⌁', view: viewQQ },
     network:  { title: '网络', icon: '⇄', view: viewNetwork },
     napcat:   { title: '协议端', icon: '⌗', view: viewNapcat },
-    settings: { title: '设置', icon: '⚙', view: viewSettings },
+    // 叫「全局设置」而不是「设置」：会话列表每行也有一个「设置」，
+    // 两个同名入口会让用户以为点哪个都一样，实际一个是全局、一个是单个会话。
+    settings: { title: '全局设置', icon: '⚙', view: viewSettings },
     pool:     { title: '图池', icon: '❏', view: viewPool },
     personas: { title: '人格', icon: '✦', view: viewPersonas },
     sessions: { title: '会话', icon: '☰', view: viewSessions },
@@ -512,8 +514,8 @@
   /* ================= 设置 ================= */
 
   function viewSettings(el) {
-    el.innerHTML = `<div class="page-head"><div><h2>设置</h2>
-      <div class="desc">模型接入与触发规则，保存后立即生效</div></div></div>
+    el.innerHTML = `<div class="page-head"><div><h2>全局设置</h2>
+      <div class="desc">模型接入与触发规则，对所有会话生效，保存后立即生效</div></div></div>
       <div id="set-body"><div class="empty">加载中…</div></div>`;
 
     Promise.all([
@@ -968,8 +970,14 @@
       </div>
       <div id="ss-body"><div class="empty">加载中…</div></div>`;
 
-    api('/api/sessions/settings?id=' + encodeURIComponent(id)).then((d) => {
+    Promise.all([
+      api('/api/sessions/settings?id=' + encodeURIComponent(id)),
+      // 人格清单：这个页面上也要能改人格，不能只回一个 id 没选项。
+      // 拉不到就退化成"只有跟随默认"——六组设置照样能改，不为此挡住整页。
+      api('/api/personas').catch(() => ({ items: [] })),
+    ]).then(([d, dp]) => {
       if (!$('#ss-body')) return; // 用户已经切走
+      const personas = dp.items || [];
 
       const ov = d.overrides || {};
       const gl = d.global || {};
@@ -980,8 +988,7 @@
 
       const head = $('#ss-head');
       if (head) {
-        head.innerHTML = `${d.name ? `<b>${esc(d.name)}</b> ` : ''}<span class="mono">${esc(id)}</span>
-          · 人格在 <a href="#/sessions">会话列表</a>那一列单独设置`;
+        head.innerHTML = `${d.name ? `<b>${esc(d.name)}</b> ` : ''}<span class="mono">${esc(id)}</span>`;
       }
 
       const botVal = st.bot.val;
@@ -991,7 +998,31 @@
       const srVal = st.search.val;
       const ctxVal = st.context.val;
 
+      // 人格不是"覆盖"，天然就是按会话的，所以它没有「本会话单独设置」开关
+      // ——打开这个页面的前提就是"只改这一个对象"，再套一层开关没有意义。
+      const def = d.default_persona || { id: 0, name: '' };
+      const pOn = (v) => (Number(d.persona_id) === Number(v) ? ' selected' : '');
+      // 当前默认人格不进候选：它已经由「跟随默认」表达了，重复一项只会让人
+      // 选错——而"显式绑到默认人格"是个陷阱：将来全局默认换人，这个会话
+      // 还锁在旧人格上，界面上却看不出自己已经从"跟随"变成了"锁定"。
+      const pOpts = [
+        `<option value="0"${pOn(0)}>跟随默认${def.name ? `（${esc(def.name)}）` : ''}</option>`,
+        ...personas
+          .filter((x) => Number(x.id) !== Number(def.id))
+          .map((x) => `<option value="${x.id}"${pOn(x.id)}>${esc(x.name)}</option>`),
+      ].join('');
+
       $('#ss-body').innerHTML =
+        `<div class="card">
+          <h3>人格 <span class="hint">这个对话对象用哪套提示词</span></h3>
+          <div class="grid c2">
+            <div class="field">
+              <label>使用的人格</label>
+              <select id="ss-persona" aria-label="该会话使用的人格">${pOpts}</select>
+              <div class="note">改完即时生效，不用点下面的保存。选「跟随默认」就回到全局启用的那个人格。</div>
+            </div>
+          </div>
+        </div>` +
         ovrCard('bot', ovrBotBody(botVal, gl.bot || {}), st) +
         ovrCard('proactive', ovrProactiveBody(proVal), st) +
         ovrCard('images', `
@@ -1043,13 +1074,21 @@
           }
         },
         'ovr-reset': async (btn) => {
-          if (!confirm('这个会话的独立设置会全部清空，之后完全跟随全局。确定？')) return;
+          if (!confirm('这个会话的独立设置会全部清空，人格也回到跟随默认。确定？')) return;
           btn.disabled = true;
           try {
             await api('/api/sessions/settings', {
               method: 'PUT',
               body: { id, name: d.name || '', overrides: {} },
             });
+            // 人格一并解绑：按钮叫「恢复跟随全局」，只清六组却把人留在原地，
+            // 用户会以为没恢复干净，还得自己再去上面改一次下拉。
+            if (Number(d.persona_id) > 0) {
+              await api('/api/sessions/persona', {
+                method: 'POST',
+                body: { id, persona_id: 0, name: d.name || '' },
+              });
+            }
             ok('已恢复跟随全局');
             route();
           } catch (e) {
@@ -1058,6 +1097,30 @@
           }
         },
       });
+
+      // 人格走独立接口（不属于那六组覆盖），改完立即提交——与原来在会话列表
+      // 改下拉是同一个行为，用户不必再点一次「保存本会话设置」。
+      const psel = $('#ss-persona');
+      if (psel) {
+        psel.addEventListener('change', async () => {
+          const pid = Number(psel.value);
+          psel.disabled = true;
+          try {
+            await api('/api/sessions/persona', {
+              method: 'POST',
+              body: { id, persona_id: pid, name: d.name || '' },
+            });
+            d.persona_id = pid;
+            ok(pid === 0 ? '已改为跟随默认人格' : '已为该会话指定人格');
+          } catch (e) {
+            bad(e.message);
+            // 拨回真实状态：不回拉整页，省一次请求也不会丢用户勾好的六组开关
+            psel.value = String(Number(d.persona_id) || 0);
+          } finally {
+            psel.disabled = false;
+          }
+        });
+      }
 
       // 勾选只切 disabled，不清值：再勾上还是刚才那套数，
       // 从全局重新复制会把用户手改到一半的调整凭空抹掉。
@@ -1523,19 +1586,9 @@
     return sameDay ? hm : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
   }
 
-  // 会话 → 人格的下拉。value=0 表示"跟随默认"，也就是全局启用的那个人格。
-  function personaPick(s, personas, fallback) {
-    const on = (v) => (Number(s.persona_id) === Number(v) ? ' selected' : '');
-    const opts = [
-      `<option value="0"${on(0)}>跟随默认${fallback.name ? `（${esc(fallback.name)}）` : ''}</option>`,
-      ...personas.map((p) => `<option value="${p.id}"${on(p.id)}>${esc(p.name)}</option>`),
-    ];
-    return `<select class="sel" data-sess="${esc(s.id)}" aria-label="该会话使用的人格">${opts.join('')}</select>`;
-  }
-
   function viewSessions(el) {
     el.innerHTML = `<div class="page-head">
-        <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录；每个对话对象可以单独指定人格</div></div>
+        <div><h2>会话</h2><div class="desc">群聊与私聊的上下文记录。每行的「设置」里可以单独指定人格与各项规则</div></div>
         <button class="btn ghost" data-act="toggle-preset">添加对话对象</button>
       </div>
       <div class="card" id="ss-preset" style="display:none">
@@ -1557,7 +1610,7 @@
           </div>
           <button class="btn" data-act="save-preset">指定</button>
         </div>
-        <p class="note" id="ss-preset-note">列表里只有还没产生过消息的对象；已经在下面会话表里的，直接改那一行的人格即可。</p>
+        <p class="note" id="ss-preset-note">列表里只有还没产生过消息的对象；已经有会话的，点那一行的「设置」就行。</p>
         <div class="preset-form">
           <div class="cell">
             <span>手动填写会话 ID（列表里找不到时用）</span>
@@ -1575,7 +1628,6 @@
     // 表格要知道人格清单。放在闭包里而不是每次重新取，是因为打开预设面板
     // 会连着调 /api/groups，协议端拉一次群列表可能要几百毫秒。
     let personas = [];
-    let fallback = { id: 0, name: '' };
     let knownIds = new Set();
     let candidates = [];
     // 会话行与「实时名字表」。sessions 里存的名字是说话那一刻记下的：
@@ -1612,7 +1664,6 @@
       return `<tr>
         <td>${who}</td>
         <td>${s.kind === 'group' ? '<span class="tag">群聊</span>' : '<span class="tag">私聊</span>'}</td>
-        <td>${personaPick(s, personas, fallback)}</td>
         <td class="dim">${preset ? '—' : fmtInt(s.messages)}</td>
         <td class="dim nowrap">${preset ? '<span class="tag on">尚未对话</span>' : esc(fmtTime(s.updated_at))}</td>
         <td class="nowrap">${acts}</td>
@@ -1628,7 +1679,7 @@
       }
       $('#ss-list').innerHTML = `
         <table>
-          <thead><tr><th>会话</th><th>类型</th><th>人格</th><th>消息数</th><th>最后活跃</th><th style="width:230px"></th></tr></thead>
+          <thead><tr><th>会话</th><th>类型</th><th>消息数</th><th>最后活跃</th><th style="width:240px"></th></tr></thead>
           <tbody>${rows.map(rowOf).join('')}</tbody>
         </table>`;
     };
@@ -1642,7 +1693,6 @@
       if (!$('#ss-list')) return; // 用户已经切走
       rows = d.items || [];
       personas = dp.items || [];
-      fallback = d.default_persona || { id: 0, name: '' };
       knownIds = new Set(rows.map((s) => s.id));
       fillPersonas();
       paint();
@@ -1688,7 +1738,7 @@
       );
       if (!avail.length) {
         sel.innerHTML = `<option value="">${
-          candidates.length ? '都已有会话了，可直接改下面表里的人格' : '没有可用对象'
+          candidates.length ? '都已有会话了，点那一行的「设置」即可改' : '没有可用对象'
         }</option>`;
         return;
       }
@@ -1741,24 +1791,6 @@
     };
     $('#ss-search').addEventListener('input', renderTargets);
 
-
-    // 下拉是 change 而不是 click，bindActions 只管点击，这里单独委托一次。
-    // 挂在 el 上：路由切页会换掉整个 main，监听器跟着走，不会累积。
-    el.addEventListener('change', async (e) => {
-      const sel = e.target.closest('select[data-sess]');
-      if (!sel) return;
-      const id = sel.dataset.sess;
-      const pid = Number(sel.value);
-      sel.disabled = true;
-      try {
-        await api('/api/sessions/persona', { method: 'POST', body: { id, persona_id: pid } });
-        ok(pid === 0 ? '已改为跟随默认人格' : '已为该会话指定人格');
-        await load();
-      } catch (err) {
-        bad(err.message);
-        await load(); // 失败时把下拉拨回真实状态
-      }
-    });
 
     bindActions(el, {
       // 进这个会话的独立设置页。id 含冒号，必须编码后再拼进 hash，

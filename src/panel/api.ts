@@ -889,11 +889,27 @@ export class Api {
     // 幽灵，实际是并集每次都把他加回来。
     const overrides = normalizeOverrides(stored ?? {}, global);
 
+    // 人格也在这个页面上改，所以一并回当前绑定（0 = 跟随默认）与默认人格名。
+    // 只回 id/name，不回 system_prompt —— 那玩意儿单条能有几十 KB，
+    // 塞进一个只为填下拉的响应里毫无意义。
+    let personaId = 0;
+    let fallback = { id: 0, name: '' };
+    try {
+      personaId = this.store.personas.bindingOf(id);
+      const a = this.store.personas.active();
+      fallback = { id: a.id, name: a.name };
+    } catch (e) {
+      // 人格读不到不该让整页打不开：六组设置照样能看能改
+      this.d.log.warn('读取会话人格失败', { id, err: e });
+    }
+
     writeJSON(ctx.res, 200, {
       id,
       kind: parsed.kind,
       target_id: parsed.targetId,
       name: this.nameOf(id),
+      persona_id: personaId,
+      default_persona: fallback,
       overrides,
       global: pickGroups(global),
     });
