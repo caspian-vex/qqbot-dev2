@@ -276,19 +276,39 @@ describe('回声式跟进链路', () => {
     }
   });
 
-  it('日限额用尽后，其他会话也不再跟进', async () => {
+  it('同一会话的日限额用尽后不再跟进', async () => {
+    const h = makeHarness({ echo_daily_limit: 1 });
+    const g = (mid: number): Event =>
+      ev({ message_type: 'group', group_id: 30000, user_id: 20000, message_id: mid });
+    try {
+      h.engine.handleEvent(g(1));
+      await waitFor(() => h.sent.length >= 2, 3000);
+      assert.equal(h.sent[1]!.texts[0], '对了，刚才那个事后来怎么样了？');
+
+      // 同一会话第二条：回复照常，跟进被本会话额度拦住
+      h.engine.handleEvent(g(2));
+      await waitFor(() => h.sent.length >= 3, 3000);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(h.sent.length, 3, '额度用尽后不应再跟进');
+      assert.equal(h.engine.pendingEchoCount(), 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('日限额按会话各自计算：一个会话用尽不影响另一个', async () => {
+    // 曾经是全局累计：群 1 用掉额度，私聊也跟着哑掉。改成按会话之后，
+    // 用户才能"这个群多补几句、那个群少补几句"，覆盖才像真的生效。
     const h = makeHarness({ echo_daily_limit: 1 });
     try {
       h.engine.handleEvent(ev({ user_id: 20000 }));
       await waitFor(() => h.sent.length >= 2, 3000);
       assert.equal(h.sent[1]!.texts[0], '对了，刚才那个事后来怎么样了？');
 
-      // 第二个会话的回复照常，但跟进被全局限额拦住
+      // 另一个会话有自己的额度，照常跟进
       h.engine.handleEvent(ev({ user_id: 20001, message_id: 2 }));
-      await waitFor(() => h.sent.length >= 3);
-      await new Promise((r) => setTimeout(r, 100));
-      assert.equal(h.sent.length, 3, '限额后不应再有跟进');
-      assert.equal(h.engine.pendingEchoCount(), 0);
+      await waitFor(() => h.sent.length >= 4, 3000);
+      assert.equal(h.sent[3]!.texts[0], '对了，刚才那个事后来怎么样了？', '第二个会话应拿到自己的额度');
     } finally {
       h.cleanup();
     }

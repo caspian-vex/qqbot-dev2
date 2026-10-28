@@ -1265,3 +1265,305 @@ describe('联网搜索的设置', () => {
     }
   });
 });
+
+describe('会话级设置（按对话对象覆盖）', () => {
+  /** 带 CSRF 的 PUT /api/sessions/settings。 */
+  async function putCfg(
+    h: Awaited<ReturnType<typeof harness>>,
+    c: { header: string; csrf: string },
+    body: unknown,
+  ): Promise<Response> {
+    return fetch(`${h.base}/api/sessions/settings`, {
+      method: 'PUT',
+      headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+      body: JSON.stringify(body),
+    });
+  }
+
+  interface CfgResp {
+    id: string;
+    kind: string;
+    target_id: number;
+    name: string;
+    overrides: Record<string, Record<string, unknown>>;
+    global: Record<string, Record<string, unknown>>;
+  }
+
+  async function getCfg(
+    h: Awaited<ReturnType<typeof harness>>,
+    c: { header: string },
+    id: string,
+  ): Promise<CfgResp> {
+    const res = await fetch(`${h.base}/api/sessions/settings?id=${encodeURIComponent(id)}`, {
+      headers: { Cookie: c.header },
+    });
+    assert.equal(res.status, 200);
+    return (await res.json()) as CfgResp;
+  }
+
+  /** 改全局设置（走真实接口，顺带证明两边不打架）。 */
+  async function putGlobal(
+    h: Awaited<ReturnType<typeof harness>>,
+    c: { header: string; csrf: string },
+    patch: unknown,
+  ): Promise<void> {
+    const res = await fetch(`${h.base}/api/settings`, {
+      method: 'PUT',
+      headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+      body: JSON.stringify(patch),
+    });
+    assert.equal(res.status, 200, await res.text());
+  }
+
+  it('鉴权：未登录 401，缺 CSRF 403', async () => {
+    const h = await harness();
+    try {
+      const anonGet = await fetch(`${h.base}/api/sessions/settings?id=group:1`);
+      assert.equal(anonGet.status, 401);
+
+      const c = await authed(h);
+      const noCsrf = await fetch(`${h.base}/api/sessions/settings`, {
+        method: 'PUT',
+        headers: { Cookie: c.header, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'group:1', overrides: {} }),
+      });
+      assert.equal(noCsrf.status, 403);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('会话 ID 格式必须严格', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const msg = '会话 ID 格式应为 group:群号 或 private:QQ号';
+      // 空 ID 走的是另一条文案：GET 当成格式错，PUT 明确说"不能为空"
+      const cases: [string, string, string][] = [
+        ['', msg, '会话 ID 不能为空'],
+        ['group:abc', msg, msg],
+        ['foo:1', msg, msg],
+        ['private:0', msg, msg],
+        ['group', msg, msg],
+      ];
+      for (const [id, getMsg, putMsg] of cases) {
+        const got = await fetch(`${h.base}/api/sessions/settings?id=${encodeURIComponent(id)}`, {
+          headers: { Cookie: c.header },
+        });
+        assert.equal(got.status, 400, id);
+        assert.deepEqual(await got.json(), { error: getMsg });
+
+        const put = await putCfg(h, c, { id, overrides: {} });
+        assert.equal(put.status, 400, id);
+        assert.deepEqual(await put.json(), { error: putMsg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('白名单外的组与字段一律 400，不静默丢弃', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ id: 'group:1', overrides: { llm: { model: 'x' } } }, '不支持的设置组：llm'],
+        [{ id: 'group:1', overrides: { panel: {} } }, '不支持的设置组：panel'],
+        // 队列级参数与部署级总闸不能按会话设
+        [{ id: 'group:1', overrides: { bot: { max_concurrent: 5 } } }, '「触发规则」不支持按会话设置的字段：max_concurrent'],
+        [{ id: 'group:1', overrides: { bot: { whitelist_groups: [1] } } }, '「触发规则」不支持按会话设置的字段：whitelist_groups'],
+        // 类型错要报出来：默默丢组会让用户以为保存成功了
+        [{ id: 'group:1', overrides: { bot: { passive_rate: '0.5' } } }, '「触发规则」的 passive_rate 取值类型不正确'],
+        [{ id: 'group:1', overrides: { bot: [1, 2] } }, '「触发规则」格式错误'],
+        [{ id: 'group:1', overrides: [1] }, '会话设置格式错误'],
+      ];
+      for (const [payload, msg] of cases) {
+        const res = await putCfg(h, c, payload);
+        assert.equal(res.status, 400, JSON.stringify(payload));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('范围校验复用全局那一套文案', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ bot: { passive_rate: 2 } }, '被动接话概率应在 0-1 之间'],
+        [{ context: { max_turns: 51 } }, '上下文轮数应在 0-50 之间'],
+        [{ vision: { max_images: 9 } }, '单条消息识图上限应在 1-4 张之间'],
+        [{ proactive: { echo_rate: 2 } }, '跟进概率应在 0-1 之间'],
+        [{ search: { max_calls: 9 } }, '每条消息最多搜几次应在 1-3 之间'],
+      ];
+      for (const [overrides, msg] of cases) {
+        const res = await putCfg(h, c, { id: 'group:1', overrides });
+        assert.equal(res.status, 400, JSON.stringify(overrides));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('没有覆盖时回全局值；写入后组内字段是全量', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const empty = await getCfg(h, c, 'group:123');
+      assert.deepEqual(empty.overrides, {});
+      assert.deepEqual(Object.keys(empty.global).sort(), ['bot', 'context', 'images', 'proactive', 'search', 'vision']);
+      assert.equal(typeof empty.global.bot!.passive_rate, 'number');
+
+      // 只传一个字段：服务端补成全量，引擎才不会读到 undefined
+      const res = await putCfg(h, c, { id: 'group:123', overrides: { context: { max_turns: 3 } } });
+      assert.equal(res.status, 200);
+
+      const got = await getCfg(h, c, 'group:123');
+      const ctx = got.overrides.context!;
+      assert.equal(ctx.max_turns, 3);
+      assert.equal(ctx.token_budget, empty.global.context!.token_budget, '缺的字段用全局补齐');
+      assert.deepEqual(Object.keys(ctx).sort(), ['max_turns', 'token_budget']);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('全局改完，会话覆盖仍然生效', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      assert.equal((await putCfg(h, c, { id: 'group:123', overrides: { bot: { passive_rate: 0.05 } } })).status, 200);
+      await putGlobal(h, c, { bot: { passive_rate: 0.9 } });
+
+      assert.equal((await getCfg(h, c, 'group:123')).overrides.bot!.passive_rate, 0.05);
+      // 没覆盖的会话跟着全局走
+      assert.equal((await getCfg(h, c, 'group:456')).global.bot!.passive_rate, 0.9);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('回显黑名单是存储原值，不是并集（否则全局名单删不掉）', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      await putGlobal(h, c, { bot: { blacklist_users: [7] } });
+      await putCfg(h, c, { id: 'group:123', overrides: { bot: { blacklist_users: [8] } } });
+
+      const got = await getCfg(h, c, 'group:123');
+      assert.deepEqual(got.overrides.bot!.blacklist_users, [8], '回并集会让用户以为删掉了 7');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('传空覆盖等于恢复跟随全局，且可重复调用', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      await putCfg(h, c, { id: 'group:123', overrides: { context: { max_turns: 1 } } });
+      assert.equal(h.store.sessionSettings.count(), 1);
+
+      assert.equal((await putCfg(h, c, { id: 'group:123', overrides: {} })).status, 200);
+      assert.equal(h.store.sessionSettings.count(), 0);
+      assert.deepEqual((await getCfg(h, c, 'group:123')).overrides, {});
+
+      // 幂等：再调一次还是 200
+      assert.equal((await putCfg(h, c, { id: 'group:123', overrides: {} })).status, 200);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('保存设置不会凭空造出会话行（否则列表里会有两条同名记录）', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      await putCfg(h, c, { id: 'group:987654321', name: '夜猫子群', overrides: { context: { max_turns: 2 } } });
+
+      const sessions = h.store.db.get<{ n: number }>(`SELECT COUNT(1) AS n FROM sessions`);
+      assert.equal(Number(sessions!.n), 0, 'sessions 行只在收到消息时才建');
+
+      const list = (await (
+        await fetch(`${h.base}/api/sessions`, { headers: { Cookie: c.header } })
+      ).json()) as { items: { id: string; preset?: boolean; overrides?: boolean; messages: number; name?: string }[] };
+      const rows = list.items.filter((s) => s.id === 'group:987654321');
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]!.preset, true);
+      assert.equal(rows[0]!.overrides, true);
+      assert.equal(rows[0]!.messages, 0);
+      assert.equal(rows[0]!.name, '夜猫子群');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('人格绑定与设置覆盖指向同一会话时只出一行', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const p = h.store.personas.upsert('coder', 'you write code');
+      await fetch(`${h.base}/api/sessions/persona`, {
+        method: 'POST',
+        headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+        body: JSON.stringify({ id: 'private:2083882365', persona_id: p.id, name: '老王' }),
+      });
+      await putCfg(h, c, { id: 'private:2083882365', overrides: { vision: { enabled: false } } });
+
+      const list = (await (
+        await fetch(`${h.base}/api/sessions`, { headers: { Cookie: c.header } })
+      ).json()) as {
+        items: { id: string; preset?: boolean; overrides?: boolean; persona_id: number; persona_name: string; name?: string }[];
+      };
+      const rows = list.items.filter((s) => s.id === 'private:2083882365');
+      assert.equal(rows.length, 1, '两个来源必须合并，否则列表里是两条一样的记录');
+      assert.equal(rows[0]!.preset, true);
+      assert.equal(rows[0]!.overrides, true);
+      assert.equal(rows[0]!.persona_id, p.id);
+      assert.equal(rows[0]!.persona_name, 'coder');
+      assert.equal(rows[0]!.name, '老王');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('有消息的会话也会标记「独立」', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      h.store.sessions.touch('group:123', 'group', 123, '老群');
+      await putCfg(h, c, { id: 'group:123', overrides: { context: { max_turns: 2 } } });
+
+      const list = (await (
+        await fetch(`${h.base}/api/sessions`, { headers: { Cookie: c.header } })
+      ).json()) as { items: { id: string; preset?: boolean; overrides?: boolean }[] };
+      const row = list.items.find((s) => s.id === 'group:123');
+      assert.equal(row?.overrides, true);
+      assert.equal(row?.preset, undefined);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('写入与重置都留审计，detail 带会话与组名', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      await putCfg(h, c, { id: 'group:123', overrides: { context: { max_turns: 2 }, vision: { enabled: false } } });
+      const saved = h.store.audit.list(10).find((a) => a.action === 'session.settings');
+      assert.ok(saved);
+      assert.ok(saved.detail.includes('group:123'));
+      assert.ok(saved.detail.includes('上下文'));
+      assert.ok(saved.detail.includes('图片识别'));
+
+      await putCfg(h, c, { id: 'group:123', overrides: {} });
+      const reset = h.store.audit.list(10).find((a) => a.action === 'session.settings');
+      assert.ok(reset!.detail.includes('default(global)'));
+    } finally {
+      await h.stop();
+    }
+  });
+});

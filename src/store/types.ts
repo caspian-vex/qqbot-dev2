@@ -47,7 +47,13 @@ export interface ProactiveSettings {
   echo_max_sec: number;
   /** 同一会话两次跟进的最小间隔（分钟），0 表示不限制。 */
   echo_cooldown_min: number;
-  /** 全局每日跟进上限（跨会话累计），防刷屏与风控的硬闸。 */
+  /**
+   * 本会话每日跟进上限，防刷屏与风控的硬闸。
+   *
+   * 曾经是"全局累计"，改成按会话之后才能按会话覆盖——否则群 1 把上限
+   * 调到 20 会吃掉私聊的额度，用户看到的是"我明明设了 20，第三条就不补了"，
+   * 覆盖像是没生效。总量另有进程级硬顶兜底（引擎的 ECHO_DAILY_HARD_CAP）。
+   */
   echo_daily_limit: number;
 }
 
@@ -337,6 +343,13 @@ export interface SessionInfo {
    * 也是 0 条消息，但会话本身是存在的，能查看能清空。
    */
   preset?: boolean;
+  /**
+   * 这个会话是否有一套自己的设置（session_settings 里有行）。
+   *
+   * 只用于列表上标"独立"，不参与引擎判断——引擎每次自己去解析，
+   * 不看这个标记（否则列表读慢一点就会影响回复行为）。
+   */
+  overrides?: boolean;
 }
 
 /** 某一天的用量汇总。 */

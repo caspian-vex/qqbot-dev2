@@ -15,6 +15,7 @@ import type { Logger } from '../log/logger';
 import type { BotStatus, EnginePort, EngineStats } from '../panel/ports';
 import { build as buildSystem, emptyVars, expand } from '../persona';
 import type { Store } from '../store';
+import { resolveSettings, type SessionOverrides } from '../store/overrides';
 import type { Settings } from '../store/types';
 import { sessionId } from '../store/types';
 import { isPeak, localDay, rfc3339, ZERO_TIME } from '../util/time';
@@ -84,6 +85,16 @@ export interface EngineOptions {
  */
 const SEARCH_MAX_ROUNDS = 3;
 
+/**
+ * 进程级每日跟进硬顶，不可配置。
+ *
+ * proactive.echo_daily_limit 改成按会话累计之后，总量上限就变成了
+ * Σ(各会话上限)：一个把 20 个群都开成 10 条/天的配置就是 200 条主动消息/天，
+ * 风控风险被一次配置放大。这道闸不上面板——正常用（几个群、几条）
+ * 永远碰不到，碰到的人本来也不该那么发。
+ */
+const ECHO_DAILY_HARD_CAP = 100;
+
 interface Counters {
   received: number;
   replied: number;
@@ -118,8 +129,17 @@ export class Engine implements EnginePort {
   private readonly pendingEcho = new Map<string, PendingEcho>();
   /** 最近一次实际发出跟进的时间（毫秒），用于会话冷却。 */
   private readonly echoSentAt = new Map<string, number>();
-  /** 今日已发跟进条数；跨天在 rollEchoDay 里清零。进程重启即归零，方向是保守的。 */
-  private echoCount = 0;
+  /**
+   * 各会话今日已发跟进条数。
+   *
+   * 曾经是进程级单值（跨会话累计）。改成按会话，是因为日限可以按会话覆盖了：
+   * 共享计数会让群 1 调大的上限吃掉私聊的额度，用户看到的是"我明明设了 20，
+   * 第三条就不补了"，覆盖像是没生效。
+   */
+  private readonly echoCount = new Map<string, number>();
+  /** 今日全进程已发总数，只服务于 ECHO_DAILY_HARD_CAP。 */
+  private echoTotal = 0;
+  /** 进程重启即归零，方向是保守的。 */
   private echoDay = localDay();
 
   private selfId = 0;
@@ -202,13 +222,17 @@ export class Engine implements EnginePort {
       return;
     }
 
+    // sid 必须在这里就算出来：设置要按会话取，得先知道是哪个会话。
+    // kindOf/targetOf 是纯函数，提前算没有副作用；下面 cancelEcho 本来也要它。
+    const sid = sessionKey(ev);
+
     // 用户有新消息，之前排的跟进立刻作废——
     // 否则会出现"对方刚开口，机器人却先补上一句刚才的茬"的错位
-    this.cancelEcho(sessionKey(ev));
+    this.cancelEcho(sid);
 
     let settings: Settings;
     try {
-      settings = this.store.settings.get();
+      settings = this.resolveFor(sid);
     } catch (e) {
       this.log.error('读取设置失败', { err: e });
       this.counters.errors++;
@@ -229,18 +253,35 @@ export class Engine implements EnginePort {
     // 同一会话串行，跨会话并发。
     // 并发上限来自设置（面板「最大并发会话」），这里每次同步一次，
     // 改完立即生效；不这么做的话那个输入框就是个摆设。
+    // 注意它永远是全局值：resolveSettings 不会让会话覆盖它（队列是进程共享的）。
     this.queue.setConcurrency(settings.bot.max_concurrent);
-    const key = sessionKey(ev);
-    const accepted = this.queue.submit(key, () => this.reply(ev, settings, decision));
+    const accepted = this.queue.submit(sid, () => this.reply(ev, settings, decision, sid));
     if (!accepted) {
       this.counters.dropped++;
-      this.log.warn('会话排队已满，丢弃本次回复', { session: key });
+      this.log.warn('会话排队已满，丢弃本次回复', { session: sid });
     }
+  }
+
+  /**
+   * 该会话实际生效的设置 = 全局 + 会话覆盖。
+   *
+   * 覆盖读失败按全局跑：一条手改坏的记录不该让机器人从此在这个群里失语。
+   * 全局设置读失败则照旧上抛，由调用方计数——那是真故障，掩盖它更糟。
+   */
+  private resolveFor(sid: string): Settings {
+    const global = this.store.settings.get();
+    let ov: SessionOverrides | null = null;
+    try {
+      ov = this.store.sessionSettings.get(sid);
+    } catch (e) {
+      this.log.warn('读取会话设置失败，按全局设置处理', { session: sid, err: e });
+    }
+    return resolveSettings(global, ov);
   }
 
   // ---- 回复链路 ----
 
-  private async reply(ev: Event, settings: Settings, d: Decision): Promise<void> {
+  private async reply(ev: Event, settings: Settings, d: Decision, sid: string): Promise<void> {
     const rawText = d.text.trim();
 
     // 先把图取回来。任何一张读不到都只是"少一张"，不能升级成整条回复失败；
@@ -293,8 +334,8 @@ export class Engine implements EnginePort {
 
     let personaPrompt: string;
     // 人格按会话取，不是全局单例：同一个人在不同群里可以是不同角色。
-    // 会话 ID 在这里就得算出来——下面 touch 会话表用的也是它，提前算没有副作用。
-    const sid = sessionId(kindOf(ev), targetOf(ev));
+    // sid 由调用方传入（handleMessage 里已经算过）：两处各算一次会变成
+    // "读的是 A 的设置、写的是 B 的历史"，而且将来改 targetOf 必漏一个。
     try {
       personaPrompt = this.store.personas.forSession(sid).system_prompt;
     } catch (e) {
@@ -619,10 +660,13 @@ export class Engine implements EnginePort {
   /** 回复成功后按概率排一个延迟跟进。 */
   private scheduleEcho(sid: string, kind: string, target: number, s: Settings): void {
     this.rollEchoDay();
+    // 排定时就判一次硬顶：省得白挂一个几分钟后才被丢掉的定时器。
+    // 权威判断在执行时（见 runEcho）。
+    if (this.echoTotal >= ECHO_DAILY_HARD_CAP) return;
     const cdMs = Math.max(0, s.proactive.echo_cooldown_min) * 60_000;
     const last = this.echoSentAt.get(sid) ?? 0;
     const ok = shouldEcho(s.proactive, {
-      sentToday: this.echoCount,
+      sentToday: this.echoCount.get(sid) ?? 0,
       cooldownOk: cdMs === 0 || last === 0 || Date.now() - last >= cdMs,
     });
     if (!ok) return;
@@ -653,7 +697,9 @@ export class Engine implements EnginePort {
 
     let settings: Settings;
     try {
-      settings = this.store.settings.get();
+      // 必须用执行时的会话设置复查：从排定到执行可能隔了几分钟，
+      // 期间用户完全可能在面板上把某个群的主动发言关掉。
+      settings = this.resolveFor(sid);
     } catch {
       return;
     }
@@ -663,7 +709,8 @@ export class Engine implements EnginePort {
     const cdMs = Math.max(0, p.echo_cooldown_min) * 60_000;
     const last = this.echoSentAt.get(sid) ?? 0;
     if (!p.echo_enabled) return;
-    if (p.echo_daily_limit <= 0 || this.echoCount >= p.echo_daily_limit) return;
+    if (this.echoTotal >= ECHO_DAILY_HARD_CAP) return;
+    if (p.echo_daily_limit <= 0 || (this.echoCount.get(sid) ?? 0) >= p.echo_daily_limit) return;
     if (cdMs > 0 && last !== 0 && Date.now() - last < cdMs) return;
 
     let personaPrompt: string;
@@ -714,7 +761,8 @@ export class Engine implements EnginePort {
 
       this.ctx.record(sid, 'assistant', echoText, estimateTokens(echoText));
       this.echoSentAt.set(sid, Date.now());
-      this.echoCount++;
+      this.echoCount.set(sid, (this.echoCount.get(sid) ?? 0) + 1);
+      this.echoTotal++;
       this.log.info('已跟进', { session: sid, segments: segs.length });
     } catch (e) {
       // 跟进是锦上添花：失败不重试、不兜底、不记 error
@@ -757,7 +805,10 @@ export class Engine implements EnginePort {
     const day = localDay();
     if (day !== this.echoDay) {
       this.echoDay = day;
-      this.echoCount = 0;
+      // 两个都要清：漏掉 Map 会让用过的群从此不再跟进（计数永远停在昨天的值），
+      // 而日志里只看得到 shouldEcho=false，完全看不出原因。
+      this.echoCount.clear();
+      this.echoTotal = 0;
     }
   }
 

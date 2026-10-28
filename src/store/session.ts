@@ -96,10 +96,18 @@ export class SessionRepo {
     });
   }
 
+  /**
+   * 删会话：消息、会话行、以及这一套独立的设置。
+   *
+   * 设置必须一起删。否则同一个人/群再开口时会建一条新会话，几个月前
+   * 那套覆盖会悄悄复活——而用户以为自己早清干净了，只会觉得"这机器人
+   * 怎么突然不听全局设置了"。
+   */
   delete(sessionID: string): void {
     this.db.tx(() => {
       this.db.run(`DELETE FROM messages WHERE session_id = ?`, sessionID);
       this.db.run(`DELETE FROM sessions WHERE id = ?`, sessionID);
+      this.db.run(`DELETE FROM session_settings WHERE session_id = ?`, sessionID);
     });
   }
 

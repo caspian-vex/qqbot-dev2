@@ -100,6 +100,9 @@ export class PanelServer {
     r.add('GET', '/api/sessions/messages', this.wrap((c) => a.sessionMessages(c), false));
     r.add('POST', '/api/sessions/clear', this.wrap((c, s) => a.clearSession(c, s), true));
     r.add('POST', '/api/sessions/persona', this.wrap((c) => a.bindSessionPersona(c), true));
+    // 会话级设置：按对话对象覆盖触发规则/主动发言/图池/识图/搜索/上下文
+    r.add('GET', '/api/sessions/settings', this.wrap((c) => a.sessionSettings(c), false));
+    r.add('PUT', '/api/sessions/settings', this.wrap((c, s) => a.putSessionSettings(c), true));
     r.add('GET', '/api/usage', this.wrap((c) => a.usage(c), false));
     r.add('GET', '/api/audit', this.wrap((c) => a.audit(c), false));
     r.add('POST', '/api/test/send', this.wrap((c, s) => a.testSend(c, s), true));

@@ -48,6 +48,13 @@
   const parseList = (s) => String(s || '').split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
   const parseNumList = (s) => parseList(s).map(Number).filter((n) => Number.isFinite(n) && n !== 0);
 
+  /** 解析 hash 里的查询串。会话 ID 含冒号，链接里必须 encodeURIComponent。 */
+  function hashQuery() {
+    const h = location.hash.replace(/^#\/?/, '');
+    const i = h.indexOf('?');
+    return new URLSearchParams(i < 0 ? '' : h.slice(i + 1));
+  }
+
   /* ================= 提示 ================= */
 
   function toast(msg, kind = '') {
@@ -139,6 +146,9 @@
     pool:     { title: '图池', icon: '❏', view: viewPool },
     personas: { title: '人格', icon: '✦', view: viewPersonas },
     sessions: { title: '会话', icon: '☰', view: viewSessions },
+    // 会话设置要从列表带 id 进来，nav:false 让侧栏不出现这个入口——
+    // 否则点进去就是「缺少会话 ID」，看着像坏掉的菜单项
+    'session-settings': { title: '会话设置', icon: '⚙', view: viewSessionSettings, nav: false },
     usage:    { title: '用量', icon: '▤', view: viewUsage },
     account:  { title: '账号', icon: '⛨', view: viewAccount },
   };
@@ -311,7 +321,7 @@
       <div class="shell">
         <aside class="side">
           <div class="brand">qqbot<small>轻量 QQ 机器人</small></div>
-          ${Object.entries(ROUTES).map(([k, r]) =>
+          ${Object.entries(ROUTES).filter(([, r]) => r.nav !== false).map(([k, r]) =>
             `<a class="nav-item" data-nav="${k}" href="#/${k}"><span class="ico">${r.icon}</span>${r.title}</a>`
           ).join('')}
           <div class="side-foot">
@@ -630,7 +640,7 @@
             <div class="field">
               <label>每日上限（条）</label>
               <input type="number" id="f-echo-limit" min="0" max="100" value="${p.echo_daily_limit ?? 5}">
-              <div class="note">全部会话共享的全局硬闸，防刷屏也是防风控。</div>
+              <div class="note">只算本会话，各会话互不占用额度；进程另有 100 条/天的硬顶兜底。</div>
             </div>
           </div>
         </div>
@@ -802,6 +812,265 @@
             ` · 共 ${pool.total || 0} 张 · <a href="#/pool">去图池管理</a>`;
       }
     }).catch(errInto('#set-body'));
+  }
+
+  /* ================= 会话设置（按对话对象覆盖） ================= */
+
+  // 与服务端 OVERRIDABLE_GROUPS 一一对应，顺序即卡片顺序。
+  // 模型与面板凭据不在这里：它们是部署级的，按会话复制会变成 N 份密文。
+  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'context'];
+  const OVR_META = {
+    bot: { title: '触发规则', hint: '唤醒词、接话概率、冷却、分段' },
+    proactive: { title: '主动发言', hint: '回复后隔一会儿补一句' },
+    images: { title: '图池', hint: '要不要发图、发几张' },
+    vision: { title: '图片识别', hint: '用户发的图要不要看' },
+    search: { title: '联网搜索', hint: '拿不准时自己去查' },
+    context: { title: '上下文', hint: '带几轮历史、多少预算' },
+  };
+
+  const ovrNum = (id, label, val, min, max, note, step) => `
+    <div class="field">
+      <label>${label}</label>
+      <input type="number" id="${id}"${step ? ` step="${step}"` : ''} min="${min}" max="${max}" value="${val}">
+      ${note ? `<div class="note">${note}</div>` : ''}
+    </div>`;
+
+  const ovrCheck = (id, label, on, note) => `
+    <label class="check">
+      <input type="checkbox" id="${id}"${on ? ' checked' : ''}>
+      <span>${label}${note ? `<span class="note">${note}</span>` : ''}</span>
+    </label>`;
+
+  function ovrBotBody(v, g) {
+    const globalBlack = (g.blacklist_users || []).join('，');
+    return `
+      <div class="grid c2">
+        <div class="field">
+          <label>唤醒词</label>
+          <input type="text" id="f-wake" value="${esc((v.wake_words || []).join('，'))}"
+                 placeholder="多个用逗号分隔">
+          <div class="note">留空表示只响应 @ 与私聊。</div>
+        </div>
+        ${ovrNum('f-passive', '被动接话概率', v.passive_rate, 0, 1, '0 表示只在被 @ 或命中唤醒词时回复。', '0.05')}
+        ${ovrNum('f-gcd', '群冷却（秒）', v.group_cooldown_sec, 0, 3600, '被动接话的最小间隔，防止在热闹的群里刷屏。')}
+        ${ovrNum('f-segs', '最多分几段', v.max_segments, 1, 8, '长回复按句切开分条发送。')}
+        <div class="field">
+          <label>最大并发会话（全局）</label>
+          <input type="text" value="${esc(g.max_concurrent)}" readonly>
+          <div class="note">队列级参数，所有会话共享，不按会话设。</div>
+        </div>
+        <div class="field">
+          <label>群白名单（全局）</label>
+          <input type="text" value="${esc((g.whitelist_groups || []).join('，') || '（不限）')}" readonly>
+          <div class="note">部署级总闸，会话只能收紧、不能放宽。</div>
+        </div>
+      </div>
+      <div class="field">
+        <label>追加用户黑名单</label>
+        <input type="text" id="f-blu" value="${esc((v.blacklist_users || []).join('，'))}"
+               placeholder="只在本会话额外的屏蔽">
+        <div class="note">全局黑名单（${esc(globalBlack || '空')}）里的人在所有会话都不回复；
+        这里填的只会追加，删不掉全局那几个——要放宽只能去 <a href="#/settings">设置</a> 页删。</div>
+      </div>`;
+  }
+
+  function ovrProactiveBody(v) {
+    return `
+      ${ovrCheck('f-echo', '开启回声式跟进', v.echo_enabled, '回复完按概率延迟补一句；对方一开口就取消。')}
+      <div class="grid c2">
+        ${ovrNum('f-echo-rate', '触发概率', v.echo_rate, 0, 1, '0.35 表示三次里约有一次。', '0.05')}
+        <div class="field">
+          <label>延迟范围（秒）</label>
+          <div class="row" style="gap:8px">
+            <input type="number" id="f-echo-min" min="5" max="3600" value="${v.echo_min_sec}" aria-label="延迟下限">
+            <span>至</span>
+            <input type="number" id="f-echo-max" min="5" max="3600" value="${v.echo_max_sec}" aria-label="延迟上限">
+          </div>
+          <div class="note">实际延迟在范围内随机取值。</div>
+        </div>
+        ${ovrNum('f-echo-cd', '本会话冷却（分钟）', v.echo_cooldown_min, 0, 1440, '两次跟进的最小间隔。')}
+        ${ovrNum('f-echo-limit', '每日上限（条）', v.echo_daily_limit, 0, 100, '只算本会话，各会话互不占用额度。')}
+      </div>`;
+  }
+
+  /** 每组卡片：标题右侧一个「本会话单独设置」开关，关着时整块置灰。 */
+  function ovrCard(g, body, st) {
+    const m = OVR_META[g];
+    return `
+      <div class="card">
+        <h3>${m.title} <span class="hint">${m.hint}</span>
+          <label class="check ovr-sw">
+            <input type="checkbox" class="ovr" data-g="${g}"${st[g].on ? ' checked' : ''}>
+            <span>本会话单独设置</span>
+          </label>
+        </h3>
+        <fieldset class="ovr-body" id="g-${g}"${st[g].on ? '' : ' disabled'}>${body}</fieldset>
+      </div>`;
+  }
+
+  /** 从界面读出某一组的完整值。 */
+  function readOvrGroup(g, st) {
+    const v = st[g].val || {};
+    const num = (sel) => Number($(sel).value);
+    if (g === 'bot') {
+      return {
+        wake_words: parseList($('#f-wake').value),
+        passive_rate: num('#f-passive'),
+        group_cooldown_sec: num('#f-gcd'),
+        max_segments: num('#f-segs'),
+        // 界面上不暴露的两个字段按原值回传。服务端也会用全局补全，
+        // 但显式带上比"让服务端猜"更接近用户在设置页看到的那套值。
+        seg_delay_min_ms: v.seg_delay_min_ms,
+        seg_delay_max_ms: v.seg_delay_max_ms,
+        quote_reply: v.quote_reply,
+        blacklist_users: parseNumList($('#f-blu').value),
+      };
+    }
+    if (g === 'proactive') {
+      return {
+        echo_enabled: $('#f-echo').checked,
+        echo_rate: num('#f-echo-rate'),
+        echo_min_sec: num('#f-echo-min'),
+        echo_max_sec: num('#f-echo-max'),
+        echo_cooldown_min: num('#f-echo-cd'),
+        echo_daily_limit: num('#f-echo-limit'),
+      };
+    }
+    if (g === 'images') {
+      return { enabled: $('#f-img').checked, max_per_reply: num('#f-img-max') };
+    }
+    if (g === 'vision') {
+      return { enabled: $('#f-vision').checked, max_images: num('#f-vision-max') };
+    }
+    if (g === 'search') {
+      return {
+        enabled: $('#f-search').checked,
+        max_results: num('#f-search-results'),
+        // 超时不放到界面上：8 秒已经比用户耐心长，调它多半是自找麻烦
+        timeout_sec: v.timeout_sec,
+        max_calls: num('#f-search-calls'),
+      };
+    }
+    return { max_turns: num('#f-turns'), token_budget: num('#f-budget') };
+  }
+
+  function viewSessionSettings(el) {
+    const id = (hashQuery().get('id') || '').trim();
+    if (!id) {
+      el.innerHTML = `<div class="page-head"><div><h2>会话设置</h2></div></div>
+        <div class="err-inline">缺少会话 ID，请从「会话」列表那一行点「设置」进入</div>`;
+      return;
+    }
+
+    el.innerHTML = `<div class="page-head">
+        <div><h2>会话设置</h2><div class="desc" id="ss-head">加载中…</div></div>
+        <a class="btn ghost" href="#/sessions">返回会话列表</a>
+      </div>
+      <div id="ss-body"><div class="empty">加载中…</div></div>`;
+
+    api('/api/sessions/settings?id=' + encodeURIComponent(id)).then((d) => {
+      if (!$('#ss-body')) return; // 用户已经切走
+
+      const ov = d.overrides || {};
+      const gl = d.global || {};
+      // 每组一份状态：on 只看 overrides 里有没有这一组（唯一真相），
+      // val 是"勾上时预填的值"——已覆盖用覆盖值，否则用全局值。
+      const st = {};
+      for (const g of OVR_GROUPS) st[g] = { on: !!ov[g], val: ov[g] || gl[g] || {} };
+
+      const head = $('#ss-head');
+      if (head) {
+        head.innerHTML = `${d.name ? `<b>${esc(d.name)}</b> ` : ''}<span class="mono">${esc(id)}</span>
+          · 人格在 <a href="#/sessions">会话列表</a>那一列单独设置`;
+      }
+
+      const botVal = st.bot.val;
+      const proVal = st.proactive.val;
+      const imgVal = st.images.val;
+      const visVal = st.vision.val;
+      const srVal = st.search.val;
+      const ctxVal = st.context.val;
+
+      $('#ss-body').innerHTML =
+        ovrCard('bot', ovrBotBody(botVal, gl.bot || {}), st) +
+        ovrCard('proactive', ovrProactiveBody(proVal), st) +
+        ovrCard('images', `
+          ${ovrCheck('f-img', '允许机器人发图', imgVal.enabled)}
+          <div class="grid c2">
+            ${ovrNum('f-img-max', '单条回复最多发几张', imgVal.max_per_reply, 1, 3, '模型点了更多图也只发前几张。')}
+          </div>`, st) +
+        ovrCard('vision', `
+          ${ovrCheck('f-vision', '识别用户发来的图片', visVal.enabled !== false,
+            '关掉后图片段被忽略，这条消息按纯文字处理，不影响回复。')}
+          <div class="grid c2">
+            ${ovrNum('f-vision-max', '单条消息最多看几张', visVal.max_images, 1, 4, '每张图都花 token，这是成本的闸。')}
+          </div>`, st) +
+        ovrCard('search', `
+          ${ovrCheck('f-search', '允许模型联网搜索', srVal.enabled,
+            '与模型共用同一把 API Key，按成功请求计费（约 ¥5 / 千次）。')}
+          <div class="grid c2">
+            ${ovrNum('f-search-results', '每次取几条结果', srVal.max_results, 1, 10, '取多了会挤占上下文预算，3-5 条通常够用。')}
+            ${ovrNum('f-search-calls', '每条消息最多搜几次', srVal.max_calls, 1, 3, '成本硬闸：每多一次就是一次模型请求加一次搜索请求。')}
+          </div>`, st) +
+        ovrCard('context', `
+          <div class="grid c2">
+            ${ovrNum('f-turns', '保留轮数', ctxVal.max_turns, 0, 50, '一轮 = 用户一句 + 助手一句。0 表示不带历史。')}
+            ${ovrNum('f-budget', 'token 预算', ctxVal.token_budget, 200, 100000, '历史按此预算从新到旧裁剪，超出的整轮丢弃。')}
+          </div>`, st) +
+        `<div class="row end">
+          <button class="btn ghost" data-act="ovr-reset">恢复跟随全局</button>
+          <button class="btn" data-act="ovr-save">保存本会话设置</button>
+        </div>`;
+
+      bindActions(el, {
+        'ovr-save': async (btn) => {
+          btn.disabled = true;
+          try {
+            const overrides = {};
+            // 没勾的组根本不出现在 payload 里 —— 那就是"回落跟随全局"。
+            // 服务端把空对象当成删行，所以关掉某组不需要另一个接口。
+            for (const g of OVR_GROUPS) if (st[g].on) overrides[g] = readOvrGroup(g, st);
+            await api('/api/sessions/settings', {
+              method: 'PUT',
+              body: { id, name: d.name || '', overrides },
+            });
+            ok('已保存');
+            // 重新拉一次：服务端会把缺的字段用全局补全，界面要显示补全后的值
+            route();
+          } catch (e) {
+            bad(e.message);
+            btn.disabled = false;
+          }
+        },
+        'ovr-reset': async (btn) => {
+          if (!confirm('这个会话的独立设置会全部清空，之后完全跟随全局。确定？')) return;
+          btn.disabled = true;
+          try {
+            await api('/api/sessions/settings', {
+              method: 'PUT',
+              body: { id, name: d.name || '', overrides: {} },
+            });
+            ok('已恢复跟随全局');
+            route();
+          } catch (e) {
+            bad(e.message);
+            btn.disabled = false;
+          }
+        },
+      });
+
+      // 勾选只切 disabled，不清值：再勾上还是刚才那套数，
+      // 从全局重新复制会把用户手改到一半的调整凭空抹掉。
+      $$('input.ovr', el).forEach((cb) => {
+        cb.addEventListener('change', () => {
+          const g = cb.dataset.g;
+          if (!st[g]) return;
+          st[g].on = cb.checked;
+          const box = $('#g-' + g);
+          if (box) box.disabled = !cb.checked;
+        });
+      });
+    }).catch(errInto('#ss-body'));
   }
 
   /* ================= 图池 ================= */
@@ -1331,9 +1600,14 @@
       const who = name
         ? `<div class="sess-name" title="${esc(name)}">${esc(name)}</div><div class="sess-id">${esc(s.id)}</div>`
         : `<span class="mono">${esc(s.id)}</span>`;
+      // 「设置」对两种行都要有：预设行同样可能已经配了一套自己的规则。
+      // 有独立设置时文案里带出来，省得用户挨个点进去看哪几个配过。
+      const cfg = `<button class="btn ghost sm" data-act="cfg" data-id="${esc(s.id)}">${
+        s.overrides ? '设置·独立' : '设置'
+      }</button>`;
       const acts = preset
-        ? `<button class="btn ghost sm" data-act="unbind" data-id="${esc(s.id)}">取消预设</button>`
-        : `<button class="btn ghost sm" data-act="peek" data-id="${esc(s.id)}">查看</button>
+        ? `${cfg}<button class="btn ghost sm" data-act="unbind" data-id="${esc(s.id)}">取消预设</button>`
+        : `${cfg}<button class="btn ghost sm" data-act="peek" data-id="${esc(s.id)}">查看</button>
            <button class="btn danger sm" data-act="clear" data-id="${esc(s.id)}">清空</button>`;
       return `<tr>
         <td>${who}</td>
@@ -1354,7 +1628,7 @@
       }
       $('#ss-list').innerHTML = `
         <table>
-          <thead><tr><th>会话</th><th>类型</th><th>人格</th><th>消息数</th><th>最后活跃</th><th style="width:150px"></th></tr></thead>
+          <thead><tr><th>会话</th><th>类型</th><th>人格</th><th>消息数</th><th>最后活跃</th><th style="width:230px"></th></tr></thead>
           <tbody>${rows.map(rowOf).join('')}</tbody>
         </table>`;
     };
@@ -1487,6 +1761,11 @@
     });
 
     bindActions(el, {
+      // 进这个会话的独立设置页。id 含冒号，必须编码后再拼进 hash，
+      // 否则 URLSearchParams 解析出来会被截断。
+      cfg: (btn) => {
+        location.hash = '#/session-settings?id=' + encodeURIComponent(btn.dataset.id);
+      },
       // 标题右侧的「取消」：跟右上角那个「添加对话对象」是同一个开关的两头，
       // 面板展开后按钮跑到了卡片里，用户不用再回到页头去找关闭的地方
       'cancel-preset': () => {

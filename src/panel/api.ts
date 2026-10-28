@@ -37,6 +37,18 @@ import {
   type SessionInfo as ChatSessionInfo,
   type Settings,
 } from '../store/types';
+import {
+  GROUP_LABELS,
+  OVERRIDABLE_GROUPS,
+  OVERRIDE_FIELDS,
+  badFieldOf,
+  normalizeOverrides,
+  overriddenGroups,
+  pickGroups,
+  resolveSettings,
+  type OverridableGroup,
+  type SessionOverrides,
+} from '../store/overrides';
 import { formatGoDuration, localDay } from '../util/time';
 import {
   hashPassword,
@@ -721,23 +733,30 @@ export class Api {
       throw new HttpError(500, '读取会话失败');
     }
 
-    // 补出「已经绑了人格、但还没产生过消息」的对话对象。
+    // 补出「已经绑了人格、或配了自己的设置，但还没产生过消息」的对话对象。
     //
     // sessions 的行要收到第一条消息才 touch 出来，所以给一个安静的群预设完
-    // 人格，那个群在 sessions 里根本不存在——不补出来的话，用户绑完刷新一下
-    // 那行就消失了，只能以为没保存上再来一遍。
+    // 人格/设置，那个群在 sessions 里根本不存在——不补出来的话，用户配完
+    // 刷新一下那行就消失了，只能以为没保存上再来一遍。
     //
-    // 失败不影响列会话：这段只是锦上添花，读不到绑定照样能看有消息的会话。
+    // 两个来源（人格绑定、按会话设置）可能指向同一个会话，必须合并成一行：
+    // 不合并的话安静群会在列表里出现两条一模一样的记录，点哪条都对，
+    // 看着就像 bug。
+    //
+    // 失败不影响列会话：这段只是锦上添花，读不到照样能看有消息的会话。
     try {
       const known = new Set(items.map((s) => s.id));
-      const presets: ChatSessionInfo[] = [];
+      const covered = this.store.sessionSettings.ids();
+      // 有消息的会话也可能有自己的设置，打个标记让列表显示「独立」
+      for (const s of items) s.overrides = covered.has(s.id);
+
+      const presets = new Map<string, ChatSessionInfo>();
       for (const b of this.store.personas.bindings()) {
-        if (known.has(b.session_id)) continue;
         const parsed = parseSessionId(b.session_id);
         // 历史脏数据（手改过库、旧版本写坏）解析不出来就跳过，不要在
         // 列表里塞一行点不动的怪物
         if (!parsed) continue;
-        presets.push({
+        presets.set(b.session_id, {
           id: b.session_id,
           kind: b.kind !== '' ? b.kind : parsed.kind,
           target_id: parsed.targetId,
@@ -747,12 +766,44 @@ export class Api {
           persona_name: b.persona_name,
           name: b.target_name,
           preset: true,
+          overrides: covered.has(b.session_id),
         });
       }
-      // 预设排最前：它们本来就是「待生效」，用户刚绑完应该在顶上看见
-      if (presets.length > 0) items = [...presets, ...items];
+      for (const o of this.store.sessionSettings.list()) {
+        const parsed = parseSessionId(o.session_id);
+        if (!parsed) continue;
+        const ex = presets.get(o.session_id);
+        if (ex) {
+          // 撞上了：合并成一行，时间取较新的，名字取有值的那个
+          ex.overrides = true;
+          if (ex.updated_at < o.updated_at) ex.updated_at = o.updated_at;
+          if (!ex.name) ex.name = o.target_name;
+          continue;
+        }
+        presets.set(o.session_id, {
+          id: o.session_id,
+          kind: o.kind !== '' ? o.kind : parsed.kind,
+          target_id: parsed.targetId,
+          messages: 0,
+          updated_at: o.updated_at,
+          // 没有绑人格：下拉显示「跟随默认（X）」，与真会话一致
+          persona_id: 0,
+          persona_name: '',
+          name: o.target_name,
+          preset: true,
+          overrides: true,
+        });
+      }
+
+      const rows = [...presets.values()].filter((s) => !known.has(s.id));
+      // 预设排最前：它们本来就是「待生效」，用户刚配完应该在顶上看见；
+      // 预设之间按最近改动倒序，刚动过的那一行在最上面。
+      if (rows.length > 0) {
+        rows.sort((a, b) => +b.updated_at - +a.updated_at);
+        items = [...rows, ...items];
+      }
     } catch (e) {
-      this.d.log.warn('读取预设人格失败', { err: e });
+      this.d.log.warn('读取预设会话失败', { err: e });
     }
 
     // 一并回全局默认人格：面板要把"跟随默认"显示成「跟随默认（毒舌）」，
@@ -812,6 +863,136 @@ export class Api {
       clientIP(ctx.req),
     );
     writeJSON(ctx.res, 200, { ok: true, persona_id: pid });
+  }
+
+  /**
+   * 会话级设置：这个会话自己那套覆盖 + 全局当前值。
+   *
+   * 全局值一并回传，是为了让面板在"跟随全局"状态下也能显示出生效的数字，
+   * 而不是给一排空白输入框让用户猜。只回可覆盖的六组，llm/panel 裁掉——
+   * 既省得前端误用，也天然避开 API Key 脱敏这件事。
+   */
+  sessionSettings(ctx: ReqCtx): void {
+    const id = (ctx.query.get('id') ?? '').trim();
+    const parsed = parseSessionId(id);
+    if (!parsed) throw new HttpError(400, '会话 ID 格式应为 group:群号 或 private:QQ号');
+
+    const global = this.settings();
+    let stored: SessionOverrides | null = null;
+    try {
+      stored = this.store.sessionSettings.get(id);
+    } catch (e) {
+      this.d.log.warn('读取会话设置失败', { id, err: e });
+    }
+    // 只回存储的原值，绝不回"并集后的生效值"。黑名单要是回并集，用户在
+    // 会话页把某个人删掉、保存成功，下次打开他又出现了——看着像删不掉的
+    // 幽灵，实际是并集每次都把他加回来。
+    const overrides = normalizeOverrides(stored ?? {}, global);
+
+    writeJSON(ctx.res, 200, {
+      id,
+      kind: parsed.kind,
+      target_id: parsed.targetId,
+      name: this.nameOf(id),
+      overrides,
+      global: pickGroups(global),
+    });
+  }
+
+  /**
+   * 保存会话级设置。整份替换，不是补丁。
+   *
+   * overrides 传空对象等价于「全部跟随全局」（存储层会直接删行），
+   * 所以不需要再开一个 DELETE 路由——少一条路径就少一处可能不一致。
+   */
+  async putSessionSettings(ctx: ReqCtx): Promise<void> {
+    const req = (await body(ctx, 32 * 1024)) as {
+      id?: unknown;
+      overrides?: unknown;
+      name?: unknown;
+    };
+    const id = typeof req.id === 'string' ? req.id.trim() : '';
+    if (id === '') throw new HttpError(400, '会话 ID 不能为空');
+    const parsed = parseSessionId(id);
+    if (!parsed) throw new HttpError(400, '会话 ID 格式应为 group:群号 或 private:QQ号');
+
+    const global = this.settings();
+    const overrides = this.parseOverrides(req.overrides, global);
+
+    // 校验的是「合并后实际生效的值」：所有范围规则与中文文案都在
+    // validateSettings 里，这里不该再写一份（两份必然会漂移）。
+    validateSettings(resolveSettings(global, overrides));
+
+    const name = typeof req.name === 'string' ? req.name.trim().slice(0, 64) : '';
+    const groups = overriddenGroups(overrides);
+    try {
+      // 只写 session_settings，绝不 touch sessions：那会给安静群凭空造一行
+      // "有会话但 0 条消息"的记录，列表里就和预设行重复成两条了。
+      this.store.sessionSettings.set(id, overrides, { kind: parsed.kind, name });
+    } catch (e) {
+      this.d.log.error('保存会话设置失败', { id, err: e });
+      throw new HttpError(500, '保存失败');
+    }
+    this.store.audit.record(
+      'session.settings',
+      `${id}${name === '' ? '' : ` (${name})`} <- ${
+        groups.length === 0 ? 'default(global)' : groups.map((g) => GROUP_LABELS[g]).join('/')
+      }`,
+      clientIP(ctx.req),
+    );
+    writeJSON(ctx.res, 200, { ok: true, overrides });
+  }
+
+  /**
+   * 校验并规范化会话覆盖的入参。
+   *
+   * 与设置页的 assignOnto（未知字段忽略）刻意不同：那边前端整份回传，
+   * 忽略未暴露的字段是对的；这边用户以为"我把这组清空了"，实际没清，
+   * 就是一次静默失效——所以白名单外的组和字段一律 400。
+   */
+  private parseOverrides(raw: unknown, global: Settings): SessionOverrides {
+    if (raw === undefined || raw === null) return {};
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new HttpError(400, '会话设置格式错误');
+    }
+    const obj = raw as Record<string, unknown>;
+    const groups = OVERRIDABLE_GROUPS as readonly string[];
+
+    for (const key of Object.keys(obj)) {
+      if (!groups.includes(key)) throw new HttpError(400, `不支持的设置组：${key}`);
+      const g = key as OverridableGroup;
+      const body = obj[key];
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        throw new HttpError(400, `「${GROUP_LABELS[g]}」格式错误`);
+      }
+      const fields = body as Record<string, unknown>;
+      for (const f of Object.keys(fields)) {
+        if (!Object.hasOwn(OVERRIDE_FIELDS[g], f)) {
+          throw new HttpError(400, `「${GROUP_LABELS[g]}」不支持按会话设置的字段：${f}`);
+        }
+      }
+      const bad = badFieldOf(g, fields);
+      if (bad !== '') throw new HttpError(400, `「${GROUP_LABELS[g]}」的 ${bad} 取值类型不正确`);
+    }
+
+    // 缺字段用全局补全的逻辑交给存储层那一份实现，避免引擎与面板各自
+    // 维护一套合并规则（那种分裂最后一定表现为"面板看着是这样、引擎跑的是那样"）。
+    return normalizeOverrides(obj, global);
+  }
+
+  /** 会话显示名的三个来源，优先级与 sessions.list() 一致。 */
+  private nameOf(id: string): string {
+    try {
+      const hit = this.store.sessions.list(500).find((s) => s.id === id);
+      if (hit?.name) return hit.name;
+      const b = this.store.personas.bindings().find((x) => x.session_id === id);
+      if (b && b.target_name !== '') return b.target_name;
+      const r = this.store.sessionSettings.list().find((x) => x.session_id === id);
+      if (r) return r.target_name;
+    } catch {
+      // 名字只用于显示，读失败就退回号码
+    }
+    return '';
   }
 
   /** 某会话最近的对话记录，供面板查看上下文。 */

@@ -426,6 +426,19 @@ select.sel {
 .check input { margin: 4px 0 0; accent-color: var(--accent); flex: none; }
 .check .note { margin: 2px 0 0; }
 
+/* ---------- 会话设置：整组开关 ---------- */
+
+/* 卡片标题是 flex 容器，开关靠 margin-left 顶到最右边；字重随标题变细 */
+.card > h3 > .ovr-sw { margin-left: auto; font-weight: 400; }
+
+/* fieldset 浏览器默认带 border / padding / min-width，
+   不重置的话六张卡片里会多出六个小方框 */
+.ovr-body { border: 0; padding: 0; margin: 0; min-width: 0; }
+
+/* 关着 = 整组跟随全局。置灰但不隐藏：用户要知道现在生效的是什么 */
+.ovr-body[disabled] .field,
+.ovr-body[disabled] .check { opacity: .5; }
+
 /* ---------- 按钮 ---------- */
 
 .btn {

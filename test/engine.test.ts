@@ -19,6 +19,7 @@ import {
 import { Logger } from '../src/log/logger';
 import type { Event, Segment } from '../src/onebot/types';
 import { Store } from '../src/store';
+import { normalizeOverrides } from '../src/store/overrides';
 import type { Settings } from '../src/store/types';
 
 const tmpDirs: string[] = [];
@@ -687,6 +688,208 @@ describe('联网搜索', () => {
       await waitFor(() => h.sent.length >= 1);
       assert.equal(textOf(h.sent[0]!.segs), '就这些。');
       assert.equal(tools[1], undefined, '额度用完后这一轮不再带工具');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('按会话的设置覆盖', () => {
+  /**
+   * 给某个会话写一份覆盖。
+   *
+   * 走 normalizeOverrides 而不是手搓对象：面板 PUT 之后库里就是这个形状，
+   * 用例要是自己拼一个"更完整"的对象，测的就不是线上那条路径了。
+   */
+  function setOv(h: Harness, sid: string, ov: Record<string, unknown>): void {
+    h.store.sessionSettings.set(sid, normalizeOverrides(ov, h.store.settings.get()), {
+      kind: sid.startsWith('group:') ? 'group' : 'private',
+    });
+  }
+
+  /** 群事件：文本可自定义，群号可换。 */
+  function g(groupId: number, text = '你好', userId = 20000, messageId = 1): Event {
+    return groupEv({ group_id: groupId, message: [{ type: 'text', data: { text } }], user_id: userId, message_id: messageId });
+  }
+
+  it('唤醒词按会话：群 1 认、群 2 不认', async () => {
+    // 关掉被动接话，测的就只剩唤醒词这一条路径
+    const h = makeHarness({ patch: (v) => { v.bot.passive_rate = 0; } });
+    try {
+      setOv(h, 'group:30001', { bot: { wake_words: ['小助手'] } });
+
+      h.engine.handleEvent(g(30001, '小助手 在吗'));
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(h.sent.length, 1, '群 1 配了唤醒词，应该回');
+      assert.equal(h.sent[0]!.target, 30001);
+
+      h.engine.handleEvent(g(30002, '小助手 在吗', 20000, 2));
+      await sleep(120);
+      assert.equal(h.sent.length, 1, '群 2 没配唤醒词，不应回');
+      assert.equal(h.engine.stats().ignored, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('接话概率按会话：全局开、群 1 关', async () => {
+    const h = makeHarness(); // 全局 passive_rate = 1
+    try {
+      setOv(h, 'group:30001', { bot: { passive_rate: 0 } });
+
+      h.engine.handleEvent(g(30001, '随便聊聊'));
+      await sleep(150);
+      assert.equal(h.sent.length, 0, '群 1 覆盖成 0，不该接话');
+
+      h.engine.handleEvent(g(30002, '随便聊聊', 20000, 2));
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(h.sent[0]!.target, 30002, '群 2 跟全局，应该接话');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('全局黑名单不能被会话覆盖放宽', async () => {
+    const h = makeHarness({ patch: (v) => { v.bot.blacklist_users = [20000]; } });
+    try {
+      // 会话里写空数组，试图"解禁"
+      setOv(h, 'group:30001', { bot: { blacklist_users: [] } });
+
+      h.engine.handleEvent(g(30001, '@bot 你好'));
+      await sleep(150);
+      assert.equal(h.sent.length, 0, '全局拉黑的人在任何会话都不该被回复');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('会话可以追加自己的黑名单', async () => {
+    const h = makeHarness();
+    try {
+      setOv(h, 'group:30001', { bot: { blacklist_users: [20000] } });
+
+      h.engine.handleEvent(g(30001, '你好', 20000, 1));
+      await sleep(150);
+      assert.equal(h.sent.length, 0, '本群拉黑的人不回复');
+
+      h.engine.handleEvent(g(30001, '你好', 20001, 2));
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(h.sent.length, 1, '同群其他人照常');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('上下文轮数按会话：覆盖成 0 就不带历史', async () => {
+    const seen: LlmMessage[][] = [];
+    const h = makeHarness({
+      llm: async (msgs) => {
+        seen.push(msgs);
+        return { content: '嗯。', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, firstTokenMs: 1 };
+      },
+    });
+    try {
+      // 两个群都先攒两条历史（messages 对 sessions 有外键，行要先建出来）
+      for (const [sid, id] of [['group:30001', 30001], ['group:30002', 30002]] as const) {
+        h.store.sessions.touch(sid, 'group', id, '群');
+        h.store.sessions.append(sid, 'user', '昨天的旧问题', 10);
+        h.store.sessions.append(sid, 'assistant', '昨天的旧回答', 10);
+      }
+
+      setOv(h, 'group:30001', { context: { max_turns: 0 } });
+
+      h.engine.handleEvent(g(30001, '今天呢', 20000, 1));
+      await waitFor(() => h.sent.length >= 1);
+      // system + 本轮用户，历史被整段丢掉
+      assert.equal(seen[0]!.length, 2, '覆盖成 0 轮时只带 system + 本轮');
+
+      h.engine.handleEvent(g(30002, '今天呢', 20000, 2));
+      await waitFor(() => h.sent.length >= 2);
+      assert.ok(seen[1]!.length >= 4, '没覆盖的群应带上历史');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('联网搜索按会话：群 1 关掉后不再带工具', async () => {
+    const tools: (ToolDef[] | undefined)[] = [];
+    const h = makeHarness({
+      patch: (v) => {
+        v.search.enabled = true;
+        v.llm.api_key = 'sk-test';
+      },
+      searchFetch: (async () => new Response('{"results":[]}')) as unknown as typeof fetch,
+      llm: async (_msgs, t) => {
+        tools.push(t);
+        return { content: '好。', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, firstTokenMs: 1 };
+      },
+    });
+    try {
+      setOv(h, 'group:30001', { search: { enabled: false } });
+
+      h.engine.handleEvent(g(30001, '今天有什么新闻', 20000, 1));
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(tools[0], undefined, '群 1 关掉搜索，请求里不该带 tools');
+
+      h.engine.handleEvent(g(30002, '今天有什么新闻', 20000, 2));
+      await waitFor(() => h.sent.length >= 2);
+      assert.ok(Array.isArray(tools[1]) && tools[1]!.length === 1, '群 2 跟全局，应带 web_search');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('改完全局设置，已覆盖的会话不受影响', async () => {
+    const h = makeHarness({ patch: (v) => { v.bot.passive_rate = 0; } });
+    try {
+      setOv(h, 'group:30001', { bot: { passive_rate: 1 } });
+
+      h.engine.handleEvent(g(30001, '你好', 20000, 1));
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(h.sent.length, 1, '覆盖成 1，应接话');
+
+      // 面板上把全局调回 0.5：已覆盖的会话必须还是 1（否则"独立"就是假的）
+      h.store.settings.update((v) => { v.bot.passive_rate = 0.5; });
+      h.engine.handleEvent(g(30001, '再聊一句', 20000, 2));
+      await waitFor(() => h.sent.length >= 2);
+      assert.equal(h.sent.length, 2, '全局变了，覆盖值不应被带走');
+
+      // 没覆盖的群跟着全局的 0.5 —— 这条会随机，所以只断言"不是必定回复"，
+      // 用同一个 rand 源没法注入，改成把全局改成 0 更确定
+      h.store.settings.update((v) => { v.bot.passive_rate = 0; });
+      h.engine.handleEvent(g(30002, '你好', 20000, 3));
+      await sleep(150);
+      assert.equal(h.sent.length, 2, '没覆盖的群跟随全局的 0');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('覆盖只影响自己那个会话：同一个号码换个 kind 互不干扰', async () => {
+    const seen: LlmMessage[][] = [];
+    const h = makeHarness({
+      llm: async (msgs) => {
+        seen.push(msgs);
+        return { content: '嗯。', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, firstTokenMs: 1 };
+      },
+    });
+    try {
+      // 群 30001 与私聊 30001 是两条完全不同的会话，只是号码撞了
+      for (const [sid, kind] of [['group:30001', 'group'], ['private:30001', 'private']] as const) {
+        h.store.sessions.touch(sid, kind, 30001, '同名');
+        h.store.sessions.append(sid, 'user', '旧问题', 10);
+        h.store.sessions.append(sid, 'assistant', '旧回答', 10);
+      }
+      // 只给私聊关掉历史
+      setOv(h, 'private:30001', { context: { max_turns: 0 } });
+
+      h.engine.handleEvent(privateEv(30001, 1));
+      await waitFor(() => h.sent.length >= 1);
+      assert.equal(seen[0]!.length, 2, '私聊按覆盖走：不带历史');
+
+      h.engine.handleEvent(g(30001, '你好', 20000, 2));
+      await waitFor(() => h.sent.length >= 2);
+      assert.ok(seen[1]!.length >= 4, '群同号不应沾到私聊的覆盖');
     } finally {
       h.cleanup();
     }

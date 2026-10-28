@@ -120,6 +120,34 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT '';
   `,
+  // v6：按对话对象的设置覆盖。
+  //
+  // 为什么单开一张表、而不是给 sessions 加列：与 v3/v4 是同一个教训——
+  // sessions 的行要收到第一条消息才 touch 出来，而"给一个安静的群单独配
+  // 一套触发规则"恰恰发生在它开口之前。加列的话，用户配完刷新一下行就没了。
+  //
+  // 为什么不挂到 session_personas 上：
+  //   1. 那张表的 persona_id 是 NOT NULL，只想覆盖设置、不改人格的会话
+  //      会被迫写一行假人格；
+  //   2. 它的生命周期由 personas 的 ON DELETE CASCADE 管，删一个人格就会
+  //      顺手删掉整会话的设置——两件毫不相干的事。
+  //
+  // overrides 存 JSON（与 settings 同一思路）：组的集合将来还会加，
+  // 加一组不该再来一次迁移；访问路径只有 WHERE session_id = ?，
+  // 不需要按字段检索。不加 JSON CHECK：坏数据要让面板看得见、
+  // 让引擎回落到全局，而不是让整库写不进去。
+  //
+  // kind / target_name 是快照，理由同 v4：只有覆盖、没有消息的会话在
+  // sessions 里不存在，面板要把它补成一行并显示名字。
+  `
+  CREATE TABLE session_settings (
+    session_id  TEXT    PRIMARY KEY,
+    kind        TEXT    NOT NULL DEFAULT '',
+    target_name TEXT    NOT NULL DEFAULT '',
+    overrides   TEXT    NOT NULL DEFAULT '{}',
+    updated_at  INTEGER NOT NULL
+  );
+  `,
 ];
 
 export class Db {

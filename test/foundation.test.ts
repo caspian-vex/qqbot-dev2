@@ -87,13 +87,13 @@ test('generateToken/safeEqual', () => {
   assert.equal(safeEqual(t, t.slice(1)), false);
 });
 
-test('迁移幂等，且 user_version 为 5（v5 = 会话记对话对象名字）', () => {
+test('迁移幂等，且 user_version 为 6（v6 = 按对话对象的设置）', () => {
   const { store, dir } = tempDb();
-  assert.equal(store.db.userVersion(), 5);
+  assert.equal(store.db.userVersion(), 6);
   store.close();
   // 再打开一次：不应重复执行迁移，也不应报错
   const again = new Store(join(dir, 'qqbot.db'));
-  assert.equal(again.db.userVersion(), 5);
+  assert.equal(again.db.userVersion(), 6);
   again.close();
   rmSync(dir, { recursive: true, force: true });
 });
