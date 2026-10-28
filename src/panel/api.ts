@@ -69,6 +69,14 @@ export const COOKIE_CSRF = 'qqbot_csrf';
  */
 export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
+/**
+ * 自动补反向 WS 最多试几次。
+ *
+ * 退避是 1/2/4/8/16/32/60/60 秒，八次合计约 3 分钟——足够覆盖协议端重启一轮；
+ * 再不成就是配置形态或权限这类不会自愈的问题，继续重试只是刷日志。
+ */
+const WS_FIX_MAX_FAILURES = 8;
+
 /** 已通过鉴权的处理函数。 */
 export type AuthedHandler = (ctx: ReqCtx, sess: SessionInfo) => void | Promise<void>;
 
@@ -1213,10 +1221,24 @@ export class Api {
         s.failures = 0;
       } catch (e) {
         s.failures += 1;
-        this.d.log.warn('自动开启反向 WS 失败，可在「网络」页手动修正', {
-          port,
-          err: e instanceof Error ? e.message : String(e),
-        });
+        const err = e instanceof Error ? e.message : String(e);
+        if (s.failures >= WS_FIX_MAX_FAILURES) {
+          // 连试这么多次都不成，基本不是"协议端还没起来"这类会自愈的问题
+          // （配置形态不对、token 没权限……），再每分钟刷一条日志只是噪音。
+          // 停手，把最后一次错误留在面板日志里，剩下的交给「网络」页。
+          s.done = true;
+          this.d.log.error('自动开启反向 WS 连续失败，已停止重试，请到「网络」页手动修正', {
+            port,
+            attempts: s.failures,
+            err,
+          });
+        } else {
+          this.d.log.warn('自动开启反向 WS 失败，稍后重试（也可在「网络」页手动修正）', {
+            port,
+            attempt: s.failures,
+            err,
+          });
+        }
       } finally {
         s.busy = false;
       }

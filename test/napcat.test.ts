@@ -395,6 +395,60 @@ describe('NapCat 网络配置（OB11Config）', () => {
       assert.equal(net.websocketServers[1]?.port, 3002);
     });
   });
+
+  // 回归：曾经把配置**当对象**发给 SetConfig，NapCat 那边 String() 成
+  // "[object Object]" 再 JSON5.parse，于是报
+  //   SyntaxError: JSON5: invalid character 'o' at 1:2
+  // 表现是「自动开启反向 WS 失败」。SetConfig 只吃文本，两种读出来的形态都得发文本。
+  it('对象形态读出来的配置，回传时也必须是文本', async () => {
+    await withFake(async (f) => {
+      f.state.uin = '10001';
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      const n = await c.networkConfig();
+      assert.equal(n.asString, false, '前提：这次是从对象形态读出来的');
+
+      await c.setNetworkConfig(n.config, false);
+
+      assert.equal(f.state.setPayloads.length, 1, '一次就该成功，不该拿对象再撞一次');
+      assert.equal(
+        typeof f.state.setPayloads[0],
+        'string',
+        `发给 SetConfig 的 config 必须是文本，实际是 ${typeof f.state.setPayloads[0]}`,
+      );
+      assert.doesNotThrow(() => JSON.parse(f.state.setPayloads[0] as string));
+    });
+  });
+
+  it('无包装形态读出来的配置，回传时也必须是文本', async () => {
+    await withFake(async (f) => {
+      f.state.uin = '10001';
+      f.state.networkBare = true;
+      f.state.network = { websocketServers: [{ enable: true, port: 3001 }] };
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      const n = await c.networkConfig();
+      assert.equal(n.asString, false);
+
+      await c.setNetworkConfig(n.config, false);
+
+      assert.equal(typeof f.state.setPayloads[0], 'string');
+      const net = f.state.network as { websocketServers: { port: number }[] };
+      assert.equal(net.websocketServers[0]?.port, 3001);
+    });
+  });
+
+  it('文本形态回传失败时不拿对象去撞（错误原样抛出）', async () => {
+    await withFake(async (f) => {
+      f.state.uin = '10001';
+      f.state.networkAsString = true;
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      const n = await c.networkConfig();
+      // 未登录会让 SetConfig 回 Not Login
+      f.state.uin = '';
+
+      await assert.rejects(() => c.setNetworkConfig(n.config, true), /Not Login/);
+      assert.equal(f.state.setPayloads.length, 0, '被拒的请求不该留下 payload');
+    });
+  });
 });
 
 describe('面板 /api/qq/network', () => {

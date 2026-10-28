@@ -334,9 +334,27 @@ export class NapCatWebUI {
     throw new NapCatError(-1, 'NapCat 未返回网络配置');
   }
 
-  /** 保存网络配置。asString 要和读出来时的形态一致。 */
+  /**
+   * 保存网络配置。
+   *
+   * 关键坑：SetConfig 收的是**JSON5 文本**，不是对象。
+   * NapCat 的 WebUI 网络页本身就是个文本编辑器，提交的是编辑器里的字符串，
+   * 服务端拿到就 `JSON5.parse(config)`。传对象进去时它会先 `String(config)`
+   * 成 `"[object Object]"` 再解析，于是报：
+   *   JSON5: invalid character 'o' at 1:2
+   * （第 1 个字符 `[` 被当成数组开头，第 2 个字符 `o` 才炸——看到这个错就是传了对象。）
+   *
+   * 所以一律先发文本。只有"读出来本来就是对象"的版本才在失败后拿对象再试一次：
+   * 那种形态意味着这个版本可能吃对象，但绝大多数版本只吃文本。
+   */
   async setNetworkConfig(config: Record<string, unknown>, asString: boolean): Promise<void> {
-    const payload = asString ? JSON.stringify(config) : config;
-    await this.call('/OB11Config/SetConfig', { config: payload });
+    const text = JSON.stringify(config);
+    try {
+      await this.call('/OB11Config/SetConfig', { config: text });
+    } catch (e) {
+      // 读出来就是文本 → 这个版本确定要文本，失败另有原因，别拿对象瞎撞
+      if (asString) throw e;
+      await this.call('/OB11Config/SetConfig', { config });
+    }
   }
 }

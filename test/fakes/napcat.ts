@@ -29,6 +29,8 @@ export interface FakeNapCatState {
   networkAsString: boolean;
   /** true 时 GetConfig 直接返回本体，不套 { config } */
   networkBare: boolean;
+  /** SetConfig 收到的 config 原文（按顺序），用来断言我们发的是文本还是对象 */
+  setPayloads: unknown[];
 }
 
 export interface FakeNapCat {
@@ -73,6 +75,7 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
     },
     networkAsString: false,
     networkBare: false,
+    setPayloads: [],
   };
 
   const calls: string[] = [];
@@ -196,10 +199,15 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
             return;
           }
           const p = JSON.parse(raw || '{}') as { config?: unknown };
-          state.network =
-            typeof p.config === 'string'
-              ? (JSON.parse(p.config) as Record<string, unknown>)
-              : ((p.config ?? {}) as Record<string, unknown>);
+          state.setPayloads.push(p.config);
+          // 真机拿到 config 直接 JSON5.parse。传对象时它先被 String() 成
+          // "[object Object]"，第 1 个字符 '[' 被当成数组开头，第 2 个字符 'o'
+          // 才炸。这里如实复刻，任何"又把对象发过去"的回归都会立刻失败。
+          if (typeof p.config !== 'string') {
+            bad(-1, "SyntaxError: JSON5: invalid character 'o' at 1:2");
+            return;
+          }
+          state.network = JSON.parse(p.config) as Record<string, unknown>;
           ok({});
           return;
         }
