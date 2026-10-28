@@ -1367,7 +1367,10 @@ export class Api {
     const qq = this.d.qq;
     if (!qq.configured) throw new HttpError(503, '未配置协议端 WebUI，无法扫码登录');
     const qr = await qq.qrcode();
-    writeJSON(ctx.res, 200, { image: qr.image });
+    // 已登录时不发图也不报错：前端拿到 logined 就收起登录卡片去同步状态。
+    // 之前这里直接抛 500，日志里留一条 "QQ Is Logined" 的 ERROR，
+    // 而它其实只是"你早就登录了"。
+    writeJSON(ctx.res, 200, { image: qr.image, logined: qr.logined });
   }
 
   /** 本地已保存的账号，用于一键重登（不用再扫码）。 */

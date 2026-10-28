@@ -70,6 +70,16 @@ describe('NapCat WebUI 客户端', () => {
     });
   });
 
+  it('并发调用只换一次凭据（轮询与页面请求会同时进来）', async () => {
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      // 修复前：三次并发都看到 credential 为空，各跑一次 login，
+      // 后写的覆盖前面的，先到的那批请求带着作废凭据 → 401
+      await Promise.all([c.status(), c.status(), c.status()]);
+      assert.equal(f.loginCount(), 1);
+    });
+  });
+
   it('二维码返回 PNG data URL（不是那个会跳转的 URL）', async () => {
     await withFake(async (f) => {
       const c = new NapCatWebUI(f.base, TOKEN, log());
@@ -265,6 +275,49 @@ describe('面板 /api/qq/*', () => {
         assert.equal(res.status, 200);
         const body = (await res.json()) as { image: string };
         assert.match(body.image, /^data:image\/png;base64,/);
+      } finally {
+        await h.stop();
+      }
+    });
+  });
+
+  it('已登录时取码不是错误：返回 logined 标记而不是抛错', async () => {
+    await withFake(async (f) => {
+      f.state.uin = '10001';
+      f.state.nick = '测试号';
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+
+      // 真机对已登录状态下的 GetQQLoginQrcode 回 code≠0 + "QQ Is Logined"。
+      // 这条路径以前直接抛 NapCatError，面板把它变成 500 + 一条 ERROR 日志。
+      const qr = await c.qrcode();
+      assert.equal(qr.logined, true);
+      assert.equal(qr.image, '');
+      assert.equal(qr.content, '');
+    });
+  });
+
+  it('其余业务错误照常抛出，别把"已登录"的宽容做成万能兜底', async () => {
+    await withFake(async (f) => {
+      f.state.failNextWith = { code: -1, message: '内部错误' };
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      await assert.rejects(() => c.qrcode(), /内部错误/);
+    });
+  });
+
+  it('已登录时 /api/qq/qrcode 回 200 + logined，而不是 500', async () => {
+    await withFake(async (f) => {
+      f.state.uin = '10001';
+      f.state.nick = '测试号';
+      const h = await panelWith(f);
+      try {
+        const res = await fetch(`${h.base}/api/qq/qrcode`, {
+          method: 'POST',
+          headers: { Cookie: h.cookie, 'X-CSRF-Token': h.csrf },
+        });
+        // 前端拿 logined 去收起登录卡片并刷新状态；报 500 只会让它
+        // 在二维码位置显示一句 "QQ Is Logined"
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), { image: '', logined: true });
       } finally {
         await h.stop();
       }

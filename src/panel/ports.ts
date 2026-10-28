@@ -73,7 +73,13 @@ export interface QQLoginPort {
   /** 是否配置了 WebUI 地址与 token。 */
   readonly configured: boolean;
   status(): Promise<QQLoginStatus>;
-  qrcode(): Promise<{ image: string; content: string }>;
+  /**
+   * 登录二维码。
+   *
+   * `logined: true` 表示协议端说"已经是登录状态了，不发码"——不是错误，
+   * 面板据此收起登录卡片并同步一次状态。
+   */
+  qrcode(): Promise<{ image: string; content: string; logined: boolean }>;
   loginInfo(): Promise<QQInfo>;
   quickLoginList(): Promise<QuickLoginItem[]>;
   quickLogin(uin: string): Promise<void>;

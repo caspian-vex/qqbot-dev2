@@ -147,7 +147,14 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
           return;
 
         case '/api/QQLogin/GetQQLoginQrcode':
-          // 真机这里给的是二维码内容字符串（一个 https 链接），不是图片地址
+          // 真机行为：已登录时直接拒绝发码，message 就是这句英文（原文如此，
+          // logined 的拼写也是 NapCat 自己的）。面板必须把它当成"已登录"，
+          // 而不是一条 500 + 日志里的 ERROR。
+          if (state.uin !== '') {
+            bad(-1, 'QQ Is Logined');
+            return;
+          }
+          // 未登录时给的是二维码内容字符串（一个 https 链接），不是图片地址
           ok({ qrcode: 'https://txz.qq.com/p?k=fake-qrcode-content&f=web', qrcodeurl: '' });
           return;
 

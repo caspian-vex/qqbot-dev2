@@ -77,6 +77,19 @@ export class NapCatError extends Error {
   }
 }
 
+/**
+ * 判断是不是"已经登录了，所以不给你二维码"。
+ *
+ * NapCat 在已登录时对 GetQQLoginQrcode 返回 code≠0 + message "QQ Is Logined"。
+ * 这是正常状态而不是故障：面板刚打开、状态轮询还没回来，或者用户在别处登录了。
+ * 不当成错误处理的话，一个"手滑点了刷新二维码"就会在日志里留一条 ERROR，
+ * 界面上还显示一句英文原文——用户只会以为机器人坏了。
+ */
+export function isLoginedError(e: unknown): boolean {
+  if (!(e instanceof NapCatError)) return false;
+  return /is\s*logined|already\s*log|已登录/i.test(e.message);
+}
+
 /** 从多种可能的字段名里取第一个非空值。协议端改过字段名，两种都认。 */
 function pick(obj: Record<string, unknown> | undefined, keys: string[]): unknown {
   if (!obj) return undefined;
@@ -124,6 +137,8 @@ function unwrapConfig(data: unknown): unknown {
 export class NapCatWebUI {
   private credential = '';
   private credentialAt = 0;
+  /** 正在进行的登录请求。并发调用共用它，别各自去换一次凭据。 */
+  private loginInflight: Promise<string> | null = null;
   private readonly log: Logger;
 
   constructor(
@@ -153,7 +168,15 @@ export class NapCatWebUI {
     if (this.credential !== '' && Date.now() - this.credentialAt < CRED_TTL_MS - CRED_REFRESH_MARGIN_MS) {
       return this.credential;
     }
-    return this.login();
+    // 并发去重：面板每 3 秒轮询一次状态，页面里的其它请求又各自走一遍这个入口，
+    // 同时进来时若各跑一次 login，会拿到不同的 Credential——后写的覆盖前面的，
+    // 先前那批请求就带着已作废的凭据返回 401，表现为"偶发鉴权失败"。
+    if (this.loginInflight === null) {
+      this.loginInflight = this.login().finally(() => {
+        this.loginInflight = null;
+      });
+    }
+    return this.loginInflight;
   }
 
   /** 用 token 换 Credential。 */
@@ -254,14 +277,23 @@ export class NapCatWebUI {
    * 那个配套的 URL 会 302 到 im.qq.com 落地页，直接当图片用是坏的。
    * 服务端生成图片还有个好处——CSP 里 img-src 允许 data: 就够了，
    * 不用为协议端开一个外部域名。
+   *
+   * 已登录时协议端会拒绝发码，这里归一成 `logined: true`（没有图，但也不是错）。
    */
-  async qrcode(): Promise<{ image: string; content: string }> {
-    const d = await this.call('/QQLogin/GetQQLoginQrcode');
+  async qrcode(): Promise<{ image: string; content: string; logined: boolean }> {
+    let d: Record<string, unknown> | undefined;
+    try {
+      d = await this.call('/QQLogin/GetQQLoginQrcode');
+    } catch (e) {
+      if (isLoginedError(e)) return { image: '', content: '', logined: true };
+      throw e;
+    }
+
     const content = asString(pick(d, ['qrcode', 'qrcodeUrl', 'qrcodeurl']));
     if (content === '') throw new NapCatError(-1, 'NapCat 未返回二维码内容');
 
     const image = await QRCode.toDataURL(content, QR_OPTIONS);
-    return { image, content };
+    return { image, content, logined: false };
   }
 
   /** 当前登录账号信息。 */

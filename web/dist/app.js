@@ -1821,6 +1821,10 @@
   function viewQQ(el) {
     let qrContent = '';
     let qrBusy = false;
+    // 上次取码失败的时间。协议端没起来时状态轮询每 3 秒会顺手重试一次取码，
+    // 不压一压的话日志里就是每 3 秒一条 ERROR，真正的故障反而被淹掉。
+    let qrFailAt = 0;
+    const QR_RETRY_MS = 20000;
     let loggedIn = false;
 
     el.innerHTML = `
@@ -1910,19 +1914,33 @@
       if (lo) lo.style.display = d.login ? '' : 'none';
     }
 
-    async function loadQr() {
+    async function loadQr(force) {
       if (qrBusy || loggedIn) return;
+      if (!force && Date.now() - qrFailAt < QR_RETRY_MS) return;
       qrBusy = true;
       const box = $('#qq-qr-box');
       try {
         const d = await api('/api/qq/qrcode', { method: 'POST' });
-        if (!box || !d) return;
+        if (!d) return;
+        // 协议端说已经登录了（发码会被它拒绝成 "QQ Is Logined"）：
+        // 这不是错误，只是状态轮询还没轮到。收起二维码并立刻同步一次状态。
+        if (d.logined) {
+          qrContent = '';
+          if (box) box.innerHTML = '';
+          await refresh();
+          return;
+        }
+        if (!box) return;
         qrContent = d.image || '';
+        // 200 但没图（协议端还没准备好）：也算"这次没拿到"，一起退避，
+        // 否则状态轮询每 3 秒就会来问一次，还顺带把协议端的二维码刷一遍
+        if (qrContent === '') qrFailAt = Date.now();
         box.innerHTML = qrContent
           ? `<img src="${esc(qrContent)}" alt="登录二维码" width="200" height="200"
                   style="border-radius:8px;background:#fff;padding:6px">`
           : '<span style="color:var(--fg-mute);font-size:12px">协议端未返回二维码</span>';
       } catch (e) {
+        qrFailAt = Date.now();
         if (box) {
           box.innerHTML = `<span style="color:var(--fg-dim);font-size:11.5px;padding:12px;
             text-align:center;line-height:1.7">${esc(e.message)}</span>`;
@@ -1973,8 +1991,10 @@
       }
     };
 
+    // 先问状态再决定要不要取码：之前这里和 refresh() 并发调 loadQr()，
+    // 那会儿 loggedIn 还是初值 false，守卫形同不存在——已登录的机器也要
+    // 白挨一次"QQ Is Logined"。refresh 内部会在未登录时补取码。
     refresh();
-    loadQr();
     loadSaved();
 
     const statusTimer = setInterval(refresh, 3000);
@@ -1993,7 +2013,9 @@
         ok('已刷新');
       },
       'qq-reload-qr': async () => {
-        await loadQr();
+        // 手动刷新要绕过退避：用户点它就是因为想立刻重试
+        qrFailAt = 0;
+        await loadQr(true);
       },
       'qq-logout': async (btn) => {
         if (!confirm('退出后机器人会离线，需要重新扫码才能恢复。确定退出？')) return;
@@ -2003,7 +2025,8 @@
           ok('已退出登录');
           loggedIn = false;
           setTimeout(refresh, 800);
-          loadQr();
+          // 退出后协议端要一点时间落状态，稍等再取码，别紧接着挨一次拒绝
+          setTimeout(() => loadQr(true), 800);
         } catch (e) {
           bad(e.message);
         } finally {
