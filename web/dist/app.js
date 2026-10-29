@@ -532,7 +532,7 @@
       if (!$('#set-body')) return; // 用户已经切走
       const imgDir = pool.dir || '';
       const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {},
-            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {};
+            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {}, tm = s.timing || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
@@ -617,7 +617,7 @@
         </div>
 
         <div class="card">
-          <h3>主动发言 <span class="hint">回复后隔一小会儿主动补一句相关的话</span></h3>
+          <h3>主动发言 <span class="hint">没人说话的时候，它自己开口</span></h3>
           <label class="check">
             <input type="checkbox" id="f-echo" ${(p.echo_enabled ? 'checked' : '')}>
             <span>开启回声式跟进
@@ -649,6 +649,85 @@
               <label>每日上限（条）</label>
               <input type="number" id="f-echo-limit" min="0" max="100" value="${p.echo_daily_limit ?? 5}">
               <div class="note">只算本会话，各会话互不占用额度；进程另有 100 条/天的硬顶兜底。</div>
+            </div>
+          </div>
+
+          <div class="hr"></div>
+
+          <label class="check">
+            <input type="checkbox" id="f-idle" ${(p.idle_after_min > 0 ? 'checked' : '')}>
+            <span>闲置后主动开口
+              <span class="note">对方说完最后一句、机器人当时没接住，隔一段时间回头补一句。
+              这是唯一一种"没人说话时自己开口"的能力。只对私聊生效：群里没人叫就插话是扰民，
+              也更容易被判定成营销号。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>闲置多久后可以开口（分钟）</label>
+              <input type="number" id="f-idle-after" min="0" max="2880" value="${p.idle_after_min ?? 0}">
+              <div class="note">0 表示关闭。建议 45 分钟起：短了像追问，长了对方已经忘了聊到哪。</div>
+            </div>
+            <div class="field">
+              <label>命中概率</label>
+              <input type="number" id="f-idle-rate" step="0.05" min="0" max="1" value="${p.idle_rate ?? 0.3}">
+              <div class="note">到点仍要掷一次骰子；模型也有权闭嘴。两条一起拦，才不会退化成每天一句问候。</div>
+            </div>
+            <div class="field">
+              <label>本会话每日上限（条）</label>
+              <input type="number" id="f-idle-limit" min="0" max="20" value="${p.proactive_daily_limit ?? 3}">
+              <div class="note">含到点提醒发出的消息；0 表示这个会话完全不主动。进程另有 60 条/天的硬顶。</div>
+            </div>
+            <div class="field">
+              <label>免打扰时段（小时）</label>
+              <div class="row" style="gap:8px">
+                <input type="number" id="f-quiet-s" min="0" max="24" value="${p.quiet_start_hour ?? 23}" aria-label="免打扰开始">
+                <span>至</span>
+                <input type="number" id="f-quiet-e" min="0" max="24" value="${p.quiet_end_hour ?? 8}" aria-label="免打扰结束">
+              </div>
+              <div class="note">支持跨零点（23 至 8）；两个数相同表示不启用，0 至 24 表示全天不主动。
+              它只拦"机器人自己想说话"，你让它到点提醒的事照发。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>节奏 <span class="hint">同样回一句话，像不像人主要差在这里</span></h3>
+          <label class="check">
+            <input type="checkbox" id="f-tm" ${(tm.enabled ? 'checked' : '')}>
+            <span>按真人节奏发送
+              <span class="note">先停顿（看到 → 想一下），再按字数模拟打字时间，偶尔"人不在"晚点回。
+              关掉就是旧行为：模型一返回立刻发。它不会让机器人多说一个字，只改时序。</span>
+            </span>
+          </label>
+          <div class="grid c2">
+            <div class="field">
+              <label>思考停顿（毫秒）</label>
+              <div class="row" style="gap:8px">
+                <input type="number" id="f-tm-think-min" min="0" max="10000" value="${tm.think_min_ms ?? 400}" aria-label="停顿下限">
+                <span>至</span>
+                <input type="number" id="f-tm-think-max" min="0" max="10000" value="${tm.think_max_ms ?? 2400}" aria-label="停顿上限">
+              </div>
+              <div class="note">多数落在靠近下限的一侧，偶尔拖到上限——长尾分布，不是均匀随机。</div>
+            </div>
+            <div class="field">
+              <label>打字速度（字/秒）</label>
+              <input type="number" id="f-tm-cps" step="0.5" min="1" max="30" value="${tm.typing_cps ?? 5}">
+              <div class="note">20 字大约 4 秒。调太快等于没开，太慢会像卡住。</div>
+            </div>
+            <div class="field">
+              <label>晚点回的概率</label>
+              <input type="number" id="f-tm-late" step="0.05" min="0" max="1" value="${tm.late_rate ?? 0.1}">
+              <div class="note">模拟"人不在"。这期间对方再发消息，会立刻打断等待、马上发。</div>
+            </div>
+            <div class="field">
+              <label>晚回时长（秒）</label>
+              <div class="row" style="gap:8px">
+                <input type="number" id="f-tm-late-min" min="10" max="3600" value="${tm.late_min_sec ?? 60}" aria-label="迟到下限">
+                <span>至</span>
+                <input type="number" id="f-tm-late-max" min="10" max="3600" value="${tm.late_max_sec ?? 300}" aria-label="迟到上限">
+              </div>
+              <div class="note">不要调得很大：迟到的回复比不回复更糟。</div>
             </div>
           </div>
         </div>
@@ -854,6 +933,24 @@
                   echo_max_sec: Number($('#f-echo-max').value),
                   echo_cooldown_min: Number($('#f-echo-cd').value),
                   echo_daily_limit: Number($('#f-echo-limit').value),
+                  // 勾上但填 0 时给一个能用的默认值：0 的语义是"关闭"，
+                  // 勾了却存成 0，用户会看到开关弹回去，以为没保存上。
+                  idle_after_min: $('#f-idle').checked
+                    ? Math.max(5, Number($('#f-idle-after').value) || 45)
+                    : 0,
+                  idle_rate: Number($('#f-idle-rate').value),
+                  proactive_daily_limit: Number($('#f-idle-limit').value),
+                  quiet_start_hour: Number($('#f-quiet-s').value),
+                  quiet_end_hour: Number($('#f-quiet-e').value),
+                },
+                timing: {
+                  enabled: $('#f-tm').checked,
+                  think_min_ms: Number($('#f-tm-think-min').value),
+                  think_max_ms: Number($('#f-tm-think-max').value),
+                  typing_cps: Number($('#f-tm-cps').value),
+                  late_rate: Number($('#f-tm-late').value),
+                  late_min_sec: Number($('#f-tm-late-min').value),
+                  late_max_sec: Number($('#f-tm-late-max').value),
                 },
                 images: {
                   enabled: $('#f-img').checked,
@@ -1039,6 +1136,11 @@
         </div>
         ${ovrNum('f-echo-cd', '本会话冷却（分钟）', v.echo_cooldown_min, 0, 1440, '两次跟进的最小间隔。')}
         ${ovrNum('f-echo-limit', '每日上限（条）', v.echo_daily_limit, 0, 100, '只算本会话，各会话互不占用额度。')}
+        ${ovrNum('f-idle-after', '闲置后开口（分钟）', v.idle_after_min, 0, 2880, '0 表示这个会话不主动开口；只对私聊生效。')}
+        ${ovrNum('f-idle-rate', '开口概率', v.idle_rate, 0, 1, '到点仍要掷一次骰子。', '0.05')}
+        ${ovrNum('f-idle-limit', '本会话每日主动上限', v.proactive_daily_limit, 0, 20, '含到点提醒；0 表示完全不主动。')}
+        ${ovrNum('f-quiet-s', '免打扰开始（小时）', v.quiet_start_hour, 0, 24, '两个数相同表示不启用；0 至 24 表示全天不主动。')}
+        ${ovrNum('f-quiet-e', '免打扰结束（小时）', v.quiet_end_hour, 0, 24, '支持跨零点，例如 23 至 8。')}
       </div>`;
   }
 
@@ -1083,6 +1185,11 @@
         echo_max_sec: num('#f-echo-max'),
         echo_cooldown_min: num('#f-echo-cd'),
         echo_daily_limit: num('#f-echo-limit'),
+        idle_after_min: num('#f-idle-after'),
+        idle_rate: num('#f-idle-rate'),
+        proactive_daily_limit: num('#f-idle-limit'),
+        quiet_start_hour: num('#f-quiet-s'),
+        quiet_end_hour: num('#f-quiet-e'),
       };
     }
     if (g === 'images') {

@@ -2,6 +2,16 @@
 export { Engine, type EngineOptions, type Sender } from './engine';
 export { ECHO_INSTRUCTION, echoDelayMs, shouldEcho, type EchoGateState } from './echo';
 export {
+  MAX_LEAD_MS,
+  MAX_SEG_TYPING_MS,
+  lateDelayMs,
+  planSpeech,
+  speakUnits,
+  typingMs,
+  weightedBetween,
+  type SpeechPlan,
+} from './timing';
+export {
   dedupeImages,
   dedupeKeepOrder,
   extractImageTags,
@@ -59,3 +69,26 @@ export {
   type SearchHit,
 } from './search';
 export { Cooldown, Dedupe, TaskQueue } from './queue';
+export {
+  IDLE_MIN_GAP_MS,
+  alarmInstruction,
+  idleInstruction,
+  inQuietHours,
+  planIdle,
+  type IdleDecision,
+  type IdleOptions,
+  type IdleState,
+} from './scheduler';
+export {
+  MAX_REMIND_BODY,
+  MAX_REMIND_MINUTES,
+  MIN_REMIND_MINUTES,
+  REMIND_PROMPT,
+  REMIND_TOOL,
+  REMIND_TOOL_NAME,
+  parseDueAt,
+  readRemindArgs,
+  type DueErr,
+  type DueOk,
+  type RemindArgs,
+} from './remind';

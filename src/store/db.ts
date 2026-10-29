@@ -148,6 +148,34 @@ const MIGRATIONS: string[] = [
     updated_at  INTEGER NOT NULL
   );
   `,
+  // v7：预排的主动消息（"闹钟"）。
+  //
+  // 为什么必须落库、而不能只靠内存里的 setTimeout：
+  // 进程重启、`qqbot up` 重建容器、OOM 被杀（1 核 2G 上很常见），
+  // 内存里的定时器全都没了。用户昨天让机器人"明早提醒我交房租"，
+  // 早上容器刚好重建过一次，这条提醒就凭空消失——而面板上会显示"已设置"。
+  //
+  // 不放 pendingEcho 那种"排定即执行"的路由里，也刻意不建外键：
+  // 与 v3/v4/v6 是同一个教训——预设的对话对象可能还没有 sessions 行。
+  //
+  // status 用文本而不是布尔：将来会有 'expired'（过期未发）与
+  // 'cancelled'（用户撤了），用 done 一个字段表达不了"为什么没发"。
+  `
+  CREATE TABLE scheduled_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    kind       TEXT    NOT NULL CHECK (kind IN ('group', 'private')),
+    target_id  INTEGER NOT NULL,
+    due_at     INTEGER NOT NULL,
+    source     TEXT    NOT NULL DEFAULT 'tool',
+    body       TEXT    NOT NULL DEFAULT '',
+    status     TEXT    NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL,
+    fired_at   INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX ix_sched_due ON scheduled_messages(status, due_at);
+  CREATE INDEX ix_sched_session ON scheduled_messages(session_id, status);
+  `,
 ];
 
 export class Db {

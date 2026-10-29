@@ -71,6 +71,9 @@ function makeHarness(opts: {
     // 段间延迟归零：这里测的是"读没读设置"，不是真的等 300ms
     v.bot.seg_delay_min_ms = 0;
     v.bot.seg_delay_max_ms = 0;
+    // 拟人节奏同理归零：思考与打字耗时会让每条用例多等几秒，
+    // 而这一层的行为由 timing.test.ts 单独钉，不在这里重复验证。
+    v.timing.enabled = false;
     opts.patch?.(v);
   });
 
@@ -942,7 +945,7 @@ describe('电脑操作', () => {
     });
   }
 
-  it('主人私聊：四个工具一起下发，system 里带工作目录', async () => {
+  it('主人私聊：电脑操作工具 + 定时消息一起下发，system 里带工作目录', async () => {
     const seen: { msgs: LlmMessage[]; tools?: ToolDef[] }[] = [];
     const h = cmp({
       llm: async (msgs, tools) => {
@@ -956,8 +959,17 @@ describe('电脑操作', () => {
 
       const first = seen[0]!;
       const names = (first.tools ?? []).map((t) => t.function.name).sort();
-      assert.deepEqual(names, ['list_dir', 'read_file', 'run_command', 'write_file']);
+      // schedule_message 与电脑操作共用同一道权限：能在这台机器上动手的人，
+      // 才配让这个号替自己到点说话。所以它出现在这里而不是另一套白名单里。
+      assert.deepEqual(names, [
+        'list_dir',
+        'read_file',
+        'run_command',
+        'schedule_message',
+        'write_file',
+      ]);
       assert.match(contentText(first.msgs[0]!.content), /默认工作目录/);
+      assert.match(contentText(first.msgs[0]!.content), /schedule_message/);
     } finally {
       h.cleanup();
     }

@@ -55,6 +55,58 @@ export interface ProactiveSettings {
    * 覆盖像是没生效。总量另有进程级硬顶兜底（引擎的 ECHO_DAILY_HARD_CAP）。
    */
   echo_daily_limit: number;
+
+  // ---- 以下为「闲置唤醒」——目前唯一一种真正的主动开口 ----
+  //
+  // 与回声跟进的差别：跟进发生在"刚聊完"，对方明确还在；闲置唤醒发生在
+  // "对方说完最后一句、机器人没接住"之后，隔了一段时间再回头补。
+  // 后者更自然，也更危险（可能已经没人在了），所以默认值更保守：
+  // 只看私聊、默认 45 分钟、每天几条。
+
+  /**
+   * 对方说完最后一句、隔多少分钟后可以主动开口。0 表示关闭。
+   *
+   * 只对**私聊**生效：群里机器人突然插话是扰民，且更容易被判定为营销号。
+   * 群里的主动消息只能来自模型自己排的闹钟（schedule_message）。
+   */
+  idle_after_min: number;
+  /** 满足闲置条件后仍要掷一次骰子，0-1。 */
+  idle_rate: number;
+  /** 本会话每日主动开口上限（含闹钟发的），0 表示关闭。 */
+  proactive_daily_limit: number;
+  /**
+   * 免打扰时段：从 quiet_start_hour 到 quiet_end_hour 之间不主动说话（本地时区）。
+   * 两个值相等表示不启用。支持跨零点的窗（23 → 8）。
+   */
+  quiet_start_hour: number;
+  quiet_end_hour: number;
+}
+
+/**
+ * 拟人节奏配置：怎么"把字打出来"。
+ *
+ * 与主动发言分开：那个决定**说不说**，这个决定**说完之后看起来像不像人**。
+ * 两者混成一块的话，想关掉"主动插话"的人会连打字节奏一起丢掉。
+ *
+ * 出厂**开**着，与主动发言不同。理由：这不会让机器人多说一个字，
+ * 只是把已有回复的时序改得像人，风险为零；默认关掉等于用户
+ * 永远看不到这个能力——而"一问一答太假"正是最劝退的体验。
+ */
+export interface TimingSettings {
+  /** 关掉即回到旧行为：收到消息立刻发，段间只按 seg_delay_* 抖一下。 */
+  enabled: boolean;
+  /** 「看到消息」到「开始打字」的停顿下限（毫秒）。 */
+  think_min_ms: number;
+  /** 同上，上限。采样落在 [min, max]，带长尾。 */
+  think_max_ms: number;
+  /** 打字速度（字/秒）。中文按字、英文按半字计。 */
+  typing_cps: number;
+  /** 整条回复"晚点再发"的概率，0 表示永不迟到。 */
+  late_rate: number;
+  /** 迟到时长的下限（秒）。 */
+  late_min_sec: number;
+  /** 迟到时长的上限（秒）。**不要调得很大**：迟到的回复比不回复更糟。 */
+  late_max_sec: number;
 }
 
 /**
@@ -162,6 +214,7 @@ export interface Settings {
   llm: LLMSettings;
   bot: BotSettings;
   proactive: ProactiveSettings;
+  timing: TimingSettings;
   images: ImageSettings;
   vision: VisionSettings;
   search: SearchSettings;
@@ -179,6 +232,33 @@ export function defaultProactive(): ProactiveSettings {
     echo_max_sec: 90,
     echo_cooldown_min: 30,
     echo_daily_limit: 5,
+    // 闲置唤醒出厂也是关的：这是唯一一种"没人说话时机器人自己开口"的能力，
+    // 要不要让一个号在你的好友列表里主动发消息，得你自己决定。
+    idle_after_min: 0,
+    idle_rate: 0.3,
+    proactive_daily_limit: 3,
+    quiet_start_hour: 23,
+    quiet_end_hour: 8,
+  };
+}
+
+/**
+ * 拟人节奏的出厂默认值。
+ *
+ * 数值都取"能看出人味、又不至于让人等"的那一档：
+ * 思考 0.4-2.4 秒、5 字/秒，一条 20 字的回复大约等 4-6 秒。
+ * 再慢就进入"这机器人是不是卡了"的区间，比机械更糟。
+ * 迟发默认 10%、最多 5 分钟，且会被新消息打断（见引擎的 waitLate）。
+ */
+export function defaultTiming(): TimingSettings {
+  return {
+    enabled: true,
+    think_min_ms: 400,
+    think_max_ms: 2400,
+    typing_cps: 5,
+    late_rate: 0.1,
+    late_min_sec: 60,
+    late_max_sec: 300,
   };
 }
 
@@ -265,6 +345,7 @@ export function defaultSettings(): Settings {
       quote_reply: true,
     },
     proactive: defaultProactive(),
+    timing: defaultTiming(),
     images: defaultImages(),
     vision: defaultVision(),
     search: defaultSearch(),
@@ -296,6 +377,47 @@ export function normalizeSettings(v: Settings): Settings {
   // 这个块只能从面板整块保存，不存在"半新半旧"的中间态。
   if (v.proactive === undefined || v.proactive === null || typeof v.proactive !== 'object') {
     v.proactive = defaultProactive();
+  } else {
+    // 块在、但缺后加的字段（老库升上来的常态）：逐字段兜。
+    // 这里是**必须**的，不是洁癖：idle_after_min 为 undefined 时
+    // `undefined <= 0` 是 false，闲置唤醒会被当成"开着"，随后拿
+    // NaN 去比时间——表现是开机就对着几个老会话乱发消息。
+    const dp = defaultProactive();
+    const p = v.proactive;
+    const nums: [keyof ProactiveSettings, number][] = [
+      ['echo_rate', dp.echo_rate],
+      ['echo_min_sec', dp.echo_min_sec],
+      ['echo_max_sec', dp.echo_max_sec],
+      ['echo_cooldown_min', dp.echo_cooldown_min],
+      ['echo_daily_limit', dp.echo_daily_limit],
+      ['idle_after_min', dp.idle_after_min],
+      ['idle_rate', dp.idle_rate],
+      ['proactive_daily_limit', dp.proactive_daily_limit],
+      ['quiet_start_hour', dp.quiet_start_hour],
+      ['quiet_end_hour', dp.quiet_end_hour],
+    ];
+    for (const [k, fallback] of nums) {
+      if (!Number.isFinite(p[k])) (p[k] as number) = fallback;
+    }
+    if (typeof p.echo_enabled !== 'boolean') p.echo_enabled = dp.echo_enabled;
+  }
+  // 旧库没有 timing 块：整块补默认值（开着的）。补上之后升级即生效，
+  // 不需要用户再去点一下——这正是他想解决的问题。
+  if (v.timing === undefined || v.timing === null || typeof v.timing !== 'object') {
+    v.timing = defaultTiming();
+  } else {
+    // 字段级兜底在这里比别的块更要紧：NaN 进 setTimeout 会 1 毫秒触发，
+    // 表现成"每条都秒回"；typing_cps 为 0 则让打字耗时变成 Infinity 再被截断，
+    // 表面看是"每条都等满 8 秒"。这类故障看起来像玄学，其实是脏数据。
+    const dt = defaultTiming();
+    const t = v.timing;
+    if (typeof t.enabled !== 'boolean') t.enabled = dt.enabled;
+    if (!Number.isFinite(t.think_min_ms)) t.think_min_ms = dt.think_min_ms;
+    if (!Number.isFinite(t.think_max_ms)) t.think_max_ms = dt.think_max_ms;
+    if (!Number.isFinite(t.typing_cps) || t.typing_cps <= 0) t.typing_cps = dt.typing_cps;
+    if (!Number.isFinite(t.late_rate)) t.late_rate = dt.late_rate;
+    if (!Number.isFinite(t.late_min_sec)) t.late_min_sec = dt.late_min_sec;
+    if (!Number.isFinite(t.late_max_sec)) t.late_max_sec = dt.late_max_sec;
   }
   // 旧库没有 images 块：整个补成默认值，理由同 proactive。
   if (v.images === undefined || v.images === null || typeof v.images !== 'object') {
@@ -359,6 +481,7 @@ export function cloneSettings(v: Settings): Settings {
       blacklist_users: [...v.bot.blacklist_users],
     },
     proactive: { ...v.proactive },
+    timing: { ...v.timing },
     images: { ...v.images },
     vision: { ...v.vision },
     search: { ...v.search },

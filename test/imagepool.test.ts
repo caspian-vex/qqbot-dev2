@@ -419,6 +419,8 @@ function setup(replyText: string, imagesEnabled: boolean, poolFile?: string): Ha
   stores.push(store);
   const s = defaultSettings();
   s.images.enabled = imagesEnabled;
+  // 拟人节奏关掉：图池用例只关心发没发图，不关心等了几秒
+  s.timing.enabled = false;
   store.settings.save(s);
 
   const imagesDir = join(home, 'images');

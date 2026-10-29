@@ -135,7 +135,7 @@ describe('合成生效设置', () => {
     const g = defaultSettings();
     const r = resolveSettings(g, {
       bot: { ...pickBot(g.bot), group_cooldown_sec: 5 },
-      proactive: { echo_enabled: true, echo_rate: 1, echo_min_sec: 5, echo_max_sec: 10, echo_cooldown_min: 0, echo_daily_limit: 3 },
+      proactive: { ...g.proactive, echo_enabled: true, echo_rate: 1, echo_daily_limit: 3 },
       images: { enabled: true, max_per_reply: 3 },
       vision: { enabled: false, max_images: 1 },
       search: { enabled: true, max_results: 3, timeout_sec: 5, max_calls: 1 },

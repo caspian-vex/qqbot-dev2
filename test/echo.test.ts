@@ -114,6 +114,8 @@ function makeHarness(echoPatch: Record<string, unknown> = {}): Harness {
     // 群消息走被动接话：钉成必触发，用例才不依赖随机数
     v.bot.passive_rate = 1;
     v.bot.group_cooldown_sec = 0;
+    // 拟人节奏关掉：这里要验的是"排没排、发没发"，不是真的等几秒
+    v.timing.enabled = false;
     Object.assign(v.proactive, {
       echo_enabled: true,
       echo_rate: 1,
@@ -213,6 +215,7 @@ describe('回声式跟进链路', () => {
     tmpDirs.push(dir);
     const store = new Store(join(dir, 'qqbot.db'));
     store.settings.update((v) => {
+      v.timing.enabled = false;
       Object.assign(v.proactive, {
         echo_enabled: true,
         echo_rate: 1,

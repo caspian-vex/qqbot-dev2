@@ -1751,3 +1751,80 @@ describe('电脑操作审批', () => {
     }
   });
 });
+
+describe('节奏与主动开口的设置', () => {
+  async function put(
+    h: Awaited<ReturnType<typeof harness>>,
+    c: { header: string; csrf: string },
+    body: unknown,
+  ): Promise<Response> {
+    return fetch(`${h.base}/api/settings`, {
+      method: 'PUT',
+      headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('节奏设置能存能读，且在 GET 里原样返回', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await put(h, c, {
+        timing: { enabled: true, think_min_ms: 500, think_max_ms: 3000, typing_cps: 6, late_rate: 0.2, late_min_sec: 30, late_max_sec: 120 },
+      });
+      assert.equal(res.status, 200);
+
+      const got = (await (await fetch(`${h.base}/api/settings`, { headers: { Cookie: c.header } })).json()) as {
+        timing: Record<string, unknown>;
+      };
+      assert.equal(got.timing.typing_cps, 6);
+      assert.equal(got.timing.think_max_ms, 3000);
+      assert.equal(got.timing.late_max_sec, 120);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('明显不合法的节奏值一律 400，不要存成"看起来设置了"', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ timing: { think_min_ms: 9000, think_max_ms: 100 } }, '思考停顿应在 0-10000 毫秒之间，且上限不小于下限'],
+        [{ timing: { think_max_ms: 20000 } }, '思考停顿应在 0-10000 毫秒之间，且上限不小于下限'],
+        [{ timing: { typing_cps: 0 } }, '打字速度应在 1-30 字/秒之间'],
+        [{ timing: { typing_cps: 100 } }, '打字速度应在 1-30 字/秒之间'],
+        [{ timing: { late_rate: 1.5 } }, '晚点回的概率应在 0-1 之间'],
+        [{ timing: { late_min_sec: 600, late_max_sec: 60 } }, '晚回时长应在 10-3600 秒之间，且上限不小于下限'],
+      ];
+      for (const [payload, msg] of cases) {
+        const res = await put(h, c, payload);
+        assert.equal(res.status, 400, JSON.stringify(payload));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('闲置与免打扰的取值范围也要卡住', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ proactive: { idle_after_min: -1 } }, '闲置时长应在 0-2880 分钟之间（0 表示关闭）'],
+        [{ proactive: { idle_after_min: 9999 } }, '闲置时长应在 0-2880 分钟之间（0 表示关闭）'],
+        [{ proactive: { idle_rate: 2 } }, '闲置开口概率应在 0-1 之间'],
+        [{ proactive: { proactive_daily_limit: 99 } }, '每日主动上限应在 0-20 条之间'],
+        [{ proactive: { quiet_start_hour: 25 } }, '免打扰时段应在 0-24 点之间'],
+      ];
+      for (const [payload, msg] of cases) {
+        const res = await put(h, c, payload);
+        assert.equal(res.status, 400, JSON.stringify(payload));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+});

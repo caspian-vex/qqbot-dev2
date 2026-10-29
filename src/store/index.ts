@@ -1,6 +1,7 @@
 // 持久化层入口：把各仓储组合成一个 Store。
 import { Db } from './db';
 import { ImageTagRepo } from './image-tags';
+import { ScheduledRepo } from './scheduled';
 import { SettingsRepo } from './settings';
 import { PersonaRepo } from './persona';
 import { SessionRepo } from './session';
@@ -18,6 +19,8 @@ export class Store {
   readonly usage: UsageRepo;
   readonly audit: AuditRepo;
   readonly imageTags: ImageTagRepo;
+  /** 预排的主动消息（"闹钟"）。落库而不是放内存，见 scheduled.ts 顶部说明。 */
+  readonly scheduled: ScheduledRepo;
 
   constructor(readonly path: string) {
     this.db = new Db(path);
@@ -28,6 +31,7 @@ export class Store {
     this.usage = new UsageRepo(this.db);
     this.audit = new AuditRepo(this.db);
     this.imageTags = new ImageTagRepo(this.db);
+    this.scheduled = new ScheduledRepo(this.db);
   }
 
   /** 注入加解密器；之后读写的敏感字段自动走 AES-256-GCM。 */
@@ -63,4 +67,13 @@ export {
   type OverridableGroup,
 } from './overrides';
 export { UsageRepo, AuditRepo } from './usage';
+export {
+  ScheduledRepo,
+  MAX_PENDING_PER_SESSION,
+  EXPIRE_AFTER_SEC,
+  type ScheduledRow,
+  type NewSchedule,
+  type ScheduledSource,
+  type ScheduledStatus,
+} from './scheduled';
 export { ImageTagRepo, type ImageTag } from './image-tags';

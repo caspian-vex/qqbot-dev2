@@ -172,6 +172,7 @@ async function cmdRun(argv: string[]): Promise<void> {
       log.error('协议端连接协程异常退出', { err: e });
     });
     void fetchLoginInfo(ac.signal, client, engine, log);
+    void tickLoop(engine, ac.signal, log);
 
     await waitForSignal(log);
     log.info('收到退出信号，正在关闭');
@@ -211,6 +212,28 @@ async function fetchLoginInfo(
     } catch (e) {
       log.debug('获取登录信息失败', { err: e });
     }
+  }
+}
+
+/**
+ * 每分钟驱动一次引擎的调度：到期的闹钟与闲置唤醒。
+ *
+ * 为什么轮询而不是给每条消息挂 setTimeout：定时消息要活过进程重启，
+ * 靠的是库里的 due_at（见 store/scheduled.ts）。轮询还有个副作用是好的
+ * ——系统时间被改（NTP 校准、容器迁移）时它会自然跟上，而 setTimeout
+ * 会按单调时钟一路错下去。
+ *
+ * 启动后立刻跑一轮：重启前欠着的闹钟不该再等 60 秒。
+ */
+async function tickLoop(engine: Engine, signal: AbortSignal, log: Logger): Promise<void> {
+  while (!signal.aborted) {
+    try {
+      await engine.tick();
+    } catch (e) {
+      // 引擎自己会兜一层，这里是最后的保险：调度线程不该整个死掉
+      log.warn('调度轮询异常', { err: e });
+    }
+    await sleep(60_000, signal);
   }
 }
 

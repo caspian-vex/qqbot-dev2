@@ -33,6 +33,24 @@ import {
   type ComputerActor,
 } from './computer';
 import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
+import { planSpeech, type SpeechPlan } from './timing';
+import {
+  IDLE_MIN_GAP_MS,
+  alarmInstruction,
+  idleInstruction,
+  inQuietHours,
+  planIdle,
+  type IdleState,
+} from './scheduler';
+import type { ScheduledRow } from '../store/scheduled';
+import {
+  MAX_REMIND_BODY,
+  REMIND_PROMPT,
+  REMIND_TOOL,
+  REMIND_TOOL_NAME,
+  parseDueAt,
+  readRemindArgs,
+} from './remind';
 import {
   dedupeImages,
   extractImageTags,
@@ -118,6 +136,21 @@ const TOOL_MAX_ROUNDS = 4;
  */
 const ECHO_DAILY_HARD_CAP = 100;
 
+/**
+ * 进程级每日"主动开口"硬顶（闲置唤醒 + 闹钟），同样不可配置。
+ *
+ * 与 ECHO_DAILY_HARD_CAP 分开计数：这是**没有对方消息触发**的发消息，
+ * 风控上比"补一句"敏感一个量级。Σ(各会话上限) 可以被配置放大，
+ * 这道闸不能——一个号一天主动发 100 条，基本等于在自证是机器人。
+ */
+const PROACTIVE_DAILY_HARD_CAP = 60;
+
+/** 一轮 tick 最多执行几条到期的闹钟。停机积压时别一次全放出去。 */
+const ALARM_BATCH = 4;
+
+/** 闲置唤醒只看最近这么多天有过动静的会话。 */
+const IDLE_LOOKBACK_MS = 7 * 24 * 3600_000;
+
 interface Counters {
   received: number;
   replied: number;
@@ -132,14 +165,16 @@ interface Counters {
 interface ToolScope {
   search: boolean;
   computer: boolean;
+  /** 排定时消息。与电脑操作同一道权限：能在这台机器上动手的人才配让它替自己说话。 */
+  schedule: boolean;
   /** 电脑操作的触发者。权限不通过时 computer=false，这个字段也不会被用到。 */
   actor: ComputerActor;
 }
 
-/** 两类工具各自的次数预算。共用轮数、分开计数。 */
+/** 各类工具的次数预算。共用轮数、分开计数。 */
 interface ToolBudget {
-  used: { search: number; computer: number };
-  limit: { search: number; computer: number };
+  used: { search: number; computer: number; schedule: number };
+  limit: { search: number; computer: number; schedule: number };
 }
 
 /** 一个已排定、尚未执行的跟进。 */
@@ -166,6 +201,13 @@ export class Engine implements EnginePort {
   // ---- 回声式跟进的状态 ----
   /** 每个会话至多挂一个待执行的跟进。 */
   private readonly pendingEcho = new Map<string, PendingEcho>();
+  /**
+   * 正在"迟到等待"里的会话 → 提前放行的回调。
+   *
+   * 迟到的回复是刻意为之（模拟人不在），但对方追了一句就必须立刻发出去：
+   * 让他等满五分钟，比机械秒回更像故障。
+   */
+  private readonly lateWaiters = new Map<string, () => void>();
   /** 最近一次实际发出跟进的时间（毫秒），用于会话冷却。 */
   private readonly echoSentAt = new Map<string, number>();
   /**
@@ -180,6 +222,25 @@ export class Engine implements EnginePort {
   private echoTotal = 0;
   /** 进程重启即归零，方向是保守的。 */
   private echoDay = localDay();
+
+  // ---- 主动开口（闲置唤醒 + 闹钟）的状态 ----
+  /** 各会话今日主动说了几句，含闹钟。 */
+  private readonly proactiveCount = new Map<string, number>();
+  /** 各会话上次主动开口的时间（毫秒），用于 IDLE_MIN_GAP_MS。 */
+  private readonly proactiveAt = new Map<string, number>();
+  /** 今日全进程主动开口条数，只服务于 PROACTIVE_DAILY_HARD_CAP。 */
+  private proactiveTotal = 0;
+  private proactiveDay = localDay();
+  /**
+   * 各会话最近一次"有人说话"的时间。
+   *
+   * 用来在真正开口前复查：从排定到执行之间，对方可能已经自己接上了话，
+   * 这时再补一句就是答非所问。比"再查一次最后一条消息"更准——
+   * 同一秒内的两条消息靠时间戳分不出来，靠这个计数可以。
+   */
+  private readonly lastActivity = new Map<string, number>();
+  /** tick 重入保护：上一轮还在等模型时，下一分钟的 tick 不该叠上来。 */
+  private ticking = false;
 
   private selfId = 0;
   private botName = '';
@@ -267,9 +328,14 @@ export class Engine implements EnginePort {
     // kindOf/targetOf 是纯函数，提前算没有副作用；下面 cancelEcho 本来也要它。
     const sid = sessionKey(ev);
 
+    // 记下"这个会话刚刚有人说话"：正在排队的主动开口要据此复查
+    this.lastActivity.set(sid, Date.now());
+
     // 用户有新消息，之前排的跟进立刻作废——
     // 否则会出现"对方刚开口，机器人却先补上一句刚才的茬"的错位
     this.cancelEcho(sid);
+    // 同理：这条回复如果正在"故意迟到"，别再让他等，立刻发
+    this.flushLate(sid);
 
     let settings: Settings;
     try {
@@ -424,6 +490,8 @@ export class Engine implements EnginePort {
     const computer = computerAccess(settings.computer, actor);
     if (computer.allowed) {
       system += `\n${computerPromptBlock(settings.computer, resolveWorkdir(settings.computer, this.dataDir))}`;
+      // 排闹钟与电脑操作同一道权限，说明也一起给：只在能排的时候告诉模型能排
+      system += `\n${REMIND_PROMPT}`;
     } else if (settings.computer.enabled) {
       // 开关开着但不适用于这个人/这个群：不注入说明、不下发工具，
       // 模型就不会承诺"我帮你看一下"，用户也不会白等一次超时。
@@ -462,6 +530,9 @@ export class Engine implements EnginePort {
       res = await this.ask(settings, cfg, msgs, {
         search: settings.search.enabled,
         computer: computer.allowed,
+        // 排闹钟与电脑操作同级：两者都是"这个号可以替你做点事"，
+        // 分成两套权限表只会让面板多一处会配错的开关。
+        schedule: computer.allowed,
         actor,
       });
     } catch (e) {
@@ -523,8 +594,17 @@ export class Engine implements EnginePort {
       maxRunes: 120,
     });
 
+    // 节奏在这里排定：多长、分几段、要不要迟到。晚到这一步才排，
+    // 是因为它依赖真实的分段结果——按"模型说了多少字"算打字时间，
+    // 不能按"模型原样输出了多少字"算，stripMarkdown 与分图标记都会变短。
+    const plan = this.pace(segs, settings);
+    if (plan && plan.lateMs > 0) {
+      this.log.debug('这条晚点回', { session: sid, late_ms: plan.lateMs });
+      await this.waitLate(sid, plan.lateMs);
+    }
+
     try {
-      if (segs.length > 0) await this.sendText(ev, segs, settings);
+      if (segs.length > 0) await this.sendText(ev, segs, settings, plan);
       // 图片跟在文字后面：先说话再甩图，符合真人"配图"的节奏
       if (picked.length > 0) await this.sendImages(ev, picked);
     } catch (e) {
@@ -566,6 +646,7 @@ export class Engine implements EnginePort {
     const tools: ToolDef[] = [];
     if (scope.search) tools.push(WEB_SEARCH_TOOL);
     if (scope.computer) tools.push(...computerTools());
+    if (scope.schedule) tools.push(REMIND_TOOL);
     // 一个工具都没开：请求形状与加工具之前逐字一致。少带两个字段，也就少
     // 一类"某个中转不认 tools 却又不报错"的兼容问题。
     if (tools.length === 0) return this.llm.chat(cfg, msgs, this.opt.signal);
@@ -576,8 +657,14 @@ export class Engine implements EnginePort {
 
     // max_calls 是成本硬闸。NaN 时 Math.max(1, NaN) 还是 NaN，
     // 比较恒为假会让工具一次都不给；normalize 已经兜过一层，这里再兜一层。
-    const limit = { search: intOr(s.search.max_calls, 2), computer: intOr(s.computer.max_calls, 1) };
-    const budget: ToolBudget = { used: { search: 0, computer: 0 }, limit };
+    const limit = {
+      search: intOr(s.search.max_calls, 2),
+      computer: intOr(s.computer.max_calls, 1),
+      // 一条消息里排一个闹钟就够了。给多了，一次"提醒我三件事"就会排成三个
+      // 各自到点的消息，而用户其实只想收到一句。
+      schedule: 1,
+    };
+    const budget: ToolBudget = { used: { search: 0, computer: 0, schedule: 0 }, limit };
     // 两类工具共用这条轮数预算，但次数各算各的：搜索贵在请求费，
     // 命令贵在它要一个真人点批准，混成一个计数器会让其中一类莫名少用。
     //
@@ -586,7 +673,8 @@ export class Engine implements EnginePort {
     // 模型就会一遍遍请求搜索、每次只收到一句"次数已用完"。
     const left = (): number =>
       (scope.search ? limit.search - budget.used.search : 0) +
-      (scope.computer ? limit.computer - budget.used.computer : 0);
+      (scope.computer ? limit.computer - budget.used.computer : 0) +
+      (scope.schedule ? limit.schedule - budget.used.schedule : 0);
 
     let convo = msgs;
     let promptTokens = 0;
@@ -725,6 +813,21 @@ export class Engine implements EnginePort {
         continue;
       }
 
+      if (name === REMIND_TOOL_NAME) {
+        // 权限与电脑操作同源：没有那个权限就不可能走到这里
+        if (!scope.schedule) {
+          say(id, name, '这个会话没有安排定时消息的权限。');
+          continue;
+        }
+        if (budget.used.schedule >= budget.limit.schedule) {
+          say(id, name, '这次消息里已经安排过一条了，需要另排请让用户下一条再说。');
+          continue;
+        }
+        budget.used.schedule++;
+        say(id, name, this.runRemind(args, scope.actor));
+        continue;
+      }
+
       say(id, name, `没有名为 ${name} 的工具。`);
     }
 
@@ -740,6 +843,53 @@ export class Engine implements EnginePort {
       this.store.audit.record(action, detail, '');
     } catch {
       // 故意忽略
+    }
+  }
+
+  /**
+   * 处理 schedule_message：排一条、或撤掉已有的。
+   *
+   * 这里**不走审批**：它没有副作用，只往库里加一行，而且到点发的时候
+   * 还要再过日限。为一句"八点叫我"让用户去面板点批准，这功能就没人用了。
+   *
+   * 永不抛错：返回值会作为工具结果回灌给模型，让它自己决定怎么跟用户说。
+   */
+  private runRemind(rawArgs: string, actor: ComputerActor): string {
+    const a = readRemindArgs(rawArgs);
+
+    if (a.cancel) {
+      let n = 0;
+      try {
+        n = this.store.scheduled.cancelSession(actor.sid);
+      } catch (e) {
+        return `取消失败（${(e as Error).message}）。`;
+      }
+      if (n > 0) this.audit('schedule.cancel', `session=${actor.sid} count=${n}`);
+      return n > 0 ? `已取消 ${n} 条还没发出的定时消息。` : '这个会话当前没有待发的定时消息。';
+    }
+
+    const now = new Date();
+    const when = parseDueAt(a.at, a.after, now);
+    if ('error' in when) return `没有排上（${when.error}）。`;
+
+    const body = a.text.slice(0, MAX_REMIND_BODY).trim();
+    try {
+      const id = this.store.scheduled.add({
+        session_id: actor.sid,
+        kind: actor.kind,
+        target_id: actor.target,
+        due_at: Math.floor(when.dueAt / 1000),
+        body,
+        source: 'tool',
+      });
+      const at = formatLocalMinute(new Date(when.dueAt));
+      this.audit('schedule.add', `id=${id} at=${at} body=${body.slice(0, 80)}`);
+      this.log.info('已排定定时消息', { session: actor.sid, id, at });
+      return body === ''
+        ? `已排定：${at} 由你自己组织一句话发出去。到点会自己发，不需要用户再说话。`
+        : `已排定：${at} 主动说「${body}」。到点会自己发，不需要用户再说话。`;
+    } catch (e) {
+      return `没有排上（${(e as Error).message}）。`;
     }
   }
 
@@ -872,21 +1022,37 @@ export class Engine implements EnginePort {
   }
 
   /**
-   * 无事件发送：跟进没有原始消息可引用，也不 @，直接说话。
-   * 段间延迟与回复链路共用 seg_delay_*，两处节奏保持一致。
+   * 无事件发送：跟进与主动开口都没有原始消息可引用，也不 @，直接说话。
+   *
+   * 节奏与回复链路共用同一套 plan：主动说一句和回一句，在对方看来
+   * 应该是一样的打字速度，否则"这个号在某些时候打字特别快"本身就是破绽。
    */
-  private async sendTo(kind: string, target: number, segs: string[], s: Settings): Promise<void> {
+  private async sendTo(
+    kind: string,
+    target: number,
+    segs: string[],
+    s: Settings,
+    plan?: SpeechPlan,
+  ): Promise<void> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
+
+    const min = Math.max(0, s.bot.seg_delay_min_ms);
+    const max = Math.max(min, s.bot.seg_delay_max_ms);
+
     for (let i = 0; i < segs.length; i++) {
+      if (i === 0) {
+        if (plan) await sleep(plan.leadMs, this.opt.signal);
+      } else {
+        const wait = plan
+          ? (plan.gapsMs[i] ?? 0)
+          : min + Math.floor(Math.random() * (max - min));
+        await sleep(wait, this.opt.signal);
+      }
+
       const parts: Segment[] = [text(segs[i]!)];
       if (kind === 'group') await sender.sendGroup(target, parts, this.opt.signal);
       else await sender.sendPrivate(target, parts, this.opt.signal);
-      if (i < segs.length - 1) {
-        const min = Math.max(0, s.bot.seg_delay_min_ms);
-        const max = Math.max(min, s.bot.seg_delay_max_ms);
-        await sleep(min + Math.floor(Math.random() * (max - min)), this.opt.signal);
-      }
     }
   }
 
@@ -918,14 +1084,357 @@ export class Engine implements EnginePort {
     return this.pendingEcho.size;
   }
 
+  // ---- 时钟驱动：闹钟与闲置唤醒 ----
+  //
+  // 上面那一整套都是"收到消息"驱动的。这一节是唯一由**时间**驱动的入口：
+  // main.ts 每分钟调一次 tick()，它做两件事——把库里到期的闹钟发出去，
+  // 再看看有没有该由机器人主动开口的会话。
+
+  /**
+   * 一轮调度，默认每分钟一次。
+   *
+   * 重入保护不是洁癖：一轮里可能要问模型（闲置唤醒），1 核机器上
+   * 一次请求两秒起，赶上模型慢的时候会有好几轮 tick 叠在一起，
+   * 结果是同一个人被连问三句"你刚才说的那个事怎么样了"。
+   */
+  async tick(now: number = Date.now()): Promise<void> {
+    if (this.ticking) {
+      this.log.debug('上一轮调度还没结束，跳过本轮');
+      return;
+    }
+    this.ticking = true;
+    try {
+      await this.fireAlarms(now);
+      this.maybeIdle(now);
+    } catch (e) {
+      // 调度是后台动作：一轮失败不该让进程退出，下一分钟再来
+      this.log.warn('调度轮询失败', { err: e });
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  /** 当前待发的定时消息条数（诊断与面板用）。 */
+  pendingScheduledCount(): number {
+    try {
+      return this.store.scheduled.countPending();
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * 发出库里到期的闹钟。
+   *
+   * 先标 done 再发，是刻意选的"至多一次"：进程在两步之间挂掉时宁可漏一条，
+   * 也不要重启后把同一条再说一遍——机器人重复自己比沉默更像故障。
+   */
+  private async fireAlarms(now: number): Promise<void> {
+    const sec = Math.floor(now / 1000);
+    const expired = this.store.scheduled.expireStale(sec);
+    if (expired > 0) this.log.warn('有定时消息过期未发，已放弃', { count: expired });
+
+    const due = this.store.scheduled.due(sec, ALARM_BATCH);
+    for (const row of due) {
+      this.store.scheduled.markDone(row.id, sec);
+      // 进会话队列：与正常回复串行，历史顺序才不会错乱
+      const accepted = this.queue.submit(row.session_id, () => this.runAlarm(row, now));
+      if (!accepted) {
+        this.log.warn('会话排队已满，定时消息被丢弃', { session: row.session_id, id: row.id });
+      }
+    }
+  }
+
+  /**
+   * 执行一条到期消息。body 非空就直接发原话，否则让模型自己组织一句。
+   *
+   * 注意这里**不看免打扰**：免打扰管的是"机器人自己想说话"，
+   * 而这条是用户明确让它到点提醒的事——晚上十点设的闹钟被静默掉，
+   * 用户只会认为这个功能坏了。概率同理，也不再掷骰子。
+   */
+  private async runAlarm(row: ScheduledRow, now: number): Promise<void> {
+    const sid = row.session_id;
+    let settings: Settings;
+    try {
+      settings = this.resolveFor(sid);
+    } catch (e) {
+      this.log.warn('定时消息读取设置失败', { session: sid, err: e });
+      return;
+    }
+
+    this.rollProactiveDay();
+    const limit = settings.proactive.proactive_daily_limit;
+    if (limit <= 0 || (this.proactiveCount.get(sid) ?? 0) >= limit) {
+      this.log.info('本会话主动发言额度用尽，定时消息取消', { session: sid, id: row.id });
+      return;
+    }
+    if (this.proactiveTotal >= PROACTIVE_DAILY_HARD_CAP) {
+      this.log.warn('进程级主动消息额度用尽，定时消息取消', { session: sid, id: row.id });
+      return;
+    }
+
+    try {
+      const minutesLate = Math.max(0, Math.floor((now - row.due_at * 1000) / 60_000));
+      const body = row.body.trim();
+      const talk =
+        body === ''
+          ? await this.composeTalk(sid, row.kind, row.target_id, alarmInstruction(minutesLate), settings)
+          : body;
+      if (talk === '') {
+        this.log.debug('定时消息没有内容可说，放弃', { session: sid, id: row.id });
+        return;
+      }
+
+      const segs = split(talk, { maxSegments: 2, maxRunes: 80 });
+      if (segs.length === 0) return;
+
+      // 节奏照旧，但不含"迟到"——它本身已经到点了
+      const plan = this.pace(segs, settings);
+      await this.sendTo(row.kind, row.target_id, segs, settings, plan);
+
+      this.ctx.record(sid, 'assistant', talk, estimateTokens(talk));
+      this.bumpProactive(sid);
+      try {
+        this.store.sessions.touch(sid, row.kind, row.target_id, '');
+      } catch {
+        // 会话表写失败不该影响已经发出去的消息
+      }
+      this.log.info('已发定时消息', { session: sid, id: row.id, segments: segs.length });
+    } catch (e) {
+      // 闹钟失败不重试：下一次 tick 不该再捞到它（已经标 done 了）
+      this.log.warn('定时消息发送失败', { session: sid, id: row.id, err: e });
+    }
+  }
+
+  /**
+   * 看看有没有该主动开口的会话。
+   *
+   * 严格的成本顺序：先用本地规则（免打扰、上限、闲置时长）把候选压到
+   * 最多一个，再决定要不要为此花一次模型请求。1 核 2G 上给所有会话
+   * 每十分钟问一次模型是不可能的。
+   */
+  private maybeIdle(now: number): void {
+    this.rollProactiveDay();
+    if (this.proactiveTotal >= PROACTIVE_DAILY_HARD_CAP) return;
+
+    const states = this.collectIdleStates(now);
+    if (states.length === 0) return;
+
+    const d = planIdle(states, {
+      now,
+      globalLeft: PROACTIVE_DAILY_HARD_CAP - this.proactiveTotal,
+    });
+    if (!d.state) {
+      this.log.debug('本轮不主动开口', { reason: d.note, candidates: states.length });
+      return;
+    }
+
+    const st = d.state;
+    let settings: Settings;
+    try {
+      settings = this.resolveFor(st.sid);
+    } catch {
+      return;
+    }
+
+    const accepted = this.queue.submit(st.sid, () => this.runIdle(st, d.satForMin, settings));
+    if (!accepted) this.log.debug('会话排队已满，放弃本次主动开口', { session: st.sid });
+  }
+
+  /** 收集候选会话。只读库，不做任何判断以外的副作用。 */
+  private collectIdleStates(now: number): IdleState[] {
+    const out: IdleState[] = [];
+    let sessions;
+    try {
+      sessions = this.store.sessions.list(200);
+    } catch (e) {
+      this.log.warn('读取会话列表失败', { err: e });
+      return out;
+    }
+
+    for (const s of sessions) {
+      // 群聊不主动开口：见 scheduler.ts 里的说明
+      if (s.kind !== 'private' || s.messages <= 0) continue;
+      if (s.updated_at.getTime() < now - IDLE_LOOKBACK_MS) continue;
+
+      let pro;
+      try {
+        pro = this.resolveFor(s.id).proactive;
+      } catch {
+        continue;
+      }
+      if (pro.idle_after_min <= 0 || pro.proactive_daily_limit <= 0) continue;
+      // 免打扰按会话自己的窗口算，不是全局那一份
+      if (inQuietHours(new Date(now), pro.quiet_start_hour, pro.quiet_end_hour)) continue;
+
+      let last;
+      try {
+        last = this.store.sessions.recent(s.id, 1)[0];
+      } catch {
+        continue;
+      }
+      if (!last) continue;
+
+      out.push({
+        sid: s.id,
+        kind: 'private',
+        target: s.target_id,
+        lastRole: last.role,
+        lastAt: last.created_at.getTime(),
+        spokeToday: this.proactiveCount.get(s.id) ?? 0,
+        lastSpokeAt: this.proactiveAt.get(s.id) ?? 0,
+        // 门槛与概率都用本会话合成后的值：全局关着、会话单独开着也能生效
+        holdMs: Math.max(0, pro.idle_after_min) * 60_000,
+        rate: pro.idle_rate,
+        dailyLimit: pro.proactive_daily_limit,
+      });
+    }
+    return out;
+  }
+
+  /** 真的去说那句主动的话。 */
+  private async runIdle(st: IdleState, satForMin: number, settings: Settings): Promise<void> {
+    // 从排定到执行之间对方可能已经自己接上了话：只要这个会话有过新消息就放弃。
+    // 比"再看一眼最后一条是谁说的"更准——回复链自己也会写历史。
+    const act = this.lastActivity.get(st.sid) ?? 0;
+    if (act > st.lastAt) {
+      this.log.debug('对方已经接着说上了，放弃主动开口', { session: st.sid });
+      return;
+    }
+
+    let last;
+    try {
+      last = this.store.sessions.recent(st.sid, 1)[0];
+    } catch {
+      return;
+    }
+    if (!last || last.role !== 'user') return;
+
+    try {
+      const talk = await this.composeTalk(
+        st.sid,
+        st.kind,
+        st.target,
+        idleInstruction(satForMin, last.content, st.spokeToday, st.dailyLimit),
+        settings,
+      );
+      // 空输出是模型行使"闭嘴权"，这是主动发言里最重要的一条通路
+      if (talk === '') {
+        this.log.debug('没有想说的，放弃主动开口', { session: st.sid });
+        return;
+      }
+
+      const segs = split(talk, { maxSegments: 2, maxRunes: 80 });
+      if (segs.length === 0) return;
+
+      const plan = this.pace(segs, settings);
+      await this.sendTo(st.kind, st.target, segs, settings, plan);
+
+      this.ctx.record(st.sid, 'assistant', talk, estimateTokens(talk));
+      this.bumpProactive(st.sid);
+      try {
+        this.store.sessions.touch(st.sid, st.kind, st.target, '');
+      } catch {
+        // 同上
+      }
+      this.log.info('已主动开口', { session: st.sid, sat_min: satForMin, segments: segs.length });
+    } catch (e) {
+      // 与跟进同一哲学：锦上添花的功能，失败不重试、不兜底
+      this.log.debug('主动开口失败，放弃', { session: st.sid, err: e });
+    }
+  }
+
+  /**
+   * 组装一次"无事件"的发言：读人格、算上下文、问模型，返回要发的话。
+   *
+   * 不带任何工具：主动开口时去搜新闻、去执行命令都很出戏，
+   * 而且会额外花钱。真需要动手的场景一定有人先说话。
+   */
+  private async composeTalk(
+    sid: string,
+    kind: string,
+    target: number,
+    instruction: string,
+    settings: Settings,
+  ): Promise<string> {
+    const personaPrompt = this.store.personas.forSession(sid).system_prompt;
+    const vars = {
+      ...emptyVars(),
+      time: formatLocalMinute(new Date()),
+      botName: this.botName,
+      groupName: kind === 'group' ? await this.groupName(target) : '',
+      nickname: '',
+    };
+    const system = buildSystem(expand(personaPrompt, vars), vars);
+    const msgs = this.ctx.build(sid, settings.context, system, instruction);
+    const cfg: LlmConfig = {
+      baseURL: settings.llm.base_url,
+      apiKey: settings.llm.api_key,
+      model: settings.llm.model,
+      temperature: settings.llm.temperature,
+      maxTokens: settings.llm.max_tokens,
+      thinking: settings.llm.thinking,
+      timeoutMs: settings.llm.timeout_sec * 1000,
+    };
+    const res = await this.llm.chat(cfg, msgs, this.opt.signal);
+    // 主动消息也花 token：不记会让用量页少算，用户对不上账时很难解释
+    try {
+      this.store.usage.record(
+        settings.llm.model,
+        res.usage.prompt_tokens,
+        res.usage.completion_tokens,
+        isPeak(),
+      );
+    } catch {
+      // 记用量失败不影响发送
+    }
+    return extractImageTags(stripMarkdown(res.content)).text;
+  }
+
+  /** 记一次主动发言（计数 + 最近时间 + 进程总数）。 */
+  private bumpProactive(sid: string): void {
+    this.proactiveCount.set(sid, (this.proactiveCount.get(sid) ?? 0) + 1);
+    this.proactiveAt.set(sid, Date.now());
+    this.proactiveTotal++;
+  }
+
+  /** 跨天清零主动发言计数。 */
+  private rollProactiveDay(): void {
+    const day = localDay();
+    if (day === this.proactiveDay) return;
+    this.proactiveDay = day;
+    this.proactiveCount.clear();
+    // proactiveAt 不清：它是"两小时内别再说"的依据，跨零点照样成立
+    this.proactiveTotal = 0;
+  }
+
+  /**
+   * 排一次发言的节奏；节奏开关关着时返回 undefined。
+   *
+   * 必须显式判断开关，而不是靠"plan 全是 0"：plan 为 undefined 时
+   * sendText 会退回旧的段间固定抖动，而一个全 0 的 plan 会把它彻底关掉。
+   * 后者意味着"关掉拟人节奏"反而让消息发得更快、更机械，与承诺相反。
+   */
+  private pace(segs: string[], s: Settings): SpeechPlan | undefined {
+    return s.timing.enabled ? planSpeech(segs, s.timing) : undefined;
+  }
+
   /**
    * 按段发送文本，第一段附带引用或 @。
    *
-   * 段之间留随机间隔（区间读设置），模拟真人打字的节奏；最后一段不等待。
+   * 节奏来自 plan（拟人节奏）：第一段之前是"看到→想→打出来"的停顿，
+   * 段与段之间是"回车、接着打"的耗时。plan 缺席时退回旧的固定抖动
+   * （seg_delay_*）——关掉 timing 的用户行为与升级前逐字一致。
+   *
    * 引用还是 @ 由 bot.quote_reply 决定：关掉引用的用户往往嫌引用框占地方，
    * 这时退化成 @，否则群里一句话飘出来没人知道在回谁。
    */
-  private async sendText(ev: Event, segs: string[], s: Settings): Promise<number> {
+  private async sendText(
+    ev: Event,
+    segs: string[],
+    s: Settings,
+    plan?: SpeechPlan,
+  ): Promise<number> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
     if (segs.length === 0) return 0;
@@ -935,6 +1444,17 @@ export class Engine implements EnginePort {
 
     let lastId = 0;
     for (let i = 0; i < segs.length; i++) {
+      // 注意顺序：先等再说。旧实现是"说完等、等完说下一句"，
+      // 两者总时长一样，但先等才能表达"第一段之前也要停一下"。
+      if (i === 0) {
+        if (plan) await sleep(plan.leadMs, this.opt.signal);
+      } else {
+        const wait = plan
+          ? (plan.gapsMs[i] ?? 0)
+          : min + Math.floor(Math.random() * (max - min));
+        await sleep(wait, this.opt.signal);
+      }
+
       const parts: Segment[] = [];
 
       // 只有第一段带引用/@，后续段保持干净
@@ -949,13 +1469,39 @@ export class Engine implements EnginePort {
         ? await sender.sendGroup(ev.group_id ?? 0, parts, this.opt.signal)
         : await sender.sendPrivate(ev.user_id ?? 0, parts, this.opt.signal);
       lastId = id;
-
-      // 最后一段不等待
-      if (i < segs.length - 1) {
-        await sleep(min + Math.floor(Math.random() * (max - min)), this.opt.signal);
-      }
     }
     return lastId;
+  }
+
+  /**
+   * 故意晚点回：等到 ms 毫秒，或等到有新消息为止。
+   *
+   * 放在会话队列里是刻意的——同一会话本来串行，这条没发出去就不该
+   * 开始处理下一条，否则会出现"先答后问"。而 flushLate 由 handleMessage
+   * 直接调用（在队列之外），所以对方一追话就能立刻脱身。
+   */
+  private waitLate(sid: string, ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    const signal = this.opt.signal;
+    if (signal?.aborted) return Promise.resolve();
+
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        this.lateWaiters.delete(sid);
+        // 正常走完必须摘掉监听：一个长跑进程里积几百个 abort 监听会被 Node 警告
+        signal?.removeEventListener('abort', done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      this.lateWaiters.set(sid, done);
+      signal?.addEventListener('abort', done, { once: true });
+    });
+  }
+
+  /** 对方又开口了：别再让他等，立刻把手上这条发出去。 */
+  private flushLate(sid: string): void {
+    this.lateWaiters.get(sid)?.();
   }
 
   /**

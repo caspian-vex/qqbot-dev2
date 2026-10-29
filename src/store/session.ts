@@ -108,6 +108,9 @@ export class SessionRepo {
       this.db.run(`DELETE FROM messages WHERE session_id = ?`, sessionID);
       this.db.run(`DELETE FROM sessions WHERE id = ?`, sessionID);
       this.db.run(`DELETE FROM session_settings WHERE session_id = ?`, sessionID);
+      // 已经排上的主动消息也必须一起删：会话都没了，几天后它还冒出来
+      // 说一句"记得交房租"，用户只会觉得见鬼了。
+      this.db.run(`DELETE FROM scheduled_messages WHERE session_id = ?`, sessionID);
     });
   }
 
