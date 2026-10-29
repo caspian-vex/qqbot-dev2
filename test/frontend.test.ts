@@ -80,6 +80,23 @@ test('页头吸顶：滚到页面底部也能点到「保存设置」', () => {
   assert.equal((css.match(/--head-line:/g) || []).length, 2, '暗色与浅色各要定义一次');
 });
 
+test('吸附态的装饰不许凭空出现（滚到吸附那一刻会"抖一下"）', () => {
+  // 回归点：0.3.2 把页头做成吸顶后，用户反馈"往下滑的时候顶部栏抖一下"。
+  // 用 CDP 逐帧抓 screencast 截图量出来：布局位置一直是 0（getBoundingClientRect
+  // 不抖），但吸附那一帧页头下沿凭空多出 1px 亮线 + 阴影 + 12px 渐隐，单帧内
+  // 近三千个采样像素变色，下一帧又全静——就是这一下被看成"窜了一下"。
+  // 所以：线和阴影在基础态先占位（颜色 transparent），渐隐层常驻（opacity 0），
+  // is-stuck 只换颜色/透明度，120ms 过渡盖住那一帧的突变。
+  const block = css.match(/\.page-head\s*\{([^}]*)\}/);
+  const body = block?.[1] ?? '';
+  assert.match(body, /box-shadow:\s*0 1px 0 transparent/, '分隔线要在基础态占位');
+  assert.match(body, /transition:\s*box-shadow/, '线的出现要有过渡，不能硬切');
+  assert.match(css, /\.page-head::after\s*\{[^}]*opacity:\s*0/, '渐隐层要常驻且默认不可见');
+  assert.match(css, /\.page-head\.is-stuck::after\s*\{\s*opacity:\s*1/, '吸附时只改渐隐层的透明度');
+  // 反过来钉住：不能再回到"只有 .page-head.is-stuck::after 才定义 content"
+  assert.doesNotMatch(css, /\.page-head\.is-stuck::after\s*\{[^}]*content:/, '渐隐层不能只在吸附态创建');
+});
+
 test('被 JS 直接写 textContent 的 id 仍在能安全改写的元素上', () => {
   // #ps-ed-title / #ss-detail-title 是 h3 本身，被 textContent 赋值；
   // 一旦有人把按钮塞进这个 h3，赋值时按钮会被一起清掉（新建人格后保存按钮消失）。

@@ -363,6 +363,13 @@ a:hover { text-decoration: underline; }
   background: var(--bg);
   padding: 12px var(--pad-x) 20px;
   margin: -12px calc(var(--pad-x) * -1) 0;
+  /* 滚动到吸附那一刻，页头会"抖一下"。实测（CDP 逐帧抓 screencast 截图，1400×900）：
+     scrollY=15 那一帧页头下沿已经稳定在 86px、getBoundingClientRect().top 一直是 0
+     ——布局没动，但下沿凭空多出 1px 亮线 + 外阴影 + 12px 渐隐，单帧近三千个采样像素
+     变色，下一帧又全静。所以这两样在基础态就占好位、颜色先透明，is-stuck 只换颜色，
+     吸附时不再凭空多画东西。 */
+  box-shadow: 0 1px 0 transparent, 0 8px 16px -12px transparent;
+  transition: box-shadow .12s linear;
 }
 
 /* 只有真被内容压到顶部才画这条线。未滚动就画，等于每个页面顶部
@@ -374,8 +381,9 @@ a:hover { text-decoration: underline; }
 }
 
 /* 线下面 12px 的渐隐：卡片从页头底下是"淡出"的，不是被一刀切断。
-   纯视觉层，pointer-events:none 保证点不到它。 */
-.page-head.is-stuck::after {
+   纯视觉层，pointer-events:none 保证点不到它。
+   和上面那条线一样常驻，靠 opacity 切换——吸附时是 120ms 淡入，不是凭空出现。 */
+.page-head::after {
   content: '';
   position: absolute;
   left: 0;
@@ -384,7 +392,11 @@ a:hover { text-decoration: underline; }
   height: 12px;
   background: linear-gradient(var(--bg), transparent);
   pointer-events: none;
+  opacity: 0;
+  transition: opacity .12s linear;
 }
+
+.page-head.is-stuck::after { opacity: 1; }
 
 /* 吸顶页头常驻顶部约 87px（窄屏 79px）：Tab 键或锚点把控件滚进视口时，
    让它停在页头下方而不是被压住。只影响聚焦/锚点滚动，点击不触发。 */

@@ -12,6 +12,26 @@ git add -A && git commit -m "chore(release): v0.2.1"
 git tag v0.2.1 && git push origin main --tags
 ```
 
+## [0.3.3] - 2026-10-29
+
+### 修复
+
+- 滚动到页头刚吸住的那一帧，顶部栏会"抖一下"。用无头浏览器逐帧抓 screencast 截图定位：
+  布局位置全程连续（`getBoundingClientRect().top` 从 14 平滑走到 0，页头高恒定 86.14），
+  文字质心极差 0.000px，但吸附那一帧页头下沿凭空多出 1px 亮线、外阴影和 12px 渐隐，
+  单帧近三千个采样像素变色，下一帧又全静——就是这一下被看成"窜了一下"。
+- 改法：线与阴影在基础态就占位（颜色 `transparent`），12px 渐隐层常驻（`opacity: 0`），
+  `is-stuck` 只换颜色与透明度，用 120ms `transition` 盖住那一帧的突变。
+  （也试过 `will-change: transform` 让它常驻合成层：那一帧的重绘只是被摊到两帧，
+  没消失，还有让文字丢掉次像素抗锯齿的风险，所以没留。）
+
+### 测试
+
+- 结构契约补一条：吸附态的线／阴影／渐隐必须在基础态就存在、且带过渡
+  （防止以后又回到"吸附时才创建"，同一个抖动会再长回来）。
+- CDP 逐帧量具留在 `.workbuddy-ai/preview/`：`stick-scan.mjs`（逐像素吸附点）、
+  `stick-roll.mjs`（真实手势滚动采样）、`stick-frames.mjs`（screencast 帧差＋文字质心）。
+
 ## [0.3.2] - 2026-10-29
 
 ### 修复
