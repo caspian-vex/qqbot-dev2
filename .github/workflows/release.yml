@@ -82,9 +82,14 @@ jobs:
           IMAGE="${{ steps.meta.outputs.image }}"
           VERSION="${{ steps.meta.outputs.version }}"
           TAGS="${IMAGE}:${VERSION}"
-          # 主分支上的构建同时打 latest，让 install.sh 的默认值一直可用
-          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+          # `latest` 只给正式发版（tag）。原先主分支构建也推 latest，于是"发版后在
+          # main 上再提交一次"会把 latest 悄悄挪到那版 `-edge` 构建上：install.sh
+          # 默认拉 latest，用户装出来的到底是发布版还是发版后的半成品，无从判断。
+          # 主分支构建改用 `edge` 这个会移动的标签，latest 永远等于最近一次发版。
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAGS="${TAGS},${IMAGE}:latest"
+          else
+            TAGS="${TAGS},${IMAGE}:edge"
           fi
           # 语义化版本额外打 major.minor，方便锁大版本。
           # 必须严格匹配 `x.y.z`：分支构建的 `0.2.0-edge` 也含两个点，

@@ -34,7 +34,8 @@ git tag v0.2.1 && git push origin main --tags
 - 新增 `npm run bump` 与 `test/version.test.ts`：升版本号只走脚本（一次改 package.json、
   package-lock 与 CHANGELOG），三者不一致时测试直接红。镜像标签与面板显示的版本不再靠手抄。
 - 镜像版本来源统一：打 tag 用 tag，主分支提交用 `package.json` 版本加 `-edge` 后缀；
-  不再出现整个面板只写着 `edge`、分不清是哪一版的情况。
+  不再出现整个面板只写着 `edge`、分不清是哪一版的情况。`latest` 只随正式发版移动，
+  主分支构建落到 `edge` 标签，避免「发版后再提交一次」把 latest 换成半成品。
 
 ### 修复
 
