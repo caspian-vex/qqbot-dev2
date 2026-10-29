@@ -35,7 +35,11 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="edge"
+            # 分支构建也要有个真版本号：面板左下角显示的就是这个值，
+            # 统一成 `edge` 会让"到底跑的是哪一版"重新变成猜谜。
+            # 取 package.json 的版本，加 -edge 后缀表示"此后还有未发布提交"，
+            # 也顺带避免和正式发版的语义化标签撞在同一个镜像标签上。
+            VERSION="$(node -p "require('./package.json').version")-edge"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
@@ -82,10 +86,12 @@ jobs:
           if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             TAGS="${TAGS},${IMAGE}:latest"
           fi
-          # 语义化版本额外打 major.minor，方便锁大版本
-          case "$VERSION" in
-            *.*.*) TAGS="${TAGS},${IMAGE}:${VERSION%.*}" ;;
-          esac
+          # 语义化版本额外打 major.minor，方便锁大版本。
+          # 必须严格匹配 `x.y.z`：分支构建的 `0.2.0-edge` 也含两个点，
+          # 用 `*.*.*` 通配会把它算成正式版，多推一个会漂移的 `:0.2`。
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            TAGS="${TAGS},${IMAGE}:${VERSION%.*}"
+          fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6

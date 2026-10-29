@@ -150,6 +150,8 @@ qqbot tunnel            # 打印面板端口的 ssh -L 命令
 | 账号 | 改面板用户名与密码、TOTP 两步验证 |
 
 - **外观不是独立页面**：切换器在侧栏底部和登录页，记在浏览器本地，默认暗色。
+- **侧栏左下角是账户卡**：头像 + 用户名 + 角色，点一下进「账号」页；右边是退出按钮（图标，避免和用户名挤在一行误点）。
+- **版本号在账户卡下方**，形如 `v0.2.0 · 6b56431`，鼠标悬停看提交与构建时间；登录页页脚也有同一行，报问题时直接念出来即可。版本来自 `/healthz`（免鉴权），所以换镜像后刷新就变，不存在"缓存里还是旧号"。
 - **「会话设置」是从会话列表进入的子页**，不在侧栏导航里。
 - 面板不代理 NapCat 的 WebUI：浏览器不会直接访问它，扫码与网络配置都由面板自己的 `/api/qq/*` 在服务端持 token 调 NapCat API 完成。
 
@@ -580,6 +582,16 @@ QQBOT_ROOT=./.devroot npm run dev -- run
   `.devroot` 在仓库内且已 gitignore；需要联调 OneBot 时在 `.devroot/etc/qqbot.toml` 里配 `[onebot].url`。
 - **前端不构建**：直接改 `web/dist/app.js` 与 `style.css`（首帧主题在 `theme.js`），刷新页面即可。文件是原生 JS，CSP 禁内联事件，所以事件都用 `data-act` 委托。
 - **改完必须过**：`npm run typecheck` + `npm test`。CI 只认这两条，镜像构建与推送由 tag / main 触发。
+- **每次更新都要升版本号**，别手改三个文件，用脚本：
+
+```bash
+npm run bump -- patch "修掉二维码过期后刷新无效"   # 或 minor / major / 1.2.3
+git add -A && git commit -m "chore(release): v0.2.1"
+git tag v0.2.1 && git push origin main --tags
+```
+
+  `bump` 一次改完 `package.json`、`package-lock.json`（两处）与 `CHANGELOG.md` 的顶部条目；`test/version.test.ts` 会盯着三者是否一致，忘了升版本或忘了写 CHANGELOG 都会红。面板、镜像标签与 CHANGELOG 因此不会各说各话。
+- 版本来源：打 tag 时用 tag（`v0.2.1` → `0.2.1`），主分支提交用 `package.json` 的版本加 `-edge` 后缀（`0.2.1-edge`），提交号用来区分同一版本的不同构建。
 - 开发过程、踩坑与决策记录见本地 `DEVLOG.md`（未纳入版本库）。
 
 ## 许可

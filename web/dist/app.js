@@ -86,7 +86,7 @@
 
   /* ================= 接口 ================= */
 
-  const app = { user: null, totp: false };
+  const app = { user: null, totp: false, ver: null };
 
   async function api(path, opts = {}) {
     const { method = 'GET', body, keepSession = false } = opts;
@@ -246,6 +246,88 @@
     },
   });
 
+  /* ================= 版本号 ================= */
+
+  /* 版本从 /healthz 读，而不是塞进页面里的静态字符串。
+   *
+   * 两个原因：一是登录页也要显示版本（报问题时第一句就是"你什么版本"），
+   * 而那时还没有会话，只有 /healthz 免鉴权；二是镜像里的前端是静态文件，
+   * 被浏览器缓存过，写死在 HTML 里的版本号会出现"换了镜像还显示旧号"。
+   * 读不到就整行不显示——宁可空着，也不要显示 vundefined。 */
+  async function loadMeta() {
+    try {
+      const d = await api('/healthz');
+      app.ver = d && d.version
+        ? { version: String(d.version), commit: String(d.commit || ''), date: String(d.build_date || '') }
+        : null;
+    } catch (_) {
+      app.ver = null;
+    }
+  }
+
+  /* 源码直跑（npm run dev）时 esbuild 的注入常量不存在，版本是 'dev'，
+   * 这种不加 v 前缀，免得看着像正式编号。 */
+  function verLabel() {
+    const v = app.ver;
+    if (!v || !v.version) return '';
+    return /^\d/.test(v.version) ? 'v' + v.version : v.version;
+  }
+
+  function verTitle() {
+    const v = app.ver;
+    if (!v) return '';
+    const extra = [];
+    if (v.commit && !/^(dev|none|unknown)$/.test(v.commit)) extra.push(v.commit);
+    /* 构建时间在 title 里给成本地的「2026-10-29 14:04」，不要原样吐 ISO 串：
+       /healthz 回的是 UTC（结尾 Z），照着念会和日志里的本地时间差 8 小时，
+       排查时最容易在这里绕圈。 */
+    if (v.date && v.date !== 'unknown') {
+      const t = new Date(v.date);
+      extra.push(isNaN(t.getTime()) ? v.date : fmtTime(t.toISOString()).slice(0, 16));
+    }
+    return extra.length ? `qqbot ${v.version}（${extra.join(' · ')}）` : `qqbot ${v.version}`;
+  }
+
+  function verHTML() {
+    const label = verLabel();
+    if (!label) return '';
+    const v = app.ver;
+    const sha = v.commit && !/^(dev|none|unknown)$/.test(v.commit) ? v.commit : '';
+    return `<div class="ver-line" title="${esc(verTitle())}">` +
+      `<span class="ver-num">${esc(label)}</span>` +
+      (sha ? `<span class="ver-dot">·</span><span class="ver-sha">${esc(sha)}</span>` : '') +
+      `</div>`;
+  }
+
+  /* 侧栏底部的账户卡。三件事一起解决：
+   *   ① 退出登录从一行文字改成图标按钮——它原先和用户名、主题切换挤在同一块
+   *      11px 的小字里，边界全靠颜色区分，误点退出是很常见的操作事故；
+   *   ② 头像 + 名字这一块做成指向「账号」页的链接。这里本来就是"我是谁"的位置，
+   *      原先点它什么都不发生，而改用户名/密码、开关两步验证还得绕去侧栏最后一项；
+   *   ③ 副标题只在真开了两步验证时补一句，没开就只有「管理员」——不再留一行
+   *      解释一个根本没启用的功能。 */
+  function sideUserHTML() {
+    const name = app.user || '';
+    const initial = (name.trim()[0] || '?').toUpperCase();
+    return `<div class="side-user" id="side-user">
+      <a class="su-link" href="#/account" title="账号设置">
+        <span class="su-av" id="su-av" aria-hidden="true">${esc(initial)}</span>
+        <span class="su-meta">
+          <span class="su-name" id="su-name" title="${esc(name)}">${esc(name)}</span>
+          <span class="su-role">管理员${app.totp ? ' · 两步验证' : ''}</span>
+        </span>
+      </a>
+      <button type="button" class="su-out" data-act="logout" title="退出登录" aria-label="退出登录">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/>
+          <path d="M10 16l-4-4 4-4"/>
+          <path d="M6 12h9"/>
+        </svg>
+      </button>
+    </div>`;
+  }
+
   /* ================= 登录 ================= */
 
   function renderLogin() {
@@ -277,6 +359,7 @@
             忘记密码：服务器上执行 <code>qqbot reset-password</code>。
           </div>
           ${themePickHTML()}
+          ${verHTML()}
         </div>
       </div>`;
 
@@ -333,9 +416,9 @@
             `<a class="nav-item" data-nav="${k}" href="#/${k}"><span class="ico">${r.icon}</span>${r.title}</a>`
           ).join('')}
           <div class="side-foot">
+            ${sideUserHTML()}
             ${themePickHTML()}
-            <div id="side-user" style="margin:8px 0 6px">${esc(app.user || '')}</div>
-            <a href="#/" data-act="logout" style="color:var(--fg-dim)">退出登录</a>
+            ${verHTML()}
           </div>
         </aside>
         <main class="main" id="view"></main>
@@ -2325,8 +2408,13 @@
             keepSession: true,
           });
           app.user = d.user;
-          const side = $('#side-user');
-          if (side) side.textContent = d.user;
+          const nm = $('#su-name');
+          if (nm) {
+            nm.textContent = d.user;
+            nm.title = d.user;
+          }
+          const av = $('#su-av');
+          if (av) av.textContent = (d.user.trim()[0] || '?').toUpperCase();
           $('#ac-name').value = d.user;
           $('#ac-name-pw').value = '';
           ok('用户名已更新，下次登录请用新用户名');
@@ -3109,6 +3197,8 @@
   /* ================= 启动 ================= */
 
   (async function boot() {
+    // 先拿版本：登录页的页脚也要显示它，而那时还没有会话
+    await loadMeta();
     try {
       const st = await api('/api/auth/status');
       app.user = st.user;

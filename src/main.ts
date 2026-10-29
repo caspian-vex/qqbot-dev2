@@ -155,7 +155,6 @@ async function cmdRun(argv: string[]): Promise<void> {
       onebotPort: onebotPortOf(config.onebot.url),
       imagesDir,
       approvals,
-      version: versionString(),
     });
 
     log.info('qqbot 启动', {

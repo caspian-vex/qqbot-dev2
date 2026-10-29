@@ -1,6 +1,6 @@
 {
   "name": "qqbot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "QQ 聊天机器人：OneBot 接入 + LLM 对话 + 自带面板（TypeScript 重写）",
   "type": "commonjs",
@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "node esbuild.mjs",
+    "bump": "node scripts/bump.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "dev": "node --import tsx src/main.ts",

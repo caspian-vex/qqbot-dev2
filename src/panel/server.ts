@@ -5,6 +5,7 @@ import { LogHub } from '../log/hub';
 import { Logger } from '../log/logger';
 import type { Store } from '../store';
 import { formatGoDuration } from '../util/time';
+import { BUILD_DATE, COMMIT, VERSION } from '../version';
 import { Api, COOKIE_CSRF, COOKIE_SESSION } from './api';
 import { subtleEqual } from './auth';
 import {
@@ -41,7 +42,6 @@ export interface PanelOptions {
    */
   approvals?: ApprovalQueue;
   hub?: LogHub;
-  version?: string;
 }
 
 export class PanelServer {
@@ -175,10 +175,20 @@ export class PanelServer {
     return subtleEqual(cookie, header);
   }
 
+  /**
+   * 探活。刻意免鉴权：docker healthcheck、反代与 qqbotctl 都只看 200。
+   *
+   * 顺带带上版本三元组——它是整个进程里唯一一个「不需要会话就能读到版本」的
+   * 地方，登录页要在用户还没登进来时就把版本显示在页脚，只能读这里。
+   * 加字段对老的探活调用方无害（它们只看状态码）。
+   */
   private healthz(ctx: ReqCtx): void {
     writeJSON(ctx.res, 200, {
       status: 'ok',
       uptime: formatGoDuration(Date.now() - this.startedAt),
+      version: VERSION,
+      commit: COMMIT,
+      build_date: BUILD_DATE,
     });
   }
 

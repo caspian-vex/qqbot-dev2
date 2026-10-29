@@ -243,9 +243,21 @@ describe('探活', () => {
     try {
       const res = await fetch(`${h.base}/healthz`);
       assert.equal(res.status, 200);
-      const body = (await res.json()) as { status: string; uptime: string };
+      const body = (await res.json()) as {
+        status: string;
+        uptime: string;
+        version: string;
+        commit: string;
+        build_date: string;
+      };
       assert.equal(body.status, 'ok');
       assert.match(body.uptime, /^\d+[hms]/);
+      // 登录页在用户登进来之前就要显示版本，只能读这个免鉴权接口，
+      // 所以版本必须和探活一起返回，不能挪到 /api/auth/status 里。
+      assert.equal(typeof body.version, 'string');
+      assert.ok(body.version !== '', '版本号不能是空串');
+      assert.equal(typeof body.commit, 'string');
+      assert.equal(typeof body.build_date, 'string');
     } finally {
       await h.stop();
     }
