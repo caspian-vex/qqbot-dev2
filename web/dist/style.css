@@ -12,6 +12,9 @@
   --bg-input: #0a0d13;
   --line: #232936;
   --line-soft: #1b202b;
+  /* 吸顶页头的下边界：比 --line 亮一档。它要在卡片从底下穿过时明明白白，
+     --line 那条线在滚动状态下太弱，看起来像内容被裁坏了。 */
+  --head-line: #2f3748;
   --fg: #e7ebf3;
   --fg-dim: #8b94a7;
   --fg-mute: #5d6577;
@@ -68,6 +71,7 @@
   --bg-input: #f7f8fa;
   --line: #d9dde4;
   --line-soft: #e7eaef;
+  --head-line: #c8cedb;
   --fg: #1f2430;
   --fg-dim: #4c5468;
   --fg-mute: #8a92a3;
@@ -328,7 +332,11 @@ a:hover { text-decoration: underline; }
 .ver-sha { overflow: hidden; text-overflow: ellipsis; }
 
 .main {
-  padding: 26px 30px 60px;
+  /* 页头要横向铺满整幅主区，靠负边距抵消这两个值；抽成变量，
+     窄屏只改一处，不会出现"页头背景比内容窄 16px、两侧漏出卡片"。 */
+  --pad-y: 26px;
+  --pad-x: 30px;
+  padding: var(--pad-y) var(--pad-x) 60px;
   max-width: 1180px;
   width: 100%;
 }
@@ -346,22 +354,43 @@ a:hover { text-decoration: underline; }
      相对视口生效——.main 与 body 上都没有 overflow，sticky 才不会被裁掉。
      底部的间距从 margin 改成 padding：背景要盖住页头到第一张卡之间那 20px，
      否则卡片会从缝里滑过去，看着像页头飘在半空。
-     顶部 -12 / +12 是自相抵消的一对，未滚动时标题位置与改造前一致。 */
+     顶部 -12 / +12 是自相抵消的一对，未滚动时标题位置与改造前一致。
+     横向同理用 padding + 负 margin：页头本来是 .main 内容盒里的一块，
+     只铺内容宽度的话，滚动时左右两侧各露出 30px 的卡片，像两条竖着的脏边。 */
   position: sticky;
   top: 0;
   z-index: 30;
   background: var(--bg);
-  padding: 12px 0 20px;
-  margin: -12px 0 0;
+  padding: 12px var(--pad-x) 20px;
+  margin: -12px calc(var(--pad-x) * -1) 0;
 }
 
 /* 只有真被内容压到顶部才画这条线。未滚动就画，等于每个页面顶部
    凭空多一道没有来由的分隔，看着像少画了个边框。
-   线用 --line 而不是 --line-soft：吸顶时页头下沿正好切在卡片中间，
-   --line-soft 几乎看不见，看着像文字被裁掉半行。 */
+   线用 --head-line（比 --line 亮一档）：吸顶时页头下沿正好切在卡片中间，
+   --line-soft 完全看不见，--line 也只是勉强，看起来像内容被裁坏了。 */
 .page-head.is-stuck {
-  box-shadow: 0 1px 0 var(--line), 0 8px 16px -14px rgba(0, 0, 0, .75);
+  box-shadow: 0 1px 0 var(--head-line), 0 8px 16px -12px rgba(0, 0, 0, .75);
 }
+
+/* 线下面 12px 的渐隐：卡片从页头底下是"淡出"的，不是被一刀切断。
+   纯视觉层，pointer-events:none 保证点不到它。 */
+.page-head.is-stuck::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -12px;
+  height: 12px;
+  background: linear-gradient(var(--bg), transparent);
+  pointer-events: none;
+}
+
+/* 吸顶页头常驻顶部约 87px（窄屏 79px）：Tab 键或锚点把控件滚进视口时，
+   让它停在页头下方而不是被压住。只影响聚焦/锚点滚动，点击不触发。 */
+.card input,
+.card select,
+.card textarea { scroll-margin-top: 96px; }
 
 .page-head h2 {
   font-size: 19px;
@@ -480,10 +509,14 @@ a:hover { text-decoration: underline; }
   .side-user { padding: 0; }
   .su-meta { display: none; }
   .ver-line { padding: 0; }
-  .main { padding: 18px 14px 48px; }
+  .main { --pad-y: 18px; --pad-x: 14px; padding: var(--pad-y) var(--pad-x) 48px; }
   /* 手机上标题和按钮常常折成两行，吸顶后页头会吃掉不少视口高度，
-     上下留白跟着页边距一起收一档；-10/+10 仍自相抵消，未滚动时位置不变。 */
-  .page-head { padding: 10px 0 14px; margin: -10px 0 0; }
+     上下留白跟着页边距一起收一档；-10/+10 仍自相抵消，未滚动时位置不变。
+     横向跟着 --pad-x 走，页头背景才不会比内容窄。 */
+  .page-head {
+    padding: 10px var(--pad-x) 14px;
+    margin: -10px calc(var(--pad-x) * -1) 0;
+  }
   /* 卡片内边距跟着页边距一起收。标题栏的负边距读的是 var(--pad)，
      所以窄屏下标题依然与正文对齐，不会出现"标题比正文少缩进 4px"。 */
   .card { --pad: 14px; }

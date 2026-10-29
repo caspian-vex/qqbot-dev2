@@ -71,6 +71,13 @@ test('页头吸顶：滚到页面底部也能点到「保存设置」', () => {
   // 吸顶状态由滚动同步：没有它，未滚动时也会画一条没有来由的分隔线。
   assert.match(js, /function syncStuckHead/);
   assert.match(js, /addEventListener\(\s*'scroll'/);
+  // 横向也要铺满：页头在 .main 的内容盒里，只铺内容宽度的话，
+  // 滚动时左右两侧各露出 30px 的卡片，像两条竖着的脏边。
+  assert.match(css, /\.main\s*\{[^}]*--pad-x:\s*\d+px/, '.main 要把左右内边距暴露成 --pad-x');
+  assert.match(body, /var\(--pad-x\)/, '.page-head 的横向留白与负边距要走 --pad-x');
+  // 吸顶时切在卡片中间，线的颜色单独一档才看得见；两套主题都得有。
+  assert.match(css, /--head-line:\s*#[0-9a-f]{6}/i);
+  assert.equal((css.match(/--head-line:/g) || []).length, 2, '暗色与浅色各要定义一次');
 });
 
 test('被 JS 直接写 textContent 的 id 仍在能安全改写的元素上', () => {
