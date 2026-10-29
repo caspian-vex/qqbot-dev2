@@ -370,9 +370,25 @@ a:hover { text-decoration: underline; }
   background: var(--bg);
   padding: var(--pad-y) var(--pad-x) 20px;
   margin: 0 calc(var(--pad-x) * -1) 0;
-  /* 吸附瞬间还有第二层"抖"：页头下沿凭空多出 1px 亮线 + 外阴影 + 12px 渐隐
+  /* 下沿那条线和阴影不画在这里，画在 ::before 上——见下面一段。 */
+}
+
+/* 页头下沿的分隔线与外阴影。
+   单独一层，左右各让进 --pad-x：页头的背景为了挡住从两侧滑过的卡片，
+   靠负 margin 铺满整个主区，比内容列左右各宽 30px；线要是跟着铺满，
+   两端就在卡片之外的空地上各多出一小截（25~30px）悬着的尾巴，看着像没对齐。
+   这一层只在滚动到吸附时才有颜色，位置、高度与页头底边完全重合。 */
+.page-head::before {
+  content: '';
+  position: absolute;
+  left: var(--pad-x);
+  right: var(--pad-x);
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+  /* 吸附瞬间凭空多出 1px 亮线 + 外阴影会让整条页头"抖一下"
      （0.3.2 实测单帧近三千个采样像素变色，下一帧又全静）。
-     所以这两样在基础态就占好位、颜色先透明，is-stuck 只换颜色。 */
+     所以基础态先占好位、颜色透明，is-stuck 只换颜色。 */
   box-shadow: 0 1px 0 transparent, 0 8px 16px -12px transparent;
   transition: box-shadow .12s linear;
 }
@@ -381,7 +397,7 @@ a:hover { text-decoration: underline; }
    凭空多一道没有来由的分隔，看着像少画了个边框。
    线用 --head-line（比 --line 亮一档）：吸顶时页头下沿正好切在卡片中间，
    --line-soft 完全看不见，--line 也只是勉强，看起来像内容被裁坏了。 */
-.page-head.is-stuck {
+.page-head.is-stuck::before {
   box-shadow: 0 1px 0 var(--head-line), 0 8px 16px -12px rgba(0, 0, 0, .75);
 }
 

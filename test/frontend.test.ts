@@ -80,17 +80,31 @@ test('页头吸顶：滚到页面底部也能点到「保存设置」', () => {
   assert.equal((css.match(/--head-line:/g) || []).length, 2, '暗色与浅色各要定义一次');
 });
 
-test('吸附态的装饰不许凭空出现（吸附那一帧的下沿突变）', () => {
+test('吸附态的装饰不许凭空出现，且必须与内容列对齐', () => {
   // 回归点：用户反馈"往下滑的时候顶部栏抖一下"。用 CDP 逐帧抓 screencast 截图
   // 量出来两件事：① 吸附那一帧页头下沿凭空多出 1px 亮线 + 阴影 + 12px 渐隐，
   // 单帧近三千个采样像素变色，下一帧又全静；② 页头自身在滚动头几帧从 top=14
   // 走到 0（见下一条用例）。这一条只管 ①：线和阴影在基础态先占位（颜色
   // transparent），渐隐层常驻（opacity 0），is-stuck 只换颜色/透明度，
   // 120ms 过渡盖住那一帧的突变。
+  //
+  // 还有一条对齐约束：页头的背景为了挡住从两侧滑过的卡片，比内容列左右各宽
+  // --pad-x；线要是画在页头身上，两端就会在卡片之外各多出一小截悬着的尾巴
+  // （实测左右各 26~30px），看着像没对齐。所以线与阴影挂在 ::before 上，
+  // 左右各让进 --pad-x，正好落在卡片列的边框上。
   const block = css.match(/\.page-head\s*\{([^}]*)\}/);
   const body = block?.[1] ?? '';
-  assert.match(body, /box-shadow:\s*0 1px 0 transparent/, '分隔线要在基础态占位');
-  assert.match(body, /transition:\s*box-shadow/, '线的出现要有过渡，不能硬切');
+  assert.doesNotMatch(body, /box-shadow/, '线与阴影不能画在页头自身：它会跟到页头的全宽背景上');
+  const deco = css.match(/\.page-head::before\s*\{([^}]*)\}/)?.[1] ?? '';
+  assert.match(deco, /left:\s*var\(--pad-x\)/, '装饰层左边要与卡片列对齐');
+  assert.match(deco, /right:\s*var\(--pad-x\)/, '装饰层右边要与卡片列对齐');
+  assert.match(deco, /box-shadow:\s*0 1px 0 transparent/, '分隔线要在基础态占位');
+  assert.match(deco, /transition:\s*box-shadow/, '线的出现要有过渡，不能硬切');
+  assert.match(
+    css,
+    /\.page-head\.is-stuck::before\s*\{[^}]*box-shadow:\s*0 1px 0 var\(--head-line\)/,
+    '吸附时只换线的颜色',
+  );
   assert.match(css, /\.page-head::after\s*\{[^}]*opacity:\s*0/, '渐隐层要常驻且默认不可见');
   assert.match(css, /\.page-head\.is-stuck::after\s*\{\s*opacity:\s*1/, '吸附时只改渐隐层的透明度');
   // 反过来钉住：不能再回到"只有 .page-head.is-stuck::after 才定义 content"
