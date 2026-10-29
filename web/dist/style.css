@@ -340,8 +340,27 @@ a:hover { text-decoration: underline; }
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 20px;
   flex-wrap: wrap;
+
+  /* 吸顶：滚到页面底部也能直接点「保存设置」，不用再滚回顶部。
+     相对视口生效——.main 与 body 上都没有 overflow，sticky 才不会被裁掉。
+     底部的间距从 margin 改成 padding：背景要盖住页头到第一张卡之间那 20px，
+     否则卡片会从缝里滑过去，看着像页头飘在半空。
+     顶部 -12 / +12 是自相抵消的一对，未滚动时标题位置与改造前一致。 */
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: var(--bg);
+  padding: 12px 0 20px;
+  margin: -12px 0 0;
+}
+
+/* 只有真被内容压到顶部才画这条线。未滚动就画，等于每个页面顶部
+   凭空多一道没有来由的分隔，看着像少画了个边框。
+   线用 --line 而不是 --line-soft：吸顶时页头下沿正好切在卡片中间，
+   --line-soft 几乎看不见，看着像文字被裁掉半行。 */
+.page-head.is-stuck {
+  box-shadow: 0 1px 0 var(--line), 0 8px 16px -14px rgba(0, 0, 0, .75);
 }
 
 .page-head h2 {
@@ -462,6 +481,9 @@ a:hover { text-decoration: underline; }
   .su-meta { display: none; }
   .ver-line { padding: 0; }
   .main { padding: 18px 14px 48px; }
+  /* 手机上标题和按钮常常折成两行，吸顶后页头会吃掉不少视口高度，
+     上下留白跟着页边距一起收一档；-10/+10 仍自相抵消，未滚动时位置不变。 */
+  .page-head { padding: 10px 0 14px; margin: -10px 0 0; }
   /* 卡片内边距跟着页边距一起收。标题栏的负边距读的是 var(--pad)，
      所以窄屏下标题依然与正文对齐，不会出现"标题比正文少缩进 4px"。 */
   .card { --pad: 14px; }

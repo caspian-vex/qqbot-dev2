@@ -56,6 +56,23 @@ test('控件高度走同一把尺', () => {
   );
 });
 
+test('页头吸顶：滚到页面底部也能点到「保存设置」', () => {
+  // 全局设置页有九张卡、两三千像素高，保存按钮本来只在页头。
+  // 页头不吸顶，每次保存都要先把页面滚回顶部。
+  const block = css.match(/\.page-head\s*\{([^}]*)\}/);
+  assert.ok(block, '找不到 .page-head 规则');
+  const body = block[1] ?? '';
+  assert.match(body, /position:\s*sticky/);
+  assert.match(body, /top:\s*0/);
+  // 页头与第一张卡之间那段间距必须是 padding：margin 不参与背景绘制，
+  // 卡片会从页头下方那条缝里滑过去，看着像页头飘在半空。
+  assert.doesNotMatch(body, /margin-bottom/, '这段间距要走 padding，不能用 margin');
+  assert.match(css, /\.page-head\.is-stuck/);
+  // 吸顶状态由滚动同步：没有它，未滚动时也会画一条没有来由的分隔线。
+  assert.match(js, /function syncStuckHead/);
+  assert.match(js, /addEventListener\(\s*'scroll'/);
+});
+
 test('被 JS 直接写 textContent 的 id 仍在能安全改写的元素上', () => {
   // #ps-ed-title / #ss-detail-title 是 h3 本身，被 textContent 赋值；
   // 一旦有人把按钮塞进这个 h3，赋值时按钮会被一起清掉（新建人格后保存按钮消失）。

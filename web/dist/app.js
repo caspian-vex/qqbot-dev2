@@ -174,10 +174,34 @@
     old.replaceWith(fresh);
 
     document.title = ROUTES[name].title + ' · qqbot';
-    Promise.resolve(ROUTES[name].view(fresh)).catch((e) => {
-      fresh.innerHTML = `<div class="err-inline">加载失败：${esc(e.message)}</div>`;
-    });
+    Promise.resolve(ROUTES[name].view(fresh))
+      .then(() => syncStuckHead())
+      .catch((e) => {
+        fresh.innerHTML = `<div class="err-inline">加载失败：${esc(e.message)}</div>`;
+      });
   }
+
+  /* 页头是吸顶的（见 style.css 的 .page-head），只有真被内容顶到视口上沿
+     才画那条分隔线：未滚动时它还在文档流里，画了就是凭空多一道线。
+     切页后滚动位置可能保留，所以在 route() 填充完内容后再同步一次。 */
+  function syncStuckHead() {
+    const head = $('.page-head');
+    if (head) head.classList.toggle('is-stuck', head.getBoundingClientRect().top <= 0.5);
+  }
+
+  let headTick = 0;
+  window.addEventListener(
+    'scroll',
+    () => {
+      // 滚动过程中每帧只读一次布局，不然每个 scroll 事件都强制同步回流
+      if (headTick) return;
+      headTick = requestAnimationFrame(() => {
+        headTick = 0;
+        syncStuckHead();
+      });
+    },
+    { passive: true },
+  );
 
   /* ================= 事件委托 ================= */
 
