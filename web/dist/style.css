@@ -23,6 +23,13 @@
   --radius: 10px;
   --mono: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace;
 
+  /* 控件高度：输入框、下拉与默认按钮必须同高，否则 .row（align-items:flex-end）
+     里「标签 + 输入框 + 按钮」只能靠底边碰巧对齐——改之前是 41.1 / 37.45 两组数。
+     --head-h 是卡片标题栏的固定高度：比按钮高 10px，按钮上下各留 5px，严格居中。 */
+  --ctl-h: 34px;
+  --ctl-h-sm: 26px;
+  --head-h: 44px;
+
   /* 交互态与零散色块。以前这些都写死成暗色值，做浅色主题时必须抽出来，
      否则一换主题就会出现「白底上的深灰按钮」这类局部不跟队。 */
   --hover: #1b202b;
@@ -328,7 +335,9 @@ a:hover { text-decoration: underline; }
 
 .page-head {
   display: flex;
-  align-items: baseline;
+  /* 不能是 baseline：左边是 h2 + desc 两行（约 54px），右边是 34px 的一行按钮，
+     baseline 只对第一行，块越高按钮看着越"浮"上去。居中后上下留白相等。 */
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 20px;
@@ -357,50 +366,76 @@ a:hover { text-decoration: underline; }
 /* ---------- 卡片 ---------- */
 
 .card {
+  /* --pad 同时决定标题栏的负边距与内边距：只改这一个数，标题与正文的左边缘、
+     按钮与右边框的间距就都不会漂。窄屏 900px 断点里把它收成 14px。 */
+  --pad: 18px;
   background: var(--bg-soft);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 18px;
+  padding: var(--pad);
   margin-bottom: 16px;
 }
 
-.card > h3 {
-  font-size: 13px;
-  font-weight: 600;
-  margin: 0 0 14px;
-  color: var(--fg);
+/* 通栏标题栏：横跨卡片的一条带子，底部一根分隔线。高度由 --head-h 钉死，
+   不再随里面放的是纯标题（21.4）、小按钮（26）还是默认按钮（34）而变化——
+   之前正是这个不定高度让 .grid 里相邻卡片的正文错行 8~16px。
+
+   左右负边距抵消 .card 的 padding，再用同量的 padding 把标题推回去：
+   于是标题左边缘 = 正文左边缘，按钮右边框到卡片外框的距离 = 标题到左边框的距离。
+   不设背景色，所以不用担心直角顶出卡片的圆角；哪天要加底色，记得补
+   border-radius: calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0。 */
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: var(--head-h);
+  margin: calc(var(--pad) * -1) calc(var(--pad) * -1) 14px;
+  padding: 0 var(--pad);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.card-head h3 {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-/* 图池标签卡的标题在 .pool-head 里，不在 .card 的直接子级，样式得单独给一份 */
-.pool-head h3 {
+  min-width: 0;
+  margin: 0;
   font-size: 13px;
   font-weight: 600;
-  margin: 0 0 4px;
   color: var(--fg);
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
-.card > h3 .hint,
-.pool-head h3 .hint {
+.card-head h3 .hint {
   font-weight: 400;
   color: var(--fg-mute);
   font-size: 12px;
 }
 
-/* 卡片标题栏右侧的次要操作（预设面板的「取消」）：标题是 flex 容器，
-   靠 margin-left 顶到最右边，不然会紧贴标题文字 */
-.card > h3 > .btn { margin-left: auto; }
+/* 卡片级操作组：一律顶到标题栏最右。flex:none —— 标题很长要折行时，
+   按钮不能被压缩（压扁比折行更难看）。 */
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex: none;
+}
+
+/* 标题栏里的整组开关（会话设置）。字重跟着标题变细，去掉 .check 给多行
+   说明留的 4px 勾选框上边距，否则单行标题栏里勾选框会显得偏下。 */
+.card-actions .ovr-sw { font-weight: 400; font-size: 12px; white-space: nowrap; }
+.card-head .check input { margin-top: 0; }
 
 .grid { display: grid; gap: 14px; }
 .grid.c2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid.c3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid.c4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .grid.c5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+/* 网格里的卡片间距交给 gap，别再叠一层 margin-bottom（否则上下留白是 16+14） */
+.grid > .card { margin-bottom: 0; }
+
+/* 网格块与后面卡片之间的间距。.grid 本身不能带 margin：卡片内部的 grid 会跟着遭殃 */
+.mb16 { margin-bottom: 16px; }
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
@@ -427,6 +462,11 @@ a:hover { text-decoration: underline; }
   .su-meta { display: none; }
   .ver-line { padding: 0; }
   .main { padding: 18px 14px 48px; }
+  /* 卡片内边距跟着页边距一起收。标题栏的负边距读的是 var(--pad)，
+     所以窄屏下标题依然与正文对齐，不会出现"标题比正文少缩进 4px"。 */
+  .card { --pad: 14px; }
+  .card-head { gap: 8px; }
+  .card-actions { gap: 6px; }
   .grid.c2, .grid.c3, .grid.c4, .grid.c5 { grid-template-columns: 1fr; }
 }
 
@@ -505,16 +545,22 @@ select {
   border: 1px solid var(--line);
   border-radius: 7px;
   color: var(--fg);
-  padding: 8px 10px;
+  /* 纵向 padding 交给 height 统一给（见下一条），这里只留横向 */
+  padding: 0 10px;
   font: inherit;
   outline: none;
   transition: border-color .12s;
 }
 
+/* 单行控件与 .btn 同高：两者在 .row 里并排时，底对齐就等于顶对齐，
+   不再靠"41.1 和 37.45 差 3.65px"碰巧看着还行。 */
+input[type=text], input[type=password], input[type=number], select { height: var(--ctl-h); }
+
 input:focus, textarea:focus, select:focus { border-color: var(--accent-dim); }
 input::placeholder, textarea::placeholder { color: var(--fg-mute); }
 
-textarea { resize: vertical; min-height: 90px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
+/* textarea 不参与统一高度：它要多行，纵向 padding 得还给上面那条共享规则 */
+textarea { resize: vertical; min-height: 90px; padding: 8px 10px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
 
 select { cursor: pointer; }
 
@@ -525,7 +571,7 @@ select { cursor: pointer; }
 .preset-form .cell { flex: 1 1 170px; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .preset-form .cell > span { font-size: 11.5px; color: var(--fg-dim); }
 .preset-form input,
-.preset-form select { width: 100%; padding: 6px 8px; font-size: 12.5px; }
+.preset-form select { width: 100%; padding: 0 8px; font-size: 12.5px; }
 .preset-form .btn { flex: none; }
 
 /* 会话名 + ID 两行：名字给人看，ID 给复制/排查用。
@@ -561,8 +607,8 @@ select { cursor: pointer; }
 
 /* ---------- 会话设置：整组开关 ---------- */
 
-/* 卡片标题是 flex 容器，开关靠 margin-left 顶到最右边；字重随标题变细 */
-.card > h3 > .ovr-sw { margin-left: auto; font-weight: 400; }
+/* 开关的定位（顶到标题栏右侧、字重变细）已在 .card-actions 一节里给出，
+   这里只留 fieldset 的重置。 */
 
 /* fieldset 浏览器默认带 border / padding / min-width，
    不重置的话六张卡片里会多出六个小方框 */
@@ -583,15 +629,21 @@ select { cursor: pointer; }
   border: 1px solid transparent;
   color: #fff;
   border-radius: 7px;
-  padding: 7px 15px;
+  /* 高度固定、纵向 padding 归零：按钮与输入框同高才能在同一行里对齐 */
+  height: var(--ctl-h);
+  padding: 0 14px;
   font: inherit;
   font-size: 13px;
   cursor: pointer;
   transition: filter .12s, opacity .12s;
   white-space: nowrap;
+  /* 全局 a:hover 会给 <a class="btn">（如「返回会话列表」）画下划线，
+     看着像正文里的链接。:hover 那条也必须一起复位——.btn 的特异性 (0,1,0)
+     输给 a:hover 的 (0,1,1)。 */
+  text-decoration: none;
 }
 
-.btn:hover { filter: brightness(1.12); }
+.btn:hover { filter: brightness(1.12); text-decoration: none; }
 .btn:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 
 .btn.ghost {
@@ -603,7 +655,7 @@ select { cursor: pointer; }
 .btn.danger { background: var(--danger-bg); border-color: var(--danger-bd); color: var(--danger-fg); }
 .btn.danger:hover { background: var(--danger-hover); }
 
-.btn.sm { padding: 4px 10px; font-size: 12px; }
+.btn.sm { height: var(--ctl-h-sm); padding: 0 10px; font-size: 12px; }
 
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
 .row > .grow { flex: 1 1 180px; }
@@ -848,19 +900,6 @@ tbody tr:hover { background: var(--row-hover); }
 
 /* ---------- 图池 ---------- */
 
-.pool-head {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  margin-bottom: 4px;
-}
-
-.pool-head > .grow { flex: 1 1 240px; min-width: 0; }
-
-.pool-head h3 { margin-bottom: 2px; }
-
 .pool-tag .note { margin: 0; }
 
 .pool-tag textarea {
@@ -968,7 +1007,9 @@ code {
 .theme-pick button {
   flex: 1;
   min-width: 0;
-  padding: 4px 0;
+  /* 用统一的小控件高度，替掉 4px 上下 padding 算出来的 26.1px 非整数 */
+  height: var(--ctl-h-sm);
+  padding: 0;
   background: transparent;
   border: 1px solid var(--line);
   border-radius: 6px;

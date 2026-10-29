@@ -450,7 +450,7 @@
         </div>
       </div>
 
-      <div class="grid c4" style="margin-bottom:16px">
+      <div class="grid c4 mb16">
         <div class="metric">
           <div class="k">协议端</div>
           <div class="v sm"><span class="dot" id="ov-dot"></span><span id="ov-conn">—</span></div>
@@ -470,7 +470,9 @@
       </div>
 
       <div class="card">
-        <h3>消息与模型 <span class="hint" id="ov-model"></span></h3>
+        <div class="card-head">
+          <h3>消息与模型 <span class="hint" id="ov-model"></span></h3>
+        </div>
         <div class="grid c5">
           <div class="metric"><div class="k">收到</div><div class="v" id="ov-recv">0</div></div>
           <div class="metric"><div class="k">已回复</div><div class="v" id="ov-rep">0</div></div>
@@ -487,7 +489,9 @@
       </div>
 
       <div class="card">
-        <h3>测试发送 <span class="hint">直接调用协议端发一条消息，不经过模型</span></h3>
+        <div class="card-head">
+          <h3>测试发送 <span class="hint">直接调用协议端发一条消息，不经过模型</span></h3>
+        </div>
         <div class="row">
           <div class="grow" style="flex:0 0 130px">
             <label class="field" style="margin:0"><span style="font-size:12px;color:var(--fg-dim)">类型</span></label>
@@ -510,7 +514,9 @@
       </div>
 
       <div class="card">
-        <h3>实时日志 <span class="hint">最近 500 条</span></h3>
+        <div class="card-head">
+          <h3>实时日志 <span class="hint">最近 500 条</span></h3>
+        </div>
         <div class="logbox" id="ov-log"></div>
       </div>`;
 
@@ -604,7 +610,8 @@
 
   function viewSettings(el) {
     el.innerHTML = `<div class="page-head"><div><h2>全局设置</h2>
-      <div class="desc">模型接入与触发规则，对所有会话生效，保存后立即生效</div></div></div>
+      <div class="desc">模型接入与触发规则，对所有会话生效，保存后立即生效</div></div>
+      <div class="row" id="set-acts"></div></div>
       <div id="set-body"><div class="empty">加载中…</div></div>`;
 
     Promise.all([
@@ -618,7 +625,9 @@
             vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {}, tm = s.timing || {};
       $('#set-body').innerHTML = `
         <div class="card">
-          <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
+          <div class="card-head">
+            <h3>模型 <span class="hint">OpenAI 兼容接口，默认指向 DeepSeek</span></h3>
+          </div>
           <div class="grid c2">
             <div class="field">
               <label>接口地址</label>
@@ -657,7 +666,9 @@
         </div>
 
         <div class="card">
-          <h3>触发规则</h3>
+          <div class="card-head">
+            <h3>触发规则</h3>
+          </div>
           <div class="grid c2">
             <div class="field">
               <label>唤醒词</label>
@@ -700,7 +711,9 @@
         </div>
 
         <div class="card">
-          <h3>主动发言 <span class="hint">没人说话的时候，它自己开口</span></h3>
+          <div class="card-head">
+            <h3>主动发言 <span class="hint">没人说话的时候，它自己开口</span></h3>
+          </div>
           <label class="check">
             <input type="checkbox" id="f-echo" ${(p.echo_enabled ? 'checked' : '')}>
             <span>开启回声式跟进
@@ -775,7 +788,9 @@
         </div>
 
         <div class="card">
-          <h3>节奏 <span class="hint">同样回一句话，像不像人主要差在这里</span></h3>
+          <div class="card-head">
+            <h3>节奏 <span class="hint">同样回一句话，像不像人主要差在这里</span></h3>
+          </div>
           <label class="check">
             <input type="checkbox" id="f-tm" ${(tm.enabled ? 'checked' : '')}>
             <span>按真人节奏发送
@@ -816,7 +831,9 @@
         </div>
 
         <div class="card">
-          <h3>图池 <span class="hint">按标签分类的图片库，在「<a href="#/pool">图池</a>」页维护</span></h3>
+          <div class="card-head">
+            <h3>图池 <span class="hint">按标签分类的图片库，在「<a href="#/pool">图池</a>」页维护</span></h3>
+          </div>
           <label class="check">
             <input type="checkbox" id="f-img" ${(img.enabled ? 'checked' : '')}>
             <span>允许机器人发图
@@ -843,7 +860,9 @@
         </div>
 
         <div class="card">
-          <h3>图片识别 <span class="hint">用户发来的图直接交给模型看</span></h3>
+          <div class="card-head">
+            <h3>图片识别 <span class="hint">用户发来的图直接交给模型看</span></h3>
+          </div>
           <label class="check">
             <input type="checkbox" id="f-vision" ${(vis.enabled !== false ? 'checked' : '')}>
             <span>识别用户发来的图片
@@ -862,7 +881,9 @@
         </div>
 
         <div class="card">
-          <h3>联网搜索 <span class="hint">模型拿不准时自己去查一下</span></h3>
+          <div class="card-head">
+            <h3>联网搜索 <span class="hint">模型拿不准时自己去查一下</span></h3>
+          </div>
           <label class="check">
             <input type="checkbox" id="f-search" ${(sr.enabled ? 'checked' : '')}>
             <span>允许模型联网搜索
@@ -887,7 +908,9 @@
         </div>
 
         <div class="card">
-          <h3>电脑操作 <span class="hint">让模型在这台机器上执行命令、读写文件</span></h3>
+          <div class="card-head">
+            <h3>电脑操作 <span class="hint">让模型在这台机器上执行命令、读写文件</span></h3>
+          </div>
           <label class="check">
             <input type="checkbox" id="f-cmp" ${cm.enabled ? 'checked' : ''}>
             <span>允许模型操作这台电脑
@@ -946,7 +969,9 @@
         </div>
 
         <div class="card">
-          <h3>上下文</h3>
+          <div class="card-head">
+            <h3>上下文</h3>
+          </div>
           <div class="grid c2">
             <div class="field">
               <label>保留轮数</label>
@@ -959,11 +984,14 @@
               <div class="note">历史按此预算从新到旧裁剪，超出的整轮丢弃，保证问答成对。</div>
             </div>
           </div>
-        </div>
-
-        <div class="row end">
-          <button class="btn" data-act="save">保存设置</button>
         </div>`;
+
+      // 九张卡铺下来两千来像素，保存按钮跟着卡尾走等于「改完还得滚到底」。
+      // 但按钮只在数据到位后才注入：加载中就能点的「保存」，点下去读的全是 undefined。
+      // 与会话设置的 #ss-acts 同一个套路；提交的是整份 settings，挂到任何一张
+      // 卡头都等于谎称「只存这张卡」，所以放页头右上。
+      const acts = $('#set-acts');
+      if (acts) acts.insertAdjacentHTML('beforeend', '<button class="btn" data-act="save">保存设置</button>');
 
       bindActions(el, {
         save: async (btn) => {
@@ -1232,12 +1260,15 @@
     const m = OVR_META[g];
     return `
       <div class="card">
-        <h3>${m.title} <span class="hint">${m.hint}</span>
-          <label class="check ovr-sw">
-            <input type="checkbox" class="ovr" data-g="${g}"${st[g].on ? ' checked' : ''}>
-            <span>本会话单独设置</span>
-          </label>
-        </h3>
+        <div class="card-head">
+          <h3>${m.title} <span class="hint">${m.hint}</span></h3>
+          <div class="card-actions">
+            <label class="check ovr-sw">
+              <input type="checkbox" class="ovr" data-g="${g}"${st[g].on ? ' checked' : ''}>
+              <span>本会话单独设置</span>
+            </label>
+          </div>
+        </div>
         <fieldset class="ovr-body" id="g-${g}"${st[g].on ? '' : ' disabled'}>${body}</fieldset>
       </div>`;
   }
@@ -1363,7 +1394,9 @@
 
       $('#ss-body').innerHTML =
         `<div class="card">
-          <h3>人格 <span class="hint">这个对话对象用哪套提示词</span></h3>
+          <div class="card-head">
+            <h3>人格 <span class="hint">这个对话对象用哪套提示词</span></h3>
+          </div>
           <div class="grid c2">
             <div class="field">
               <label>使用的人格</label>
@@ -1546,7 +1579,9 @@
       </div>
 
       <div class="card">
-        <h3>怎么用 <span class="hint">标签 = 一个子目录，备注 = 给模型看的说明</span></h3>
+        <div class="card-head">
+          <h3>怎么用 <span class="hint">标签 = 一个子目录，备注 = 给模型看的说明</span></h3>
+        </div>
         <div class="note">
           建一个标签（例如 <code>funny</code>），备注写清"好笑的梗图，群里出现好笑的事时发"，
           再往里传几张图。之后机器人聊到好笑的场面，就会自己挑一张 funny 里的图发出来。<br>
@@ -1556,7 +1591,13 @@
       </div>
 
       <div class="card" id="pool-new" style="display:none">
-        <h3>新建标签</h3>
+        <div class="card-head">
+          <h3>新建标签</h3>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="cancel-new">取消</button>
+            <button class="btn" data-act="create-tag">创建</button>
+          </div>
+        </div>
         <div class="row">
           <div class="grow" style="flex:0 0 180px">
             <label class="field" style="margin:0"><span style="font-size:12px;color:var(--fg-dim)">标签名</span></label>
@@ -1566,8 +1607,6 @@
             <label class="field" style="margin:0"><span style="font-size:12px;color:var(--fg-dim)">备注（给机器人看）</span></label>
             <input type="text" id="pool-new-note" maxlength="300" placeholder="好笑的梗图，群里出现好笑的事时发">
           </div>
-          <button class="btn" data-act="create-tag">创建</button>
-          <button class="btn ghost" data-act="cancel-new">取消</button>
         </div>
         <div class="note">标签名可用中文、字母、数字、下划线、连字符；备注随时能改。</div>
       </div>
@@ -1590,14 +1629,12 @@
       const untagged = t.name === '未分类';
       return `
       <div class="card pool-tag">
-        <div class="pool-head">
-          <div class="grow">
-            <h3>${esc(t.name)} <span class="hint">${t.images.length} 张</span></h3>
-          </div>
-          <div class="row" style="gap:6px;flex:0 0 auto">
-            <button class="btn sm ghost" data-act="pick" data-tag="${esc(t.name)}">上传图片</button>
-            ${untagged ? '' : `<button class="btn sm ghost" data-act="rename" data-tag="${esc(t.name)}">改名</button>
-            <button class="btn sm danger" data-act="del-tag" data-tag="${esc(t.name)}">删除标签</button>`}
+        <div class="card-head">
+          <h3>${esc(t.name)} <span class="hint">${t.images.length} 张</span></h3>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="pick" data-tag="${esc(t.name)}">上传图片</button>
+            ${untagged ? '' : `<button class="btn ghost" data-act="rename" data-tag="${esc(t.name)}">改名</button>
+            <button class="btn danger" data-act="del-tag" data-tag="${esc(t.name)}">删除标签</button>`}
           </div>
         </div>
 
@@ -1798,7 +1835,13 @@
         </div>
       </div>
       <div class="card" id="ps-editor" style="display:none">
-        <h3 id="ps-ed-title">编辑人格</h3>
+        <div class="card-head">
+          <h3 id="ps-ed-title">编辑人格</h3>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="cancel">取消</button>
+            <button class="btn" data-act="save-persona">保存</button>
+          </div>
+        </div>
         <div class="field">
           <label>人格名</label>
           <input type="text" id="ps-name" placeholder="例如：默认、毒舌助手">
@@ -1812,10 +1855,6 @@
             可用变量：{{time}} {{group_name}} {{nickname}} {{bot_name}}。
             结尾会自动追加「纯文本、不用 Markdown、1-3 句」等格式约束。
           </div>
-        </div>
-        <div class="row end">
-          <button class="btn ghost" data-act="cancel">取消</button>
-          <button class="btn" data-act="save-persona">保存</button>
         </div>
       </div>`;
 
@@ -1957,9 +1996,12 @@
         <button class="btn ghost" data-act="toggle-preset">添加对话对象</button>
       </div>
       <div class="card" id="ss-preset" style="display:none">
-        <h3>给还没说过话的群 / 好友预设人格
-          <button class="btn ghost sm" data-act="cancel-preset">取消</button>
-        </h3>
+        <div class="card-head">
+          <h3>给还没说过话的群 / 好友预设人格</h3>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="cancel-preset">取消</button>
+          </div>
+        </div>
         <div class="preset-form">
           <div class="cell">
             <span>筛选</span>
@@ -1985,7 +2027,9 @@
       </div>
       <div class="card"><div id="ss-list"><div class="empty">加载中…</div></div></div>
       <div class="card" id="ss-detail" style="display:none">
-        <h3 id="ss-detail-title">对话记录</h3>
+        <div class="card-head">
+          <h3 id="ss-detail-title">对话记录</h3>
+        </div>
         <div class="chat" id="ss-chat"></div>
       </div>`;
 
@@ -2287,7 +2331,9 @@
 
       $('#us-body').innerHTML = `
         <div class="card">
-          <h3>今日</h3>
+          <div class="card-head">
+            <h3>今日</h3>
+          </div>
           <div class="grid c4">
             <div class="metric"><div class="k">请求次数</div><div class="v" id="us-req">${fmtInt(today.requests)}</div></div>
             <div class="metric"><div class="k">输入 token</div><div class="v sm mono">${fmtInt(today.prompt_tokens)}</div></div>
@@ -2297,7 +2343,9 @@
         </div>
 
         <div class="card">
-          <h3>最近 7 天请求量</h3>
+          <div class="card-head">
+            <h3>最近 7 天请求量</h3>
+          </div>
           ${items.length ? `
             <div class="bars">
               ${items.map((x) => {
@@ -2312,7 +2360,9 @@
         </div>
 
         <div class="card">
-          <h3>明细</h3>
+          <div class="card-head">
+            <h3>明细</h3>
+          </div>
           ${items.length ? `
             <table>
               <thead><tr><th>日期</th><th>请求</th><th>输入</th><th>输出</th><th>高峰请求</th><th>花费</th></tr></thead>
@@ -2340,7 +2390,12 @@
       </div>
 
       <div class="card">
-        <h3>账户名 <span class="hint">登录面板时使用</span></h3>
+        <div class="card-head">
+          <h3>账户名 <span class="hint">登录面板时使用</span></h3>
+          <div class="card-actions">
+            <button class="btn" data-act="name">更新用户名</button>
+          </div>
+        </div>
         <div class="grid c2">
           <div class="field"><label>新用户名</label>
             <input type="text" id="ac-name" autocomplete="username" value="${esc(app.user || '')}" maxlength="32">
@@ -2349,22 +2404,27 @@
             <input type="password" id="ac-name-pw" autocomplete="current-password">
             <div class="note">改的是登录身份，需要确认是本人操作。</div></div>
         </div>
-        <button class="btn" data-act="name">更新用户名</button>
       </div>
 
       <div class="card">
-        <h3>修改密码</h3>
+        <div class="card-head">
+          <h3>修改密码</h3>
+          <div class="card-actions">
+            <button class="btn" data-act="pw">更新密码</button>
+          </div>
+        </div>
         <div class="grid c3">
           <div class="field"><label>原密码</label><input type="password" id="ac-old" autocomplete="current-password"></div>
           <div class="field"><label>新密码</label><input type="password" id="ac-new" autocomplete="new-password">
             <div class="note">至少 12 位。</div></div>
           <div class="field"><label>确认新密码</label><input type="password" id="ac-new2" autocomplete="new-password"></div>
         </div>
-        <button class="btn" data-act="pw">更新密码</button>
       </div>
 
       <div class="card">
-        <h3>两步验证 <span class="hint" id="ac-totp-state">—</span></h3>
+        <div class="card-head">
+          <h3>两步验证 <span class="hint" id="ac-totp-state">—</span></h3>
+        </div>
         <div id="ac-totp-body"><div class="empty">加载中…</div></div>
       </div>`;
 
@@ -2523,20 +2583,29 @@
         </div>
       </div>
 
-      <div class="card" style="margin-bottom:16px">
-        <h3>账号状态</h3>
+      <div class="card">
+        <div class="card-head">
+          <h3>账号状态</h3>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="qq-refresh">重新查询</button>
+            <button class="btn ghost" data-act="qq-logout" id="qq-logout" style="display:none">退出登录</button>
+          </div>
+        </div>
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <span class="dot" id="qq-dot"></span>
           <span id="qq-state" style="font-size:13px">正在查询…</span>
           <span class="mono" id="qq-uin" style="color:var(--fg-dim);font-size:12px"></span>
-          <button class="btn ghost sm" data-act="qq-refresh" style="margin-left:auto">重新查询</button>
-          <button class="btn ghost sm" data-act="qq-logout" id="qq-logout" style="display:none">退出登录</button>
         </div>
         <div id="qq-hint" style="margin-top:10px;font-size:11.5px;color:var(--fg-mute);line-height:1.7"></div>
       </div>
 
       <div class="card" id="qq-login-card" style="display:none">
-        <h3>扫码登录 <span class="hint">二维码约 2 分钟失效，过期会自动换新</span></h3>
+        <div class="card-head">
+          <h3>扫码登录 <span class="hint">二维码约 2 分钟失效，过期会自动换新</span></h3>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="qq-reload-qr">刷新二维码</button>
+          </div>
+        </div>
         <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start">
           <div style="text-align:center">
             <div id="qq-qr-box" style="width:220px;height:220px;display:flex;align-items:center;
@@ -2544,7 +2613,6 @@
                  border:1px solid var(--line)">
               <span style="color:var(--fg-mute);font-size:12px">加载中…</span>
             </div>
-            <button class="btn ghost sm" data-act="qq-reload-qr" style="margin-top:10px">刷新二维码</button>
             <div id="qq-qr-note" style="margin-top:8px;max-width:220px;font-size:11px;
                  line-height:1.6;color:var(--fg-mute)"></div>
           </div>
@@ -2560,8 +2628,10 @@
         </div>
       </div>
 
-      <div class="card" id="qq-saved-card" style="display:none;margin-top:16px">
-        <h3>已保存的账号 <span class="hint">本地登录过，可一键重登</span></h3>
+      <div class="card" id="qq-saved-card" style="display:none">
+        <div class="card-head">
+          <h3>已保存的账号 <span class="hint">本地登录过，可一键重登</span></h3>
+        </div>
         <div id="qq-saved-list" style="display:flex;flex-direction:column;gap:8px"></div>
       </div>`;
 
@@ -2803,9 +2873,11 @@
         <button class="btn ghost" data-act="nc-check">重新检测</button>
       </div>
 
-      <div class="grid c2" style="margin-bottom:16px">
+      <div class="grid c2 mb16">
         <div class="card">
-          <h3>QQ 账号</h3>
+          <div class="card-head">
+            <h3>QQ 账号</h3>
+          </div>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span class="dot" id="nc-dot"></span>
             <span id="nc-state" style="font-size:13px">检测中…</span>
@@ -2815,7 +2887,9 @@
         </div>
 
         <div class="card">
-          <h3>连接</h3>
+          <div class="card-head">
+            <h3>连接</h3>
+          </div>
           <div id="nc-links" style="display:flex;flex-direction:column;gap:10px;font-size:12.5px">
             <div class="empty">检测中…</div>
           </div>
@@ -2823,13 +2897,15 @@
       </div>
 
       <div class="card">
-        <h3>操作</h3>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn" data-act="nc-login">去扫码登录</button>
-          <button class="btn ghost" data-act="nc-logout" id="nc-logout" style="display:none">退出登录</button>
-          <button class="btn ghost" data-act="nc-net">网络配置（改反向 WS）</button>
+        <div class="card-head">
+          <h3>操作</h3>
+          <div class="card-actions">
+            <button class="btn" data-act="nc-login">去扫码登录</button>
+            <button class="btn ghost" data-act="nc-logout" id="nc-logout" style="display:none">退出登录</button>
+            <button class="btn ghost" data-act="nc-net">网络配置（改反向 WS）</button>
+          </div>
         </div>
-        <div style="margin-top:12px;font-size:11.5px;color:var(--fg-mute);line-height:1.9">
+        <div style="font-size:11.5px;color:var(--fg-mute);line-height:1.9">
           退出登录会让机器人立刻离线，之后必须重新扫码。<br>
           反向 WS 没开、或者要改上报格式与 token，都在「网络」页——它只动 OneBot 那一段配置。
         </div>
@@ -2975,8 +3051,10 @@
         </div>
       </div>
 
-      <div class="card" style="margin-bottom:16px">
-        <h3>当前生效的监听</h3>
+      <div class="card">
+        <div class="card-head">
+          <h3>当前生效的监听</h3>
+        </div>
         <div class="grid c4">
           <div class="metric">
             <div class="k">反向 WS</div>
@@ -3001,11 +3079,15 @@
       </div>
 
       <div class="card" id="nw-edit" style="display:none">
-        <h3>编辑配置 <span class="hint">协议端原始 JSON，保存即生效</span></h3>
+        <div class="card-head">
+          <h3>编辑配置 <span class="hint">协议端原始 JSON，保存即生效</span></h3>
+          <div class="card-actions">
+            <button class="btn" data-act="nw-save">保存</button>
+          </div>
+        </div>
         <textarea id="nw-json" spellcheck="false" wrap="off"
                   style="width:100%;min-height:360px"></textarea>
-        <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
-          <button class="btn" data-act="nw-save">保存</button>
+        <div class="row end" style="margin-top:12px;gap:8px;flex-wrap:wrap">
           <button class="btn ghost" data-act="nw-fmt">格式化</button>
           <button class="btn ghost" data-act="nw-reload">重新读取</button>
           <button class="btn ghost" data-act="nw-fix">修正反向 WS（:3001）</button>
