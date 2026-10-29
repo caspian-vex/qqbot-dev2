@@ -124,7 +124,7 @@ test('吸附判据同时看位置与滚动量', () => {
   const body = js.match(/function syncStuckHead\(\)\s*\{([\s\S]*?)\n  \}/)?.[1] ?? '';
   assert.ok(body, '找不到 syncStuckHead 的实现');
   assert.match(body, /getBoundingClientRect\(\)\.top <= 0\.5/, '窄屏要靠位置判断真贴顶');
-  assert.match(body, /window\.scrollY > 0\.5/, '桌面要靠滚动量区分「还没滚」');
+  assert.match(body, /window\.scrollY > 0/, '桌面要靠滚动量区分「还没滚」');
 });
 
 test('被 JS 直接写 textContent 的 id 仍在能安全改写的元素上', () => {

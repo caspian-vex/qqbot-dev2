@@ -191,7 +191,7 @@
   function syncStuckHead() {
     const head = $('.page-head');
     if (!head) return;
-    const stuck = head.getBoundingClientRect().top <= 0.5 && window.scrollY > 0.5;
+    const stuck = head.getBoundingClientRect().top <= 0.5 && window.scrollY > 0;
     head.classList.toggle('is-stuck', stuck);
   }
 

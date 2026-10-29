@@ -12,6 +12,10 @@ git add -A && git commit -m "chore(release): v0.2.1"
 git tag v0.2.1 && git push origin main --tags
 ```
 
+## [0.3.5] - 2026-10-29
+
+- 吸附判据改为 scrollY>0，0.5px 滚动时也画线
+
 ## [0.3.4] - 2026-10-29
 
 ### 修复
