@@ -183,10 +183,16 @@
 
   /* 页头是吸顶的（见 style.css 的 .page-head），只有真被内容顶到视口上沿
      才画那条分隔线：未滚动时它还在文档流里，画了就是凭空多一道线。
-     切页后滚动位置可能保留，所以在 route() 填充完内容后再同步一次。 */
+     页头的静态位置已经和吸顶位置重合（上留白在页头自己的 padding 里），
+     所以未滚动时 rect.top 就是 0——光看 rect 分不出"还没滚"和"已吸住"，
+     光看 scrollY 又会让窄屏（侧栏变成顶部横条、页头还在半空）提前画线。
+     两条同时成立才画线。切页后滚动位置可能保留，所以在 route() 填充完
+     内容后再同步一次。 */
   function syncStuckHead() {
     const head = $('.page-head');
-    if (head) head.classList.toggle('is-stuck', head.getBoundingClientRect().top <= 0.5);
+    if (!head) return;
+    const stuck = head.getBoundingClientRect().top <= 0.5 && window.scrollY > 0.5;
+    head.classList.toggle('is-stuck', stuck);
   }
 
   let headTick = 0;

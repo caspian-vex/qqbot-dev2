@@ -80,13 +80,13 @@ test('页头吸顶：滚到页面底部也能点到「保存设置」', () => {
   assert.equal((css.match(/--head-line:/g) || []).length, 2, '暗色与浅色各要定义一次');
 });
 
-test('吸附态的装饰不许凭空出现（滚到吸附那一刻会"抖一下"）', () => {
-  // 回归点：0.3.2 把页头做成吸顶后，用户反馈"往下滑的时候顶部栏抖一下"。
-  // 用 CDP 逐帧抓 screencast 截图量出来：布局位置一直是 0（getBoundingClientRect
-  // 不抖），但吸附那一帧页头下沿凭空多出 1px 亮线 + 阴影 + 12px 渐隐，单帧内
-  // 近三千个采样像素变色，下一帧又全静——就是这一下被看成"窜了一下"。
-  // 所以：线和阴影在基础态先占位（颜色 transparent），渐隐层常驻（opacity 0），
-  // is-stuck 只换颜色/透明度，120ms 过渡盖住那一帧的突变。
+test('吸附态的装饰不许凭空出现（吸附那一帧的下沿突变）', () => {
+  // 回归点：用户反馈"往下滑的时候顶部栏抖一下"。用 CDP 逐帧抓 screencast 截图
+  // 量出来两件事：① 吸附那一帧页头下沿凭空多出 1px 亮线 + 阴影 + 12px 渐隐，
+  // 单帧近三千个采样像素变色，下一帧又全静；② 页头自身在滚动头几帧从 top=14
+  // 走到 0（见下一条用例）。这一条只管 ①：线和阴影在基础态先占位（颜色
+  // transparent），渐隐层常驻（opacity 0），is-stuck 只换颜色/透明度，
+  // 120ms 过渡盖住那一帧的突变。
   const block = css.match(/\.page-head\s*\{([^}]*)\}/);
   const body = block?.[1] ?? '';
   assert.match(body, /box-shadow:\s*0 1px 0 transparent/, '分隔线要在基础态占位');
@@ -95,6 +95,36 @@ test('吸附态的装饰不许凭空出现（滚到吸附那一刻会"抖一下"
   assert.match(css, /\.page-head\.is-stuck::after\s*\{\s*opacity:\s*1/, '吸附时只改渐隐层的透明度');
   // 反过来钉住：不能再回到"只有 .page-head.is-stuck::after 才定义 content"
   assert.doesNotMatch(css, /\.page-head\.is-stuck::after\s*\{[^}]*content:/, '渐隐层不能只在吸附态创建');
+});
+
+test('页头的上留白必须在页头里，不能在 .main 里（否则滚动时会窜一段）', () => {
+  // 回归点：页头静态位置与吸顶位置(0)的差就是它的「自由行程」。
+  // .main 的 padding-top + 页头的 margin-top 都是这段行程的来源：
+  // 有行程，页头就跟着内容走几帧、然后在一帧内停住，相对内容整体错位一次；
+  // 滚轮一格约 100px，这一停就是一帧内的事，看起来像"顶部栏窜了一下"。
+  // 实测（改前）：页头 top 从 14 走到 0，夹取那帧内容走了 12px、页头只走 3px。
+  // 所以：上留白归 .page-head 的 padding-top，.main 的 padding-top 必须为 0。
+  const main = css.match(/\.main\s*\{([^}]*)\}/)?.[1] ?? '';
+  const head = css.match(/\.page-head\s*\{([^}]*)\}/)?.[1] ?? '';
+  assert.match(main, /padding:\s*0\s+var\(--pad-x\)/, '.main 只留左右内边距，上留白交给页头');
+  assert.doesNotMatch(main, /padding:\s*var\(--pad-y\)/, '上留白不许留在 .main（会长出自由行程）');
+  assert.match(head, /padding:\s*var\(--pad-y\)\s+var\(--pad-x\)/, '页头的 padding-top 吃 --pad-y');
+  assert.doesNotMatch(head, /margin:\s*-/, '页头不许再有纵向负边距');
+  // 没有页头的视图（加载失败）要自己把那 26px 补回来
+  assert.match(css, /\.main\s*>\s*\.err-inline\s*\{[^}]*margin-top/, '失败态要补回上留白');
+  // 窄屏是可独立生效的覆盖块，必须一起改，只改桌面等于手机上还有一段行程
+  const narrow = css.slice(css.indexOf('@media (max-width: 900px)'));
+  assert.match(narrow, /\.main\s*\{[^}]*padding:\s*0\s+var\(--pad-x\)/, '窄屏 .main 也不能有上留白');
+  assert.match(narrow, /\.page-head\s*\{[^}]*padding:\s*var\(--pad-y\)/, '窄屏页头要吃 --pad-y');
+});
+
+test('吸附判据同时看位置与滚动量', () => {
+  // 上一条把页头的静态位置改成 0 之后，只看 rect.top 会永远为真（一进页面就画线），
+  // 只看 scrollY 又会让窄屏（侧栏变成顶部横条、页头还在半空）提前画线。
+  const body = js.match(/function syncStuckHead\(\)\s*\{([\s\S]*?)\n  \}/)?.[1] ?? '';
+  assert.ok(body, '找不到 syncStuckHead 的实现');
+  assert.match(body, /getBoundingClientRect\(\)\.top <= 0\.5/, '窄屏要靠位置判断真贴顶');
+  assert.match(body, /window\.scrollY > 0\.5/, '桌面要靠滚动量区分「还没滚」');
 });
 
 test('被 JS 直接写 textContent 的 id 仍在能安全改写的元素上', () => {

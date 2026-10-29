@@ -332,11 +332,16 @@ a:hover { text-decoration: underline; }
 .ver-sha { overflow: hidden; text-overflow: ellipsis; }
 
 .main {
-  /* 页头要横向铺满整幅主区，靠负边距抵消这两个值；抽成变量，
-     窄屏只改一处，不会出现"页头背景比内容窄 16px、两侧漏出卡片"。 */
+  /* 这两个值原本是 .main 自己的内边距，现在只给左右——上留白归页头（见下）。
+     抽成变量：窄屏只改一处，不会出现"页头背景比内容窄 16px、两侧漏出卡片"。 */
   --pad-y: 26px;
   --pad-x: 30px;
-  padding: var(--pad-y) var(--pad-x) 60px;
+  /* 顶部必须为 0。只要这里还有 padding-top，页头的静态位置就比吸顶位置(0)
+     低这么多，这一段就是页头的「自由行程」：滚动头几帧它跟着内容 1:1 走，
+     到 top:0 那一帧突然停住，页头相对内容整体错位一次——滚轮一格约 100px，
+     这一停就在一帧内完成，看到的就是"往下滑的时候顶部栏抖一下"。
+     （0.3.3 之前实测：页头 top 从 14 走到 0，夹取那帧内容走了 12px、页头只走 3px。） */
+  padding: 0 var(--pad-x) 60px;
   max-width: 1180px;
   width: 100%;
 }
@@ -352,22 +357,22 @@ a:hover { text-decoration: underline; }
 
   /* 吸顶：滚到页面底部也能直接点「保存设置」，不用再滚回顶部。
      相对视口生效——.main 与 body 上都没有 overflow，sticky 才不会被裁掉。
-     底部的间距从 margin 改成 padding：背景要盖住页头到第一张卡之间那 20px，
+     上留白放在 padding-top、且 margin-top 为 0：页头 border box 正好贴在 .main
+     上沿（y=0），静态位置与吸顶位置重合，滚动时页头本身一动不动，只有卡片从
+     它下面滑过去。留白挪回 .main 就会重新长出上面说的那段自由行程。
+     底部的间距也是 padding 不是 margin：背景要盖住页头到第一张卡之间那 20px，
      否则卡片会从缝里滑过去，看着像页头飘在半空。
-     顶部 -12 / +12 是自相抵消的一对，未滚动时标题位置与改造前一致。
-     横向同理用 padding + 负 margin：页头本来是 .main 内容盒里的一块，
+     横向用 padding + 负 margin：页头本来是 .main 内容盒里的一块，
      只铺内容宽度的话，滚动时左右两侧各露出 30px 的卡片，像两条竖着的脏边。 */
   position: sticky;
   top: 0;
   z-index: 30;
   background: var(--bg);
-  padding: 12px var(--pad-x) 20px;
-  margin: -12px calc(var(--pad-x) * -1) 0;
-  /* 滚动到吸附那一刻，页头会"抖一下"。实测（CDP 逐帧抓 screencast 截图，1400×900）：
-     scrollY=15 那一帧页头下沿已经稳定在 86px、getBoundingClientRect().top 一直是 0
-     ——布局没动，但下沿凭空多出 1px 亮线 + 外阴影 + 12px 渐隐，单帧近三千个采样像素
-     变色，下一帧又全静。所以这两样在基础态就占好位、颜色先透明，is-stuck 只换颜色，
-     吸附时不再凭空多画东西。 */
+  padding: var(--pad-y) var(--pad-x) 20px;
+  margin: 0 calc(var(--pad-x) * -1) 0;
+  /* 吸附瞬间还有第二层"抖"：页头下沿凭空多出 1px 亮线 + 外阴影 + 12px 渐隐
+     （0.3.2 实测单帧近三千个采样像素变色，下一帧又全静）。
+     所以这两样在基础态就占好位、颜色先透明，is-stuck 只换颜色。 */
   box-shadow: 0 1px 0 transparent, 0 8px 16px -12px transparent;
   transition: box-shadow .12s linear;
 }
@@ -398,11 +403,16 @@ a:hover { text-decoration: underline; }
 
 .page-head.is-stuck::after { opacity: 1; }
 
-/* 吸顶页头常驻顶部约 87px（窄屏 79px）：Tab 键或锚点把控件滚进视口时，
-   让它停在页头下方而不是被压住。只影响聚焦/锚点滚动，点击不触发。 */
+/* 吸顶页头常驻顶部约 100px（窄屏 86px）：Tab 键或锚点把控件滚进视口时，
+   让它停在页头下方而不是被压住。只影响聚焦/锚点滚动，点击不触发。
+   这个数要 ≥ 页头高度：页头从 86.15 长到 100.15（上留白挪进来后），96 就不够了。 */
 .card input,
 .card select,
-.card textarea { scroll-margin-top: 96px; }
+.card textarea { scroll-margin-top: 110px; }
+
+/* 视图加载失败时 .main 里只剩一条 .err-inline，没有页头替它把那 26px 上留白
+   撑起来，否则报错文字会贴着视口顶。 */
+.main > .err-inline { margin-top: var(--pad-y); }
 
 .page-head h2 {
   font-size: 19px;
@@ -521,14 +531,18 @@ a:hover { text-decoration: underline; }
   .side-user { padding: 0; }
   .su-meta { display: none; }
   .ver-line { padding: 0; }
-  .main { --pad-y: 18px; --pad-x: 14px; padding: var(--pad-y) var(--pad-x) 48px; }
+  .main { --pad-y: 18px; --pad-x: 14px; padding: 0 var(--pad-x) 48px; }
   /* 手机上标题和按钮常常折成两行，吸顶后页头会吃掉不少视口高度，
-     上下留白跟着页边距一起收一档；-10/+10 仍自相抵消，未滚动时位置不变。
-     横向跟着 --pad-x 走，页头背景才不会比内容窄。 */
+     上下留白跟着页边距一起收一档。上留白同样只属于页头（理由见基础态），
+     窄屏侧栏变成顶部横条，页头在它下面，等横条滚出视口才贴顶。 */
   .page-head {
-    padding: 10px var(--pad-x) 14px;
-    margin: -10px calc(var(--pad-x) * -1) 0;
+    padding: var(--pad-y) var(--pad-x) 14px;
+    margin: 0 calc(var(--pad-x) * -1) 0;
   }
+  /* 窄屏页头高度 86.15px（文字两层 54.15 + 18 + 14） */
+  .card input,
+  .card select,
+  .card textarea { scroll-margin-top: 96px; }
   /* 卡片内边距跟着页边距一起收。标题栏的负边距读的是 var(--pad)，
      所以窄屏下标题依然与正文对齐，不会出现"标题比正文少缩进 4px"。 */
   .card { --pad: 14px; }
