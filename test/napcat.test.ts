@@ -90,6 +90,67 @@ describe('NapCat WebUI 客户端', () => {
     });
   });
 
+  it('刷新二维码会真的让协议端重建（过期后能换到新码）', async () => {
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      const first = await c.qrcode();
+      assert.equal(first.stale, false);
+
+      // 修复前的 bug 就长这样：不带 force（也就是只重复调 GetQQLoginQrcode），
+      // 协议端一直返回缓存里那张，二维码失效后就再也换不掉。
+      const again = await c.qrcode({ force: true });
+      assert.equal(f.state.qrRefreshes, 1, 'force 必须打 RefreshQRcode，光重复读是拿不到新码的');
+      assert.notEqual(again.content, first.content);
+      assert.notEqual(again.image, first.image, '内容变了，渲染出来的图也必须跟着变');
+      assert.equal(again.stale, false);
+      // 实机验证：RefreshQRcode 是同步返回新码的（字段 qrcodeurl），
+      // 所以 force 那一次不需要再 Get 一遍，省一次往返也不依赖时序假设。
+      const gets = f.calls.filter((p) => p === '/api/QQLogin/GetQQLoginQrcode').length;
+      assert.equal(gets, 1, '只有首次取码该走 Get，刷新那次直接用 RefreshQRcode 的返回值');
+    });
+  });
+
+  it('协议端不换码时如实报 stale，不假装刷新成功', async () => {
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      const first = await c.qrcode();
+      // 账号被踢下线时 RefreshQRcode 会回成功，但内核不再推新码
+      f.state.qrRotateOnRefresh = false;
+
+      const again = await c.qrcode({ force: true });
+      assert.equal(f.state.qrRefreshes, 1);
+      assert.equal(again.stale, true);
+      assert.equal(again.content, first.content);
+      // 图还是要给出去：用户能看出"还是这张"，总比二维码框整块空白强
+      assert.match(again.image, /^data:image\/png;base64,/);
+    });
+  });
+
+  it('不刷新时不打 RefreshQRcode（别把用户正在扫的码作废）', async () => {
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      await c.qrcode();
+      await c.qrcode();
+      await c.qrcode();
+      assert.equal(f.state.qrRefreshes, 0);
+    });
+  });
+
+  it('协议端没有刷新接口时退回已缓存的码，不把扫码页打挂', async () => {
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      const first = await c.qrcode();
+      // 老版本 NapCat 没有 RefreshQRcode，调用会失败；这不该连累取码
+      f.state.failNextWith = { code: -1, message: 'Not Found' };
+
+      const again = await c.qrcode({ force: true });
+      assert.equal(again.logined, false);
+      assert.equal(again.content, first.content);
+      assert.equal(again.stale, true, '没换成就要如实说，别让用户对着死码等');
+      assert.match(again.image, /^data:image\/png;base64,/);
+    });
+  });
+
   it('快捷登录列表归一化，空列表不报错', async () => {
     await withFake(async (f) => {
       const c = new NapCatWebUI(f.base, TOKEN, log());
@@ -281,6 +342,32 @@ describe('面板 /api/qq/*', () => {
     });
   });
 
+  it('/api/qq/qrcode?refresh=1 让协议端重建二维码（「刷新二维码」按钮走这条）', async () => {
+    await withFake(async (f) => {
+      const h = await panelWith(f);
+      try {
+        const post = (q: string): Promise<Response> =>
+          fetch(`${h.base}/api/qq/qrcode${q}`, {
+            method: 'POST',
+            headers: { Cookie: h.cookie, 'X-CSRF-Token': h.csrf },
+          });
+
+        const first = (await (await post('')).json()) as { image: string };
+        assert.equal(f.state.qrRefreshes, 0, '普通取码不该触发重建');
+
+        const second = (await (await post('?refresh=1')).json()) as {
+          image: string;
+          stale: boolean;
+        };
+        assert.equal(f.state.qrRefreshes, 1);
+        assert.notEqual(second.image, first.image);
+        assert.equal(second.stale, false);
+      } finally {
+        await h.stop();
+      }
+    });
+  });
+
   it('已登录时取码不是错误：返回 logined 标记而不是抛错', async () => {
     await withFake(async (f) => {
       f.state.uin = '10001';
@@ -317,7 +404,10 @@ describe('面板 /api/qq/*', () => {
         // 前端拿 logined 去收起登录卡片并刷新状态；报 500 只会让它
         // 在二维码位置显示一句 "QQ Is Logined"
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { image: '', logined: true });
+        const b = (await res.json()) as { image: string; logined: boolean; stale: boolean };
+        assert.equal(b.image, '');
+        assert.equal(b.logined, true);
+        assert.equal(b.stale, false);
       } finally {
         await h.stop();
       }

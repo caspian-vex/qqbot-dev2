@@ -13,6 +13,9 @@
 //   - 业务错误一律 HTTP 200，只能看 body 的 code 字段
 //   - qrcode 字段是二维码**内容字符串**，不是图片地址
 //     （那个地址会 302 跳 im.qq.com 落地页，塞进 <img> 是坏的）
+//   - GetQQLoginQrcode 只是把内核缓存的那串读出来，**不会重建二维码**。
+//     二维码约 2 分钟失效，失效后反复调它拿到的永远是同一张死码；
+//     想换新必须调 RefreshQRcode，让 QQ 登录内核重新发起登录。
 import { createHash } from 'node:crypto';
 import QRCode from 'qrcode';
 import type { Logger } from '../log/logger';
@@ -25,6 +28,24 @@ const CRED_TTL_MS = 3600_000;
 const CRED_REFRESH_MARGIN_MS = 60_000;
 
 const CALL_TIMEOUT_MS = 10_000;
+
+/**
+ * 二维码有效期。
+ *
+ * 官方约 2 分钟，取 110 秒：留 10 秒余量，避免用户正好在失效那一刻扫。
+ * 这个数字只用来决定"该不该换新码"，不是给用户看的倒计时。
+ */
+const QR_TTL_MS = 110_000;
+
+/**
+ * 刷新之后等新码的轮询参数。
+ *
+ * RefreshQRcode 只是把请求转给 QQ 登录内核，**返回成功不代表新码已经就绪**——
+ * 紧接着调 GetQQLoginQrcode 很可能还是旧的。所以刷新后要再读几轮，
+ * 读到内容变了才算换成功；一直没变就把 stale 如实报给面板。
+ */
+const QR_POLL_ATTEMPTS = 3;
+const QR_POLL_DELAY_MS = 400;
 
 /** 协议端登录状态（归一化后的形状，字段名由我们自己定）。 */
 export interface QQLoginStatus {
@@ -110,6 +131,16 @@ function asBool(v: unknown): boolean {
   return v === true || v === 'true' || v === 1;
 }
 
+/** 等一会儿。只在刷新二维码后轮询新码时用，别拿它做业务节流。 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** 二维码内容字段。真机叫 qrcode，个别版本给的是 qrcodeUrl / qrcodeurl。 */
+function qrcodeContent(d: Record<string, unknown> | undefined): string {
+  return asString(pick(d, ['qrcode', 'qrcodeUrl', 'qrcodeurl']));
+}
+
 /**
  * 从 data 里挖出真正的配置。
  *
@@ -139,6 +170,15 @@ export class NapCatWebUI {
   private credentialAt = 0;
   /** 正在进行的登录请求。并发调用共用它，别各自去换一次凭据。 */
   private loginInflight: Promise<string> | null = null;
+  /**
+   * 上一次拿到的二维码内容与**内容发生变化的时间**。
+   *
+   * 只用它判定两件事：这张码是不是该换了（超过 TTL），
+   * 以及刷新之后协议端到底有没有给新码（内容有没有变）。
+   * 不用"上次调用时间"——每 3 秒的状态轮询不会读码，但读码的重试会，
+   * 那会把过期时间一次次推后，等于永远不换。
+   */
+  private lastQr = { content: '', at: 0 };
   private readonly log: Logger;
 
   constructor(
@@ -279,21 +319,100 @@ export class NapCatWebUI {
    * 不用为协议端开一个外部域名。
    *
    * 已登录时协议端会拒绝发码，这里归一成 `logined: true`（没有图，但也不是错）。
+   *
+   * `force` 用于「刷新」：二维码过期后必须真的让协议端重建，
+   * 只重复读的话永远拿到同一张死码。没传 force 时，本模块也会在
+   * 距上次**内容变化**超过 QR_TTL_MS 后自己补一次重建——
+   * 否则任何按周期取码的调用都只是把同一张旧码再拿一遍。
+   *
+   * `stale: true` 表示"刷新请求发出去了，但协议端没给出新码"。
+   * 这不是失败，是一种需要如实告诉用户的状态（通常是账号被踢下线、
+   * 内核卡住），面板据此提示重启协议端，而不是假装刷新成功。
    */
-  async qrcode(): Promise<{ image: string; content: string; logined: boolean }> {
-    let d: Record<string, unknown> | undefined;
-    try {
-      d = await this.call('/QQLogin/GetQQLoginQrcode');
-    } catch (e) {
-      if (isLoginedError(e)) return { image: '', content: '', logined: true };
-      throw e;
+  async qrcode(opts: { force?: boolean } = {}): Promise<{
+    image: string;
+    content: string;
+    logined: boolean;
+    stale: boolean;
+  }> {
+    const expired = this.lastQr.content !== '' && Date.now() - this.lastQr.at >= QR_TTL_MS;
+    const force = opts.force === true || expired;
+
+    // 刷新路由自己就会返回新码（字段名是 qrcodeurl，与 GetQQLoginQrcode 的
+    // qrcode 不同），实机验证是**同步**的：调用后立刻取码拿到的就是新码。
+    // 所以正常路径不需要再 Get 一次，也不用等。
+    let content = '';
+    if (force) content = await this.refreshQrcode();
+
+    if (content === '') {
+      const data = await this.readQrcode();
+      if (data === null) return { image: '', content: '', logined: true, stale: false };
+      content = qrcodeContent(data);
     }
 
-    const content = asString(pick(d, ['qrcode', 'qrcodeUrl', 'qrcodeurl']));
+    // 兜底：刷新有返回但仍与上一张相同（老版本 NapCat 只回结果不回码、
+    // 或内核还没来得及推新码）。等几轮，确认它到底换没换。
+    if (force && content === this.lastQr.content) {
+      for (let i = 0; i < QR_POLL_ATTEMPTS; i++) {
+        await sleep(QR_POLL_DELAY_MS);
+        const again = await this.readQrcode();
+        if (again === null) return { image: '', content: '', logined: true, stale: false };
+        const next = qrcodeContent(again);
+        if (next !== '' && next !== this.lastQr.content) {
+          content = next;
+          break;
+        }
+      }
+    }
+
     if (content === '') throw new NapCatError(-1, 'NapCat 未返回二维码内容');
 
+    const stale = force && content === this.lastQr.content;
+    if (content !== this.lastQr.content) {
+      this.lastQr = { content, at: Date.now() };
+    } else if (force) {
+      // 内容没变也把时间戳推一下：否则每次调用都会判定"过期了"，
+      // 一个卡住的协议端会被每 3 秒一次的轮询反复 refresh。
+      this.lastQr = { content, at: Date.now() };
+    }
+
     const image = await QRCode.toDataURL(content, QR_OPTIONS);
-    return { image, content, logined: false };
+    return { image, content, logined: false, stale };
+  }
+
+  /**
+   * 让协议端重建二维码。
+   *
+   * 为什么非调不可：二维码过期后 GetQQLoginQrcode 会一直返回缓存里那张，
+   * 面板上的「刷新二维码」就成了摆设。只有这条路由会让 QQ 登录内核
+   * 重新走一遍登录流程、推一张新码上来。
+   *
+   * 失败不当致命错误：老版本 NapCat 没有这条路由，能拿到（哪怕过期的）码
+   * 也比整个扫码页报错强。已登录时它也会拒绝，那不是问题。
+   *
+   * 返回值是刷新后拿到的新码内容（拿不到就是空串，由调用方退回 Get）。
+   * 注意它的字段名是 `qrcodeurl`，不是 GetQQLoginQrcode 的 `qrcode`——
+   * 两个接口返回形状不一样，这里统一交给 qrcodeContent 兜住。
+   */
+  async refreshQrcode(): Promise<string> {
+    try {
+      const d = await this.call('/QQLogin/RefreshQRcode');
+      return qrcodeContent(d ?? {});
+    } catch (e) {
+      if (isLoginedError(e)) return '';
+      this.log.warn('请求协议端刷新二维码失败，将退回已缓存的二维码', { err: e });
+      return '';
+    }
+  }
+
+  /** 读一次二维码 data，已登录时返回 null（不是错误）。 */
+  private async readQrcode(): Promise<Record<string, unknown> | undefined | null> {
+    try {
+      return await this.call('/QQLogin/GetQQLoginQrcode');
+    } catch (e) {
+      if (isLoginedError(e)) return null;
+      throw e;
+    }
   }
 
   /** 当前登录账号信息。 */

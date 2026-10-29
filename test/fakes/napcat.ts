@@ -23,6 +23,12 @@ export interface FakeNapCatState {
   invalidateCredential: boolean;
   /** 让下一个业务接口返回 code!=0 */
   failNextWith: { code: number; message: string } | null;
+  /** 当前二维码内容。真机行为：读取不会换码，只有 RefreshQRcode 才会。 */
+  qrContent: string;
+  /** RefreshQRcode 是否真的换了码。false 用来复刻"账号被踢下线、内核不重建"的卡死态。 */
+  qrRotateOnRefresh: boolean;
+  /** RefreshQRcode 被调用的次数 */
+  qrRefreshes: number;
   /** OneBot11 网络配置（OB11Config/* 读写的就是它） */
   network: Record<string, unknown>;
   /** true 时 GetConfig 把配置当 JSON 字符串返回（真机有这种形态） */
@@ -53,6 +59,9 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
     saved: [],
     invalidateCredential: false,
     failNextWith: null,
+    qrContent: 'https://txz.qq.com/p?k=fake-qrcode-content&f=web',
+    qrRotateOnRefresh: true,
+    qrRefreshes: 0,
     // 与 NapCat 出厂默认一致：反向 WS 服务端开在 3001
     network: {
       network: {
@@ -154,8 +163,28 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
             bad(-1, 'QQ Is Logined');
             return;
           }
-          // 未登录时给的是二维码内容字符串（一个 https 链接），不是图片地址
-          ok({ qrcode: 'https://txz.qq.com/p?k=fake-qrcode-content&f=web', qrcodeurl: '' });
+          // 未登录时给的是二维码内容字符串（一个 https 链接），不是图片地址。
+          // 关键：读多少次都是同一串——真机的缓存行为就是这样，
+          // 只有 RefreshQRcode 会让它变。旧代码"刷新"只重复读，所以永远同一张。
+          ok({ qrcode: state.qrContent, qrcodeurl: '' });
+          return;
+
+        case '/api/QQLogin/RefreshQRcode':
+          // 真机实测（2026-10-29，NapCat + QQ 内核未登录态）：
+          //   1) 这条路由**同步**返回新码，字段名是 `qrcodeurl`；
+          //   2) 紧接着 GetQQLoginQrcode 拿到的就是这张新码。
+          // 所以客户端可以直接用返回值，不必再 Get 一次、也不用等。
+          // GetQQLoginQrcode 自己则永远回同一串缓存，这才是"刷新没反应"的根因。
+          if (state.uin !== '') {
+            bad(-1, 'QQ Is Logined');
+            return;
+          }
+          state.qrRefreshes++;
+          if (state.qrRotateOnRefresh) {
+            state.qrContent = `https://txz.qq.com/p?k=fake-qrcode-${state.qrRefreshes}&f=web`;
+          }
+          // 没换码时也把当前码带回来：客户端靠"返回值与上一张相同"判定 stale
+          ok({ qrcodeurl: state.qrContent });
           return;
 
         case '/api/QQLogin/GetQQLoginInfo':

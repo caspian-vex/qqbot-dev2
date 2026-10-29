@@ -2311,6 +2311,13 @@
     // 不压一压的话日志里就是每 3 秒一条 ERROR，真正的故障反而被淹掉。
     let qrFailAt = 0;
     const QR_RETRY_MS = 20000;
+    // 这张码是什么时候拿到的。协议端只在内容真的变了时才更新它，
+    // 用来判断"该换新码了"——不能拿"上次请求时间"判断，
+    // 否则每次轮询都把过期时间往后推，等于永远不换（这就是旧 bug 的形态）。
+    let qrIssuedAt = 0;
+    // 协议端收下了刷新请求但没给出新码。不是错误，但不该假装刷新成功。
+    let qrStale = false;
+    const QR_TTL_MS = 110000; // 二维码约 2 分钟失效，留 10 秒余量
     let loggedIn = false;
 
     el.innerHTML = `
@@ -2343,6 +2350,8 @@
               <span style="color:var(--fg-mute);font-size:12px">加载中…</span>
             </div>
             <button class="btn ghost sm" data-act="qq-reload-qr" style="margin-top:10px">刷新二维码</button>
+            <div id="qq-qr-note" style="margin-top:8px;max-width:220px;font-size:11px;
+                 line-height:1.6;color:var(--fg-mute)"></div>
           </div>
           <div style="flex:1;min-width:220px;font-size:12.5px;line-height:1.9;color:var(--fg-dim)">
             <div>1. 手机 QQ 右上角「+」→「扫一扫」</div>
@@ -2400,33 +2409,57 @@
       if (lo) lo.style.display = d.login ? '' : 'none';
     }
 
+    function qrNote(text) {
+      const n = $('#qq-qr-note');
+      if (n) n.textContent = text || '';
+    }
+
     async function loadQr(force) {
       if (qrBusy || loggedIn) return;
       if (!force && Date.now() - qrFailAt < QR_RETRY_MS) return;
       qrBusy = true;
       const box = $('#qq-qr-box');
+      if (force) qrNote('正在换新二维码…');
       try {
-        const d = await api('/api/qq/qrcode', { method: 'POST' });
+        // refresh=1 让协议端**重建**二维码。不带它只是读缓存里那张，
+        // 旧码过期后再点一百次也还是同一张——那是这个 bug 的根因。
+        const d = await api('/api/qq/qrcode' + (force ? '?refresh=1' : ''), { method: 'POST' });
         if (!d) return;
         // 协议端说已经登录了（发码会被它拒绝成 "QQ Is Logined"）：
         // 这不是错误，只是状态轮询还没轮到。收起二维码并立刻同步一次状态。
         if (d.logined) {
           qrContent = '';
+          qrStale = false;
+          qrNote('');
           if (box) box.innerHTML = '';
           await refresh();
           return;
         }
         if (!box) return;
-        qrContent = d.image || '';
+        const img = d.image || '';
         // 200 但没图（协议端还没准备好）：也算"这次没拿到"，一起退避，
         // 否则状态轮询每 3 秒就会来问一次，还顺带把协议端的二维码刷一遍
-        if (qrContent === '') qrFailAt = Date.now();
+        if (img === '') qrFailAt = Date.now();
+        const changed = img !== '' && img !== qrContent;
+        if (changed) qrContent = img;
+        qrStale = d.stale === true;
+        // 主动刷新过（不管有没有换成）都把计时推后：否则 stale 状态下
+        // 看门狗每 10 秒就会再逼协议端刷一次，把内核刷爆。
+        if (force || changed) qrIssuedAt = Date.now();
+
+        if (qrStale) {
+          qrNote('协议端没有给出新二维码。稍后会自动重试；一直这样请重启协议端（docker restart qqbot-napcat）。');
+        } else if (force) {
+          qrNote('');
+        }
+
         box.innerHTML = qrContent
           ? `<img src="${esc(qrContent)}" alt="登录二维码" width="200" height="200"
                   style="border-radius:8px;background:#fff;padding:6px">`
           : '<span style="color:var(--fg-mute);font-size:12px">协议端未返回二维码</span>';
       } catch (e) {
         qrFailAt = Date.now();
+        qrNote('');
         if (box) {
           box.innerHTML = `<span style="color:var(--fg-dim);font-size:11.5px;padding:12px;
             text-align:center;line-height:1.7">${esc(e.message)}</span>`;
@@ -2486,12 +2519,19 @@
     const statusTimer = setInterval(refresh, 3000);
     stops.push(() => clearInterval(statusTimer));
 
-    // 二维码会过期，但重新要一张会让协议端刷新二维码，
-    // 手机正在扫的时候刷新会把用户扫的那张作废，所以间隔取保守的 100 秒。
-    const qrTimer = setInterval(() => {
-      if (!loggedIn) loadQr();
-    }, 100000);
-    stops.push(() => clearInterval(qrTimer));
+    // 二维码换新的策略：**只在真的过期后**才换。
+    //
+    // 旧写法是每 100 秒无脑 loadQr()，两个问题叠在一起：
+    //   1. 不带 refresh，拿回来的是协议端缓存里那张，等于没换；
+    //   2. 万一真换成功了，手机正在扫的那张会被作废。
+    // 现在按「这张码拿了多久」判断：超过 TTL 才强制重建一次，
+    // 既不会把正在扫的码换掉，也不会让用户对着死码干等。
+    const qrWatch = setInterval(() => {
+      if (loggedIn || qrBusy || qrContent === '') return;
+      if (Date.now() - qrIssuedAt < QR_TTL_MS) return;
+      loadQr(true);
+    }, 10000);
+    stops.push(() => clearInterval(qrWatch));
 
     bindActions(el, {
       'qq-refresh': async () => {

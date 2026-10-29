@@ -1667,15 +1667,34 @@ export class Api {
     })();
   }
 
-  /** 取二维码（PNG data URL）。每次调用都会让协议端刷新二维码。 */
+  /**
+   * 取二维码（PNG data URL）。
+   *
+   * `?refresh=1` 会让协议端**重建**二维码。为什么必须区分这两种调用：
+   * 二维码约 2 分钟失效，而协议端的取码接口只是把内核缓存的那串读出来，
+   * 失效后反复调它拿到的还是同一张死码——面板上「刷新二维码」点了没反应，
+   * 就是这个原因。只有真的请求重建才会出新码。
+   *
+   * 不用请求体传这个开关：这条路由原本没有 body，加一个 body 会让
+   * 缓存了旧前端的浏览器（POST 无 body）直接吃 400。查询串加一个参数
+   * 对两边都兼容，也不需要额外解析。
+   */
   async qqQrcode(ctx: ReqCtx): Promise<void> {
     const qq = this.d.qq;
     if (!qq.configured) throw new HttpError(503, '未配置协议端 WebUI，无法扫码登录');
-    const qr = await qq.qrcode();
+    const raw = ctx.query.get('refresh') ?? '';
+    const force = raw !== '' && raw !== '0' && raw !== 'false';
+    const qr = await qq.qrcode({ force });
     // 已登录时不发图也不报错：前端拿到 logined 就收起登录卡片去同步状态。
     // 之前这里直接抛 500，日志里留一条 "QQ Is Logined" 的 ERROR，
     // 而它其实只是"你早就登录了"。
-    writeJSON(ctx.res, 200, { image: qr.image, logined: qr.logined });
+    // stale 也一样如实透出：刷新失败不能假装成功，否则用户会一直对着死码。
+    writeJSON(ctx.res, 200, {
+      image: qr.image,
+      logined: qr.logined,
+      stale: qr.stale,
+      at: Date.now(),
+    });
   }
 
   /** 本地已保存的账号，用于一键重登（不用再扫码）。 */

@@ -78,8 +78,17 @@ export interface QQLoginPort {
    *
    * `logined: true` 表示协议端说"已经是登录状态了，不发码"——不是错误，
    * 面板据此收起登录卡片并同步一次状态。
+   *
+   * `force: true` 会让协议端**重建**二维码。必须能重建：二维码约 2 分钟失效，
+   * 而只是重复读取拿到的永远是缓存里那张死码（这就是"过期后点刷新没反应"）。
+   * `stale: true` 表示刷新请求已发出但协议端没给出新码，面板要如实提示。
    */
-  qrcode(): Promise<{ image: string; content: string; logined: boolean }>;
+  qrcode(opts?: { force?: boolean }): Promise<{
+    image: string;
+    content: string;
+    logined: boolean;
+    stale: boolean;
+  }>;
   loginInfo(): Promise<QQInfo>;
   quickLoginList(): Promise<QuickLoginItem[]>;
   quickLogin(uin: string): Promise<void>;
