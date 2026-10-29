@@ -32,7 +32,7 @@ import {
   runComputerTool,
   type ComputerActor,
 } from './computer';
-import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho } from './echo';
+import { echoDelayMs, echoInstruction, isAwaitingAnswer, repeatsLastReply, shouldEcho } from './echo';
 import { planSpeech, type SpeechPlan } from './timing';
 import {
   IDLE_MIN_GAP_MS,
@@ -73,7 +73,7 @@ import {
   toolQuery,
   webSearch,
 } from './search';
-import { split, stripMarkdown } from './split';
+import { split, stripMarkdown, truncate } from './split';
 import {
   VISION_HINT,
   VISION_ONLY_PROMPT,
@@ -182,6 +182,17 @@ interface PendingEcho {
   kind: string;
   target: number;
   timer: ReturnType<typeof setTimeout>;
+  /**
+   * 排这次跟进时机器人刚发出去的那句（含图片备注，已截断）。
+   * 跟进时要把原文交给模型：「不许把上一句换个说法再说一遍」这条规则，
+   * 不给它看原文是做不到的。
+   */
+  lastReply: string;
+  /**
+   * 排定的时刻。执行时用它复查"这期间用户说过话没有"——
+   * 排定时取消过不代表执行时还有效，见 runEcho。
+   */
+  armedAt: number;
 }
 
 export class Engine implements EnginePort {
@@ -615,6 +626,10 @@ export class Engine implements EnginePort {
 
     this.counters.replied++;
     this.counters.lastReplyAt = Math.floor(Date.now() / 1000);
+    // 这句话已经把问题抛给对方了没有？跟着日志一起带上，部署后 grep echo_skip
+    // 就能量出"有多少条回复因为已在等回答而没排出跟进"。只算这一次，
+    // scheduleEcho 直接用结果，不重复判。
+    const awaiting = isAwaitingAnswer(replyText);
     this.log.info('已回复', {
       group: ev.group_id ?? 0,
       user: ev.user_id ?? 0,
@@ -622,9 +637,13 @@ export class Engine implements EnginePort {
       images: picked.length,
       seen_images: images.length,
       first_token: `${res.firstTokenMs}ms`,
+      ...(awaiting ? { echo_skip: 'awaiting' } : {}),
     });
 
-    this.scheduleEcho(sid, kindOf(ev), targetOf(ev), settings);
+    // quoteText 给它看的是实际发出去的口径（含"发了 1 张图"的备注）：
+    // 纯发图时 replyText 是空串，只有 recordText 有内容——
+    // 只给空串，模型会以为自己刚才什么都没说。
+    this.scheduleEcho(sid, kindOf(ev), targetOf(ev), settings, awaiting, truncate(recordText, 200));
   }
 
   /**
@@ -908,9 +927,30 @@ export class Engine implements EnginePort {
   // 主动消息里风险最低的一种：对话刚发生、对方明确在聊，
   // 隔一小会儿补一句相关的话。所以把它做成第一个落地的主动功能。
 
-  /** 回复成功后按概率排一个延迟跟进。 */
-  private scheduleEcho(sid: string, kind: string, target: number, s: Settings): void {
+  /**
+   * 回复成功后按概率排一个延迟跟进。
+   *
+   * awaiting 是这次回复有没有在问对方问题，由 reply() 算好传进来（同一个值
+   * 还要写进"已回复"日志的 echo_skip 字段），不在这里重复解析。
+   */
+  private scheduleEcho(
+    sid: string,
+    kind: string,
+    target: number,
+    s: Settings,
+    awaiting: boolean,
+    quoteText: string,
+  ): void {
     this.rollEchoDay();
+    // 已经在等对方回答，就别再补一句：球在对方手里，隔 40 秒又追问一遍，
+    // 在对方看来就是"同一个消息回了两遍"。线上 2026-10-29 的
+    // 「跑顺点了没」→「调过画质之后有没有好点呀」就是这么来的。
+    // 放在掷骰子之前，与 shouldEcho 注释里"概率最后掷"的约定一致，
+    // 也让日志能区分"被这条拦下"和"没中概率"。
+    if (awaiting) {
+      this.log.debug('跟进跳过：上一条在等回答', { session: sid });
+      return;
+    }
     // 排定时就判一次硬顶：省得白挂一个几分钟后才被丢掉的定时器。
     // 权威判断在执行时（见 runEcho）。
     if (this.echoTotal >= ECHO_DAILY_HARD_CAP) return;
@@ -926,7 +966,7 @@ export class Engine implements EnginePort {
     this.cancelEcho(sid);
     const delay = echoDelayMs(s.proactive);
     const timer = setTimeout(() => this.fireEcho(sid), delay);
-    this.pendingEcho.set(sid, { kind, target, timer });
+    this.pendingEcho.set(sid, { kind, target, timer, lastReply: quoteText, armedAt: Date.now() });
     this.log.debug('已排跟进', { session: sid, delay_ms: delay });
   }
 
@@ -983,8 +1023,10 @@ export class Engine implements EnginePort {
         nickname: '',
       };
       const system = buildSystem(expand(personaPrompt, vars), vars);
-      // 指令以 user 角色进请求但从不落库；真正发出的内容事后补记为 assistant
-      const msgs = this.ctx.build(sid, settings.context, system, ECHO_INSTRUCTION);
+      // 指令以 user 角色进请求但从不落库；真正发出的内容事后补记为 assistant。
+      // 把上一条原文一起交给它：跟进时上下文里没有新输入，不给它看自己刚说过什么，
+      // 它唯一能做的就是把那句换个说法再问一遍。
+      const msgs = this.ctx.build(sid, settings.context, system, echoInstruction(entry.lastReply));
       const cfg: LlmConfig = {
         baseURL: settings.llm.base_url,
         apiKey: settings.llm.api_key,
@@ -1002,6 +1044,22 @@ export class Engine implements EnginePort {
       // 空输出是模型行使"闭嘴权"，正常放弃而不是错误
       if (echoText === '') {
         this.log.debug('跟进没有想说的，放弃', { session: sid });
+        return;
+      }
+
+      // 字面复读也要拦：模型弱一点就会把上一句原样吐回来，发出去就是
+      // 同一句话说了两遍。（语义级的重复它拦不住，那道防线在指令与时机闸门上。）
+      if (repeatsLastReply(echoText, entry.lastReply)) {
+        this.log.info('跟进与上一条重复，丢弃', { session: sid });
+        return;
+      }
+
+      // 从排定到执行之间用户可能已经说话了：定时器到点时正好在排队，
+      // 或者跟进请求这几秒里对方发了新消息——判据是 lastActivity 晚于排定时刻。
+      // 这种跟进已经过期，发出去就是"对着上一句答了两遍"。cancelEcho 挡不住：
+      // 条目在 runEcho 开头就被删了，新消息进来时已经没东西可取消。
+      if ((this.lastActivity.get(sid) ?? 0) > entry.armedAt) {
+        this.log.debug('跟进已过期，放弃', { session: sid });
         return;
       }
 

@@ -747,8 +747,9 @@
           <label class="check">
             <input type="checkbox" id="f-echo" ${(p.echo_enabled ? 'checked' : '')}>
             <span>开启回声式跟进
-              <span class="note">回复完用户后，按概率延迟补一句相关的话或小问题。
-              对方有任何新消息都会立即取消未发出的跟进；连续不接话会自然停住。</span>
+              <span class="note">回复完用户后，按概率延迟补一句相关的话。
+              补的内容要么把刚才那件事说完，要么换一个新方向，不会把上一句重复一遍。
+              上一条已经在问对方问题时不会补（在等你回答）；对方有任何新消息都会立即取消未发出的跟进。</span>
             </span>
           </label>
           <div class="grid c2">

@@ -8,7 +8,15 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
-import { ECHO_INSTRUCTION, echoDelayMs, shouldEcho, Engine, type Sender } from '../src/bot';
+import {
+  echoDelayMs,
+  echoInstruction,
+  isAwaitingAnswer,
+  repeatsLastReply,
+  shouldEcho,
+  Engine,
+  type Sender,
+} from '../src/bot';
 import { Logger } from '../src/log/logger';
 import type { LlmClient } from '../src/llm/client';
 import type { Event } from '../src/onebot/types';
@@ -75,6 +83,74 @@ describe('跟进闸门', () => {
   });
 });
 
+describe('时机闸门：上一条是否在等回答', () => {
+  // 判据是"任意位置含问号"或"以语气词 / 了没 收尾"——
+  // 线上那句的问号藏在颜文字里（（・ω・？），按尾部判会漏。
+  const cases: [string, boolean][] = [
+    ['', false],
+    ['晚上好呀，游戏现在跑顺点了没（・ω・？', true], // 线上原文
+    ['画质调好了没', true],
+    ['还没', false],
+    ['真的？', true],
+    ['晚安。', false],
+    ['你就说嘛', true], // 语气词收尾，保守方向：宁可少补一句
+    ['要不要我帮你看看配置', false], // 已知缺口：V 不 V 问句不识别
+  ];
+  for (const [text, want] of cases) {
+    it(`${JSON.stringify(text)} → ${want}`, () => {
+      assert.equal(isAwaitingAnswer(text), want);
+    });
+  }
+});
+
+describe('跟进重复检测', () => {
+  const dup: [string, string][] = [
+    ['游戏你调过画质之后有没有好点呀？', '那游戏你调过画质之后有没有好点呀'],
+    ['要不要我帮你看看配置文件？', '要不要我帮你看看配置文件'],
+    ['画质调过之后画面顺了不少吧，现在应该不卡了', '画质调过之后画面顺了不少'],
+    ['嗯', '嗯'],
+    ['画质调了之后好点没', '你画质调了之后好点没'],
+  ];
+  for (const [echo, last] of dup) {
+    it(`判重：${echo}`, () => {
+      assert.equal(repeatsLastReply(echo, last), true);
+    });
+  }
+
+  const ok: [string, string][] = [
+    ['行', '嗯'],
+    ['好呀那我去睡了', '好呀'],
+    ['行吧', '行'],
+    ['我刚吃完', '你吃了吗'],
+    // 已知缺口，如实钉在这里：这两句在语义上是同一件事，但字面几乎不重叠
+    // （二元组交集只有「游戏」，Jaccard≈0.04），这个函数判不出来。
+    // 真正治它的是时机闸门 + 指令里带上一条原文，别指望调阈值。
+    ['那你还玩别的游戏吗', '那游戏你调过画质之后有没有好点呀'],
+  ];
+  for (const [echo, last] of ok) {
+    it(`不判重：${echo}`, () => {
+      assert.equal(repeatsLastReply(echo, last), false);
+    });
+  }
+});
+
+describe('跟进指令', () => {
+  it('带上一条原文，且不再要求"抛出小问题"', () => {
+    const t = echoInstruction('晚上好呀，游戏现在跑顺点了没');
+    assert.ok(t.includes('（内部指令'), '测试靠这四个字区分两跳，不能改');
+    assert.ok(t.includes('你上一句已经发出去的是「晚上好呀，游戏现在跑顺点了没」'));
+    assert.ok(!t.includes('抛出一个具体的小问题'), '这句是重复追问的直接诱因');
+    assert.ok(t.includes('空字符串'), '必须保留模型的闭嘴权');
+  });
+
+  it('没有上一条文字（纯发图）时也给一版自洽的措辞', () => {
+    const t = echoInstruction('  ');
+    assert.ok(t.includes('（内部指令'));
+    assert.ok(!t.includes('「」'), '不能出现空的引文');
+    assert.ok(t.includes('空字符串'));
+  });
+});
+
 // ---- 引擎级链路 ----
 
 interface SentMsg {
@@ -106,7 +182,10 @@ function ev(patch: Partial<Event> = {}): Event {
   };
 }
 
-function makeHarness(echoPatch: Record<string, unknown> = {}): Harness {
+function makeHarness(
+  echoPatch: Record<string, unknown> = {},
+  llmPatch: { reply?: string; echo?: string } = {},
+): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-echo-'));
   tmpDirs.push(dir);
   const store = new Store(join(dir, 'qqbot.db'));
@@ -140,13 +219,17 @@ function makeHarness(echoPatch: Record<string, unknown> = {}): Harness {
     groupInfo: async () => '测试群',
   };
 
-  // 假模型：最后一问是内部指令时输出跟进内容，否则输出普通回复
+  // 假模型：最后一次问是内部指令时输出跟进内容，否则输出普通回复。
+  // 两跳靠「内部指令」这个字面量区分（engine.test.ts 同约定），
+  // 所以 echoInstruction 里必须保留这四个字。
   const prompts: string[] = [];
   const llm = {
     chat: async (_cfg: unknown, msgs: { role: string; content: string }[]) => {
       prompts.push(msgs.map((m) => `${m.role}:${m.content}`).join('\n'));
       const last = msgs[msgs.length - 1]!.content;
-      const content = last.includes('内部指令') ? '对了，刚才那个事后来怎么样了？' : '你好呀';
+      const content = last.includes('内部指令')
+        ? (llmPatch.echo ?? '对了，刚才那个事后来怎么样了？')
+        : (llmPatch.reply ?? '你好呀');
       return {
         content,
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
@@ -203,7 +286,44 @@ describe('回声式跟进链路', () => {
       for (const m of history) {
         assert.ok(!m.content.includes('内部指令'), '内部指令不能进历史');
       }
-      assert.ok(h.prompts.some((p) => p.includes(ECHO_INSTRUCTION)), '请求里应带内部指令');
+      // 跟进请求里必须带着上一条原文：不告诉它自己刚才说了什么，
+      // 它就只能把那句换个说法再问一遍（线上就是这么连发了两条）。
+      assert.ok(
+        h.prompts.some(
+          (p) => p.includes('内部指令') && p.includes('你上一句已经发出去的是「你好呀」'),
+        ),
+        '请求里应带上一条原文',
+      );
+      assert.equal(h.engine.pendingEchoCount(), 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('回复已经在问对方问题时，不排跟进', async () => {
+    // 线上 2026-10-29：用户只说「晚上好」，回复是「…跑顺点了没（・ω・？」，
+    // 40 秒后又补了一句「…调过画质之后有没有好点呀」，看着像同一个消息回了两遍。
+    const h = makeHarness({}, { reply: '晚上好呀，游戏现在跑顺点了没（・ω・？' });
+    try {
+      h.engine.handleEvent(ev());
+      await waitFor(() => h.sent.length >= 1);
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(h.sent.length, 1, '已在等对方回答，不该再补一句');
+      assert.equal(h.engine.pendingEchoCount(), 0, '连定时器都不该挂');
+      assert.equal(h.prompts.length, 1, '不该有第二跳模型调用');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('跟进内容与上一条重复时丢弃，不发也不记', async () => {
+    const h = makeHarness({}, { reply: '晚安，早点睡', echo: '晚安，早点睡' });
+    try {
+      h.engine.handleEvent(ev());
+      await waitFor(() => h.sent.length >= 1);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(h.sent.length, 1, '复读的内容不该发出去');
+      assert.equal(h.store.sessions.recent('private:20000', 10).length, 2, '也不该落库');
       assert.equal(h.engine.pendingEchoCount(), 0);
     } finally {
       h.cleanup();

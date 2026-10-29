@@ -1,6 +1,13 @@
 // 消息处理引擎。
 export { Engine, type EngineOptions, type Sender } from './engine';
-export { ECHO_INSTRUCTION, echoDelayMs, shouldEcho, type EchoGateState } from './echo';
+export {
+  echoDelayMs,
+  echoInstruction,
+  isAwaitingAnswer,
+  repeatsLastReply,
+  shouldEcho,
+  type EchoGateState,
+} from './echo';
 export {
   MAX_LEAD_MS,
   MAX_SEG_TYPING_MS,
