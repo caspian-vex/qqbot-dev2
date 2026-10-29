@@ -1427,6 +1427,8 @@ describe('会话级设置（按对话对象覆盖）', () => {
         [{ context: { max_turns: 51 } }, '上下文轮数应在 0-50 之间'],
         [{ vision: { max_images: 9 } }, '单条消息识图上限应在 1-4 张之间'],
         [{ proactive: { echo_rate: 2 } }, '跟进概率应在 0-1 之间'],
+        [{ timing: { typing_cps: 0 } }, '打字速度应在 1-30 字/秒之间'],
+        [{ timing: { think_min_ms: 3000, think_max_ms: 1000 } }, '思考停顿应在 0-10000 毫秒之间，且上限不小于下限'],
         [{ search: { max_calls: 9 } }, '每条消息最多搜几次应在 1-3 之间'],
       ];
       for (const [overrides, msg] of cases) {
@@ -1452,6 +1454,7 @@ describe('会话级设置（按对话对象覆盖）', () => {
         'images',
         'proactive',
         'search',
+        'timing',
         'vision',
       ]);
       assert.equal(typeof empty.global.bot!.passive_rate, 'number');

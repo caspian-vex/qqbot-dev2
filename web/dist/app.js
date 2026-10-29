@@ -1205,10 +1205,11 @@
 
   // 与服务端 OVERRIDABLE_GROUPS 一一对应，顺序即卡片顺序。
   // 模型与面板凭据不在这里：它们是部署级的，按会话复制会变成 N 份密文。
-  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'computer', 'context'];
+  const OVR_GROUPS = ['bot', 'proactive', 'timing', 'images', 'vision', 'search', 'computer', 'context'];
   const OVR_META = {
     bot: { title: '触发规则', hint: '唤醒词、接话概率、冷却、分段' },
     proactive: { title: '主动发言', hint: '回复后隔一会儿补一句' },
+    timing: { title: '节奏', hint: '这个群该回得多快、多像人' },
     images: { title: '图池', hint: '要不要发图、发几张' },
     vision: { title: '图片识别', hint: '用户发的图要不要看' },
     search: { title: '联网搜索', hint: '拿不准时自己去查' },
@@ -1283,6 +1284,35 @@
         ${ovrNum('f-idle-limit', '本会话每日主动上限', v.proactive_daily_limit, 0, 20, '含到点提醒；0 表示完全不主动。')}
         ${ovrNum('f-quiet-s', '免打扰开始（小时）', v.quiet_start_hour, 0, 24, '两个数相同表示不启用；0 至 24 表示全天不主动。')}
         ${ovrNum('f-quiet-e', '免打扰结束（小时）', v.quiet_end_hour, 0, 24, '支持跨零点，例如 23 至 8。')}
+      </div>`;
+  }
+
+  /** 节奏：字段与「全局设置」里的那一张卡一一对应，改的是"怎么把字打出来"。 */
+  function ovrTimingBody(v) {
+    return `
+      ${ovrCheck('f-tm', '按真人节奏发送', v.enabled,
+        '先停顿、再按字数模拟打字，偶尔"人不在"晚点回。关掉就是模型一返回立刻发。')}
+      <div class="grid c2">
+        <div class="field">
+          <label>思考停顿（毫秒）</label>
+          <div class="row" style="gap:8px">
+            <input type="number" id="f-tm-think-min" min="0" max="10000" value="${v.think_min_ms}" aria-label="停顿下限">
+            <span>至</span>
+            <input type="number" id="f-tm-think-max" min="0" max="10000" value="${v.think_max_ms}" aria-label="停顿上限">
+          </div>
+          <div class="note">多数落在靠近下限的一侧，偶尔拖到上限。</div>
+        </div>
+        ${ovrNum('f-tm-cps', '打字速度（字/秒）', v.typing_cps, 1, 30, '20 字约 4 秒；调太快等于没开，太慢像卡住。', '0.5')}
+        ${ovrNum('f-tm-late', '晚点回的概率', v.late_rate, 0, 1, '模拟"人不在"；对方再发消息会立刻打断等待。', '0.05')}
+        <div class="field">
+          <label>晚回时长（秒）</label>
+          <div class="row" style="gap:8px">
+            <input type="number" id="f-tm-late-min" min="10" max="3600" value="${v.late_min_sec}" aria-label="迟到下限">
+            <span>至</span>
+            <input type="number" id="f-tm-late-max" min="10" max="3600" value="${v.late_max_sec}" aria-label="迟到上限">
+          </div>
+          <div class="note">不要调得很大：迟到的回复比不回复更糟。</div>
+        </div>
       </div>`;
   }
 
@@ -1361,6 +1391,17 @@
         max_calls: num('#f-search-calls'),
       };
     }
+    if (g === 'timing') {
+      return {
+        enabled: $('#f-tm').checked,
+        think_min_ms: num('#f-tm-think-min'),
+        think_max_ms: num('#f-tm-think-max'),
+        typing_cps: num('#f-tm-cps'),
+        late_rate: num('#f-tm-late'),
+        late_min_sec: num('#f-tm-late-min'),
+        late_max_sec: num('#f-tm-late-max'),
+      };
+    }
     return { max_turns: num('#f-turns'), token_budget: num('#f-budget') };
   }
 
@@ -1403,6 +1444,7 @@
 
       const botVal = st.bot.val;
       const proVal = st.proactive.val;
+      const tmVal = st.timing.val;
       const imgVal = st.images.val;
       const visVal = st.vision.val;
       const srVal = st.search.val;
@@ -1438,6 +1480,7 @@
         </div>` +
         ovrCard('bot', ovrBotBody(botVal, gl.bot || {}), st) +
         ovrCard('proactive', ovrProactiveBody(proVal), st) +
+        ovrCard('timing', ovrTimingBody(tmVal), st) +
         ovrCard('images', `
           ${ovrCheck('f-img', '允许机器人发图', imgVal.enabled)}
           <div class="grid c2">

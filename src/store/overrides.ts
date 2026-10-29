@@ -18,6 +18,7 @@ import {
   type ProactiveSettings,
   type SearchSettings,
   type Settings,
+  type TimingSettings,
   type VisionSettings,
 } from './types';
 
@@ -68,6 +69,13 @@ export type SessionComputerOverride = Pick<ComputerSettings, 'enabled' | 'max_ca
 export interface SessionOverrides {
   bot?: SessionBotOverride;
   proactive?: ProactiveSettings;
+  /**
+   * 拟人节奏整组可覆盖：它是"同样一句话怎么打出来"的时序，与这个会话
+   * 该多克制强相关——工作群要快、要少停顿，朋友群慢一点反而更像人。
+   * 它不涉及钱、不涉及权限，覆盖错了最多是"这个群回得有点拖"，
+   * 所以敢整组开放，不像电脑操作那样只挑三个字段。
+   */
+  timing?: TimingSettings;
   images?: ImageSettings;
   vision?: VisionSettings;
   search?: SearchSettings;
@@ -79,6 +87,7 @@ export interface SessionOverrides {
 export const OVERRIDABLE_GROUPS = [
   'bot',
   'proactive',
+  'timing',
   'images',
   'vision',
   'search',
@@ -92,6 +101,7 @@ export type OverridableGroup = (typeof OVERRIDABLE_GROUPS)[number];
 export const GROUP_LABELS: Record<OverridableGroup, string> = {
   bot: '触发规则',
   proactive: '主动发言',
+  timing: '节奏',
   images: '图池',
   vision: '图片识别',
   search: '联网搜索',
@@ -131,6 +141,15 @@ export const OVERRIDE_FIELDS: Record<OverridableGroup, Record<string, FieldKind>
     proactive_daily_limit: 'num',
     quiet_start_hour: 'num',
     quiet_end_hour: 'num',
+  },
+  timing: {
+    enabled: 'bool',
+    think_min_ms: 'num',
+    think_max_ms: 'num',
+    typing_cps: 'num',
+    late_rate: 'num',
+    late_min_sec: 'num',
+    late_max_sec: 'num',
   },
   images: { enabled: 'bool', max_per_reply: 'num' },
   vision: { enabled: 'bool', max_images: 'num' },
@@ -174,6 +193,8 @@ export function groupBase(g: OverridableGroup, global: Settings): Record<string,
       return { ...pickBot(global.bot) };
     case 'proactive':
       return { ...global.proactive };
+    case 'timing':
+      return { ...global.timing };
     case 'images':
       return { ...global.images };
     case 'vision':
@@ -272,6 +293,9 @@ export function normalizeOverrides(raw: unknown, global: Settings): SessionOverr
       case 'proactive':
         out.proactive = merged as unknown as ProactiveSettings;
         break;
+      case 'timing':
+        out.timing = merged as unknown as TimingSettings;
+        break;
       case 'images':
         out.images = merged as unknown as ImageSettings;
         break;
@@ -303,11 +327,12 @@ export function isEmptyOverrides(ov: SessionOverrides | null): boolean {
   return overriddenGroups(ov).length === 0;
 }
 
-/** 只取可覆盖的六个组，供面板回显"全局当前值"（不含 Key 与面板凭据）。 */
+/** 只取可覆盖的组，供面板回显"全局当前值"（不含 Key 与面板凭据）。 */
 export function pickGroups(global: Settings): Record<OverridableGroup, unknown> {
   return {
     bot: pickBot(global.bot),
     proactive: { ...global.proactive },
+    timing: { ...global.timing },
     images: { ...global.images },
     vision: { ...global.vision },
     search: { ...global.search },
@@ -364,6 +389,7 @@ export function resolveSettings(global: Settings, ov: SessionOverrides | null): 
     };
   }
   if (ov.proactive) out.proactive = { ...ov.proactive };
+  if (ov.timing) out.timing = { ...ov.timing };
   if (ov.images) out.images = { ...ov.images };
   if (ov.vision) out.vision = { ...ov.vision };
   if (ov.search) out.search = { ...ov.search };

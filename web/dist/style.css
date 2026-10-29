@@ -758,6 +758,13 @@ select { cursor: pointer; }
 .row > .grow { flex: 1 1 180px; }
 .row.end { justify-content: flex-end; }
 
+/* 「A 至 B」这类区间输入：两个数字框各占一半，中间的"至"竖直居中。
+   必须压 flex 基准 —— input 的 width:100% 会让它默认占满整行，
+   结果后一个框和"至"被挤到下一行，看着像两个字段。 */
+.field > .row { flex-wrap: nowrap; align-items: center; }
+.field > .row > input[type=number] { flex: 1 1 0; min-width: 0; }
+.field > .row > span { flex: none; font-size: 12px; color: var(--fg-dim); }
+
 /* ---------- 表格 ---------- */
 
 table {

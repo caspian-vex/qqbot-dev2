@@ -960,7 +960,7 @@ export class Api {
    * 会话级设置：这个会话自己那套覆盖 + 全局当前值。
    *
    * 全局值一并回传，是为了让面板在"跟随全局"状态下也能显示出生效的数字，
-   * 而不是给一排空白输入框让用户猜。只回可覆盖的六组，llm/panel 裁掉——
+   * 而不是给一排空白输入框让用户猜。只回可覆盖的那几组，llm/panel 裁掉——
    * 既省得前端误用，也天然避开 API Key 脱敏这件事。
    */
   sessionSettings(ctx: ReqCtx): void {
@@ -990,7 +990,7 @@ export class Api {
       const a = this.store.personas.active();
       fallback = { id: a.id, name: a.name };
     } catch (e) {
-      // 人格读不到不该让整页打不开：六组设置照样能看能改
+      // 人格读不到不该让整页打不开：各组设置照样能看能改
       this.d.log.warn('读取会话人格失败', { id, err: e });
     }
 
