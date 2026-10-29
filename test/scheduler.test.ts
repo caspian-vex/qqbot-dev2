@@ -167,7 +167,6 @@ function harness(patch: (p: ProactiveSettings) => void, reply = '你刚才说的
   tmpDirs.push(dir);
   const store = new Store(join(dir, 'qqbot.db'));
   store.settings.update((v) => {
-    v.timing.enabled = false;
     v.bot.seg_delay_min_ms = 0;
     v.bot.seg_delay_max_ms = 0;
     patch(v.proactive);

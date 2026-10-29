@@ -131,12 +131,11 @@ describe('合成生效设置', () => {
     assert.deepEqual(resolveSettings(g, null), g);
   });
 
-  it('八组都能被覆盖', () => {
+  it('七组都能被覆盖', () => {
     const g = defaultSettings();
     const r = resolveSettings(g, {
       bot: { ...pickBot(g.bot), group_cooldown_sec: 5 },
       proactive: { ...g.proactive, echo_enabled: true, echo_rate: 1, echo_daily_limit: 3 },
-      timing: { ...g.timing, typing_cps: 12, late_rate: 0 },
       images: { enabled: true, max_per_reply: 3 },
       vision: { enabled: false, max_images: 1 },
       search: { enabled: true, max_results: 3, timeout_sec: 5, max_calls: 1 },
@@ -144,47 +143,10 @@ describe('合成生效设置', () => {
     });
     assert.equal(r.bot.group_cooldown_sec, 5);
     assert.equal(r.proactive.echo_daily_limit, 3);
-    assert.equal(r.timing.typing_cps, 12);
-    assert.equal(r.timing.late_rate, 0);
     assert.equal(r.images.max_per_reply, 3);
     assert.equal(r.vision.max_images, 1);
     assert.equal(r.search.max_calls, 1);
     assert.equal(r.context.token_budget, 800);
-  });
-
-  it('节奏覆盖是整组冻结：补成全量，且之后改全局带不动它', () => {
-    const g = defaultSettings();
-    g.timing.typing_cps = 5;
-
-    // 只传一个字段：服务端必须用全局补成全量，否则引擎会读到 undefined
-    const ov = normalizeOverrides({ timing: { typing_cps: 15 } }, g);
-    assert.deepEqual(Object.keys(ov.timing!).sort(), [
-      'enabled',
-      'late_max_sec',
-      'late_min_sec',
-      'late_rate',
-      'think_max_ms',
-      'think_min_ms',
-      'typing_cps',
-    ]);
-    assert.equal(ov.timing!.typing_cps, 15);
-    assert.equal(ov.timing!.think_min_ms, 400, '没动过的字段按当时的全局值落进快照');
-
-    // 全局随后改这一组的别的字段：已覆盖的会话不跟（整组语义），未覆盖的一分不差跟着
-    const g2 = defaultSettings();
-    g2.timing.think_min_ms = 900;
-    g2.timing.typing_cps = 9;
-    assert.equal(resolveSettings(g2, ov).timing.think_min_ms, 400);
-    assert.equal(resolveSettings(g2, ov).timing.typing_cps, 15);
-    assert.equal(resolveSettings(g2, null).timing.think_min_ms, 900);
-
-    // 也不能反过来污染全局缓存
-    assert.equal(g.timing.think_min_ms, 400);
-  });
-
-  it('groupBase 与字段清单自洽，不会把全局整块 timing 漏进来', () => {
-    const g = defaultSettings();
-    assert.deepEqual(Object.keys(groupBase('timing', g)).sort(), Object.keys(OVERRIDE_FIELDS.timing).sort());
   });
 });
 
@@ -233,7 +195,6 @@ describe('规范化外来覆盖', () => {
     assert.deepEqual([...OVERRIDABLE_GROUPS], [
       'bot',
       'proactive',
-      'timing',
       'images',
       'vision',
       'search',
@@ -300,7 +261,7 @@ describe('规范化外来覆盖', () => {
     ]);
   });
 
-  it('pickGroups 只给八个可覆盖组（不含 Key 与面板凭据）', () => {
+  it('pickGroups 只给七个可覆盖组（不含 Key 与面板凭据）', () => {
     const g = defaultSettings();
     g.llm.api_key = 'sk-secret';
     const p = pickGroups(g);
@@ -311,7 +272,6 @@ describe('规范化外来覆盖', () => {
       'images',
       'proactive',
       'search',
-      'timing',
       'vision',
     ]);
     assert.ok(!JSON.stringify(p).includes('sk-secret'));

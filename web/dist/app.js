@@ -652,7 +652,7 @@
       if (!$('#set-body')) return; // 用户已经切走
       const imgDir = pool.dir || '';
       const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {},
-            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {}, tm = s.timing || {};
+            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <div class="card-head">
@@ -814,49 +814,6 @@
               </div>
               <div class="note">支持跨零点（23 至 8）；两个数相同表示不启用，0 至 24 表示全天不主动。
               它只拦"机器人自己想说话"，你让它到点提醒的事照发。</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h3>节奏 <span class="hint">同样回一句话，像不像人主要差在这里</span></h3>
-          </div>
-          <label class="check">
-            <input type="checkbox" id="f-tm" ${(tm.enabled ? 'checked' : '')}>
-            <span>按真人节奏发送
-              <span class="note">先停顿（看到 → 想一下），再按字数模拟打字时间，偶尔"人不在"晚点回。
-              关掉就是旧行为：模型一返回立刻发。它不会让机器人多说一个字，只改时序。</span>
-            </span>
-          </label>
-          <div class="grid c2">
-            <div class="field">
-              <label>思考停顿（毫秒）</label>
-              <div class="row" style="gap:8px">
-                <input type="number" id="f-tm-think-min" min="0" max="10000" value="${tm.think_min_ms ?? 400}" aria-label="停顿下限">
-                <span>至</span>
-                <input type="number" id="f-tm-think-max" min="0" max="10000" value="${tm.think_max_ms ?? 2400}" aria-label="停顿上限">
-              </div>
-              <div class="note">多数落在靠近下限的一侧，偶尔拖到上限——长尾分布，不是均匀随机。</div>
-            </div>
-            <div class="field">
-              <label>打字速度（字/秒）</label>
-              <input type="number" id="f-tm-cps" step="0.5" min="1" max="30" value="${tm.typing_cps ?? 5}">
-              <div class="note">20 字大约 4 秒。调太快等于没开，太慢会像卡住。</div>
-            </div>
-            <div class="field">
-              <label>晚点回的概率</label>
-              <input type="number" id="f-tm-late" step="0.05" min="0" max="1" value="${tm.late_rate ?? 0.1}">
-              <div class="note">模拟"人不在"。这期间对方再发消息，会立刻打断等待、马上发。</div>
-            </div>
-            <div class="field">
-              <label>晚回时长（秒）</label>
-              <div class="row" style="gap:8px">
-                <input type="number" id="f-tm-late-min" min="10" max="3600" value="${tm.late_min_sec ?? 60}" aria-label="迟到下限">
-                <span>至</span>
-                <input type="number" id="f-tm-late-max" min="10" max="3600" value="${tm.late_max_sec ?? 300}" aria-label="迟到上限">
-              </div>
-              <div class="note">不要调得很大：迟到的回复比不回复更糟。</div>
             </div>
           </div>
         </div>
@@ -1085,15 +1042,6 @@
                   quiet_start_hour: Number($('#f-quiet-s').value),
                   quiet_end_hour: Number($('#f-quiet-e').value),
                 },
-                timing: {
-                  enabled: $('#f-tm').checked,
-                  think_min_ms: Number($('#f-tm-think-min').value),
-                  think_max_ms: Number($('#f-tm-think-max').value),
-                  typing_cps: Number($('#f-tm-cps').value),
-                  late_rate: Number($('#f-tm-late').value),
-                  late_min_sec: Number($('#f-tm-late-min').value),
-                  late_max_sec: Number($('#f-tm-late-max').value),
-                },
                 images: {
                   enabled: $('#f-img').checked,
                   max_per_reply: Number($('#f-img-max').value),
@@ -1205,11 +1153,10 @@
 
   // 与服务端 OVERRIDABLE_GROUPS 一一对应，顺序即卡片顺序。
   // 模型与面板凭据不在这里：它们是部署级的，按会话复制会变成 N 份密文。
-  const OVR_GROUPS = ['bot', 'proactive', 'timing', 'images', 'vision', 'search', 'computer', 'context'];
+  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'computer', 'context'];
   const OVR_META = {
     bot: { title: '触发规则', hint: '唤醒词、接话概率、冷却、分段' },
     proactive: { title: '主动发言', hint: '回复后隔一会儿补一句' },
-    timing: { title: '节奏', hint: '这个群该回得多快、多像人' },
     images: { title: '图池', hint: '要不要发图、发几张' },
     vision: { title: '图片识别', hint: '用户发的图要不要看' },
     search: { title: '联网搜索', hint: '拿不准时自己去查' },
@@ -1284,35 +1231,6 @@
         ${ovrNum('f-idle-limit', '本会话每日主动上限', v.proactive_daily_limit, 0, 20, '含到点提醒；0 表示完全不主动。')}
         ${ovrNum('f-quiet-s', '免打扰开始（小时）', v.quiet_start_hour, 0, 24, '两个数相同表示不启用；0 至 24 表示全天不主动。')}
         ${ovrNum('f-quiet-e', '免打扰结束（小时）', v.quiet_end_hour, 0, 24, '支持跨零点，例如 23 至 8。')}
-      </div>`;
-  }
-
-  /** 节奏：字段与「全局设置」里的那一张卡一一对应，改的是"怎么把字打出来"。 */
-  function ovrTimingBody(v) {
-    return `
-      ${ovrCheck('f-tm', '按真人节奏发送', v.enabled,
-        '先停顿、再按字数模拟打字，偶尔"人不在"晚点回。关掉就是模型一返回立刻发。')}
-      <div class="grid c2">
-        <div class="field">
-          <label>思考停顿（毫秒）</label>
-          <div class="row" style="gap:8px">
-            <input type="number" id="f-tm-think-min" min="0" max="10000" value="${v.think_min_ms}" aria-label="停顿下限">
-            <span>至</span>
-            <input type="number" id="f-tm-think-max" min="0" max="10000" value="${v.think_max_ms}" aria-label="停顿上限">
-          </div>
-          <div class="note">多数落在靠近下限的一侧，偶尔拖到上限。</div>
-        </div>
-        ${ovrNum('f-tm-cps', '打字速度（字/秒）', v.typing_cps, 1, 30, '20 字约 4 秒；调太快等于没开，太慢像卡住。', '0.5')}
-        ${ovrNum('f-tm-late', '晚点回的概率', v.late_rate, 0, 1, '模拟"人不在"；对方再发消息会立刻打断等待。', '0.05')}
-        <div class="field">
-          <label>晚回时长（秒）</label>
-          <div class="row" style="gap:8px">
-            <input type="number" id="f-tm-late-min" min="10" max="3600" value="${v.late_min_sec}" aria-label="迟到下限">
-            <span>至</span>
-            <input type="number" id="f-tm-late-max" min="10" max="3600" value="${v.late_max_sec}" aria-label="迟到上限">
-          </div>
-          <div class="note">不要调得很大：迟到的回复比不回复更糟。</div>
-        </div>
       </div>`;
   }
 
@@ -1391,17 +1309,6 @@
         max_calls: num('#f-search-calls'),
       };
     }
-    if (g === 'timing') {
-      return {
-        enabled: $('#f-tm').checked,
-        think_min_ms: num('#f-tm-think-min'),
-        think_max_ms: num('#f-tm-think-max'),
-        typing_cps: num('#f-tm-cps'),
-        late_rate: num('#f-tm-late'),
-        late_min_sec: num('#f-tm-late-min'),
-        late_max_sec: num('#f-tm-late-max'),
-      };
-    }
     return { max_turns: num('#f-turns'), token_budget: num('#f-budget') };
   }
 
@@ -1424,7 +1331,7 @@
     Promise.all([
       api('/api/sessions/settings?id=' + encodeURIComponent(id)),
       // 人格清单：这个页面上也要能改人格，不能只回一个 id 没选项。
-      // 拉不到就退化成"只有跟随默认"——六组设置照样能改，不为此挡住整页。
+      // 拉不到就退化成"只有跟随默认"——七组设置照样能改，不为此挡住整页。
       api('/api/personas').catch(() => ({ items: [] })),
     ]).then(([d, dp]) => {
       if (!$('#ss-body')) return; // 用户已经切走
@@ -1444,7 +1351,6 @@
 
       const botVal = st.bot.val;
       const proVal = st.proactive.val;
-      const tmVal = st.timing.val;
       const imgVal = st.images.val;
       const visVal = st.vision.val;
       const srVal = st.search.val;
@@ -1480,7 +1386,6 @@
         </div>` +
         ovrCard('bot', ovrBotBody(botVal, gl.bot || {}), st) +
         ovrCard('proactive', ovrProactiveBody(proVal), st) +
-        ovrCard('timing', ovrTimingBody(tmVal), st) +
         ovrCard('images', `
           ${ovrCheck('f-img', '允许机器人发图', imgVal.enabled)}
           <div class="grid c2">
@@ -1553,7 +1458,7 @@
               method: 'PUT',
               body: { id, name: d.name || '', overrides: {} },
             });
-            // 人格一并解绑：按钮叫「恢复跟随全局」，只清六组却把人留在原地，
+            // 人格一并解绑：按钮叫「恢复跟随全局」，只清七组却把人留在原地，
             // 用户会以为没恢复干净，还得自己再去上面改一次下拉。
             if (Number(d.persona_id) > 0) {
               await api('/api/sessions/persona', {
@@ -1570,7 +1475,7 @@
         },
       });
 
-      // 人格走独立接口（不属于那六组覆盖），改完立即提交——与原来在会话列表
+      // 人格走独立接口（不属于那七组覆盖），改完立即提交——与原来在会话列表
       // 改下拉是同一个行为，用户不必再点一次「保存本会话设置」。
       const psel = $('#ss-persona');
       if (psel) {
@@ -1586,7 +1491,7 @@
             ok(pid === 0 ? '已改为跟随默认人格' : '已为该会话指定人格');
           } catch (e) {
             bad(e.message);
-            // 拨回真实状态：不回拉整页，省一次请求也不会丢用户勾好的六组开关
+            // 拨回真实状态：不回拉整页，省一次请求也不会丢用户勾好的七组开关
             psel.value = String(Number(d.persona_id) || 0);
           } finally {
             psel.disabled = false;

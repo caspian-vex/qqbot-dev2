@@ -264,26 +264,6 @@ function validateSettings(v: Settings): void {
   ) {
     throw new HttpError(400, '免打扰时段应在 0-24 点之间');
   }
-  if (
-    v.timing.think_min_ms < 0 ||
-    v.timing.think_max_ms > 10_000 ||
-    v.timing.think_max_ms < v.timing.think_min_ms
-  ) {
-    throw new HttpError(400, '思考停顿应在 0-10000 毫秒之间，且上限不小于下限');
-  }
-  if (v.timing.typing_cps < 1 || v.timing.typing_cps > 30) {
-    throw new HttpError(400, '打字速度应在 1-30 字/秒之间');
-  }
-  if (v.timing.late_rate < 0 || v.timing.late_rate > 1) {
-    throw new HttpError(400, '晚点回的概率应在 0-1 之间');
-  }
-  if (
-    v.timing.late_min_sec < 10 ||
-    v.timing.late_max_sec < v.timing.late_min_sec ||
-    v.timing.late_max_sec > 3600
-  ) {
-    throw new HttpError(400, '晚回时长应在 10-3600 秒之间，且上限不小于下限');
-  }
   if (v.images.max_per_reply < 1 || v.images.max_per_reply > 3) {
     throw new HttpError(400, '单条回复发图上限应在 1-3 张之间');
   }
@@ -735,7 +715,6 @@ export class Api {
         };
         v.context = { ...inp.context };
         v.proactive = { ...inp.proactive };
-        v.timing = { ...inp.timing };
         v.images = { ...inp.images };
         v.vision = { ...inp.vision };
         v.search = { ...inp.search };

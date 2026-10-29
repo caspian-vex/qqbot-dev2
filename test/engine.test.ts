@@ -71,9 +71,6 @@ function makeHarness(opts: {
     // 段间延迟归零：这里测的是"读没读设置"，不是真的等 300ms
     v.bot.seg_delay_min_ms = 0;
     v.bot.seg_delay_max_ms = 0;
-    // 拟人节奏同理归零：思考与打字耗时会让每条用例多等几秒，
-    // 而这一层的行为由 timing.test.ts 单独钉，不在这里重复验证。
-    v.timing.enabled = false;
     opts.patch?.(v);
   });
 
@@ -817,52 +814,6 @@ describe('按会话的设置覆盖', () => {
       h.engine.handleEvent(g(30002, '今天呢', 20000, 2));
       await waitFor(() => h.sent.length >= 2);
       assert.ok(seen[1]!.length >= 4, '没覆盖的群应带上历史');
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  it('节奏按会话：群 1 关掉后立刻发，群 2 仍按全局的停顿发', async () => {
-    // 全局把停顿钉成固定 800ms：没覆盖的群必须等满，覆盖成关的应当抢在前面。
-    // late_rate 归零是关键——默认 0.1 会让"晚点回"随机吃掉几十秒，用例直接抖。
-    const h = makeHarness({
-      patch: (v) => {
-        v.timing.enabled = true;
-        v.timing.think_min_ms = 800;
-        v.timing.think_max_ms = 800;
-        v.timing.late_rate = 0;
-      },
-    });
-    try {
-      setOv(h, 'group:30001', { timing: { enabled: false } });
-
-      const t0 = Date.now();
-      h.engine.handleEvent(g(30001, '你好'));
-      await waitFor(() => h.sent.length >= 1);
-      const fast = Date.now() - t0;
-      assert.ok(fast < 400, `覆盖成关之后应该立刻发，实际等了 ${fast}ms`);
-
-      const t1 = Date.now();
-      h.engine.handleEvent(g(30002, '你好', 20000, 2));
-      await waitFor(() => h.sent.length >= 2);
-      const slow = Date.now() - t1;
-      assert.ok(slow >= 700, `没覆盖的群仍应按全局等满停顿，实际 ${slow}ms`);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  it('节奏也能在会话里单独打开：全局关着，这个群照样按停顿发', async () => {
-    // makeHarness 默认 timing.enabled = false，这里要的就是这个全局值
-    const h = makeHarness({ patch: (v) => { v.timing.late_rate = 0; } });
-    try {
-      setOv(h, 'group:30001', { timing: { enabled: true, think_min_ms: 600, think_max_ms: 600 } });
-
-      const t0 = Date.now();
-      h.engine.handleEvent(g(30001, '你好'));
-      await waitFor(() => h.sent.length >= 1);
-      const waited = Date.now() - t0;
-      assert.ok(waited >= 500, `会话单独打开后应等满停顿，实际 ${waited}ms`);
     } finally {
       h.cleanup();
     }

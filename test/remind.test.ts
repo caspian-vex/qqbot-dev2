@@ -129,7 +129,6 @@ function harness(calls: { msgs: LlmMessage[]; tools?: ToolDef[] }[]): {
   tmpDirs.push(dir);
   const store = new Store(join(dir, 'qqbot.db'));
   store.settings.update((v) => {
-    v.timing.enabled = false;
     v.bot.seg_delay_min_ms = 0;
     v.bot.seg_delay_max_ms = 0;
     // 主人私聊：电脑操作与定时消息都靠这道门
@@ -229,7 +228,7 @@ describe('定时消息链路', () => {
     const store = new Store(join(dir, 'qqbot.db'));
     // 默认设置：computer.enabled = false，主人为空
     store.settings.update((v) => {
-      v.timing.enabled = false;
+      v.bot.seg_delay_min_ms = 0;
     });
     const llm = {
       chat: async (_c: unknown, msgs: LlmMessage[], _s?: unknown, tools?: ToolDef[]) => {

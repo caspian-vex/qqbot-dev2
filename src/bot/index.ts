@@ -9,16 +9,6 @@ export {
   type EchoGateState,
 } from './echo';
 export {
-  MAX_LEAD_MS,
-  MAX_SEG_TYPING_MS,
-  lateDelayMs,
-  planSpeech,
-  speakUnits,
-  typingMs,
-  weightedBetween,
-  type SpeechPlan,
-} from './timing';
-export {
   dedupeImages,
   dedupeKeepOrder,
   extractImageTags,

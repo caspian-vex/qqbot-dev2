@@ -33,7 +33,6 @@ import {
   type ComputerActor,
 } from './computer';
 import { echoDelayMs, echoInstruction, isAwaitingAnswer, repeatsLastReply, shouldEcho } from './echo';
-import { planSpeech, type SpeechPlan } from './timing';
 import {
   IDLE_MIN_GAP_MS,
   alarmInstruction,
@@ -212,13 +211,6 @@ export class Engine implements EnginePort {
   // ---- 回声式跟进的状态 ----
   /** 每个会话至多挂一个待执行的跟进。 */
   private readonly pendingEcho = new Map<string, PendingEcho>();
-  /**
-   * 正在"迟到等待"里的会话 → 提前放行的回调。
-   *
-   * 迟到的回复是刻意为之（模拟人不在），但对方追了一句就必须立刻发出去：
-   * 让他等满五分钟，比机械秒回更像故障。
-   */
-  private readonly lateWaiters = new Map<string, () => void>();
   /** 最近一次实际发出跟进的时间（毫秒），用于会话冷却。 */
   private readonly echoSentAt = new Map<string, number>();
   /**
@@ -345,8 +337,6 @@ export class Engine implements EnginePort {
     // 用户有新消息，之前排的跟进立刻作废——
     // 否则会出现"对方刚开口，机器人却先补上一句刚才的茬"的错位
     this.cancelEcho(sid);
-    // 同理：这条回复如果正在"故意迟到"，别再让他等，立刻发
-    this.flushLate(sid);
 
     let settings: Settings;
     try {
@@ -605,17 +595,8 @@ export class Engine implements EnginePort {
       maxRunes: 120,
     });
 
-    // 节奏在这里排定：多长、分几段、要不要迟到。晚到这一步才排，
-    // 是因为它依赖真实的分段结果——按"模型说了多少字"算打字时间，
-    // 不能按"模型原样输出了多少字"算，stripMarkdown 与分图标记都会变短。
-    const plan = this.pace(segs, settings);
-    if (plan && plan.lateMs > 0) {
-      this.log.debug('这条晚点回', { session: sid, late_ms: plan.lateMs });
-      await this.waitLate(sid, plan.lateMs);
-    }
-
     try {
-      if (segs.length > 0) await this.sendText(ev, segs, settings, plan);
+      if (segs.length > 0) await this.sendText(ev, segs, settings);
       // 图片跟在文字后面：先说话再甩图，符合真人"配图"的节奏
       if (picked.length > 0) await this.sendImages(ev, picked);
     } catch (e) {
@@ -1081,16 +1062,12 @@ export class Engine implements EnginePort {
 
   /**
    * 无事件发送：跟进与主动开口都没有原始消息可引用，也不 @，直接说话。
-   *
-   * 节奏与回复链路共用同一套 plan：主动说一句和回一句，在对方看来
-   * 应该是一样的打字速度，否则"这个号在某些时候打字特别快"本身就是破绽。
    */
   private async sendTo(
     kind: string,
     target: number,
     segs: string[],
     s: Settings,
-    plan?: SpeechPlan,
   ): Promise<void> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
@@ -1099,14 +1076,9 @@ export class Engine implements EnginePort {
     const max = Math.max(min, s.bot.seg_delay_max_ms);
 
     for (let i = 0; i < segs.length; i++) {
-      if (i === 0) {
-        if (plan) await sleep(plan.leadMs, this.opt.signal);
-      } else {
-        const wait = plan
-          ? (plan.gapsMs[i] ?? 0)
-          : min + Math.floor(Math.random() * (max - min));
-        await sleep(wait, this.opt.signal);
-      }
+      // 第一段立刻发，之后每段之间抖一下：分段是为了让长回复读起来
+      // 不像一整块，不是为了让人等。
+      if (i > 0) await sleep(min + Math.floor(Math.random() * (max - min)), this.opt.signal);
 
       const parts: Segment[] = [text(segs[i]!)];
       if (kind === 'group') await sender.sendGroup(target, parts, this.opt.signal);
@@ -1247,8 +1219,7 @@ export class Engine implements EnginePort {
       if (segs.length === 0) return;
 
       // 节奏照旧，但不含"迟到"——它本身已经到点了
-      const plan = this.pace(segs, settings);
-      await this.sendTo(row.kind, row.target_id, segs, settings, plan);
+      await this.sendTo(row.kind, row.target_id, segs, settings);
 
       this.ctx.record(sid, 'assistant', talk, estimateTokens(talk));
       this.bumpProactive(sid);
@@ -1385,8 +1356,7 @@ export class Engine implements EnginePort {
       const segs = split(talk, { maxSegments: 2, maxRunes: 80 });
       if (segs.length === 0) return;
 
-      const plan = this.pace(segs, settings);
-      await this.sendTo(st.kind, st.target, segs, settings, plan);
+      await this.sendTo(st.kind, st.target, segs, settings);
 
       this.ctx.record(st.sid, 'assistant', talk, estimateTokens(talk));
       this.bumpProactive(st.sid);
@@ -1467,22 +1437,9 @@ export class Engine implements EnginePort {
   }
 
   /**
-   * 排一次发言的节奏；节奏开关关着时返回 undefined。
-   *
-   * 必须显式判断开关，而不是靠"plan 全是 0"：plan 为 undefined 时
-   * sendText 会退回旧的段间固定抖动，而一个全 0 的 plan 会把它彻底关掉。
-   * 后者意味着"关掉拟人节奏"反而让消息发得更快、更机械，与承诺相反。
-   */
-  private pace(segs: string[], s: Settings): SpeechPlan | undefined {
-    return s.timing.enabled ? planSpeech(segs, s.timing) : undefined;
-  }
-
-  /**
    * 按段发送文本，第一段附带引用或 @。
    *
-   * 节奏来自 plan（拟人节奏）：第一段之前是"看到→想→打出来"的停顿，
-   * 段与段之间是"回车、接着打"的耗时。plan 缺席时退回旧的固定抖动
-   * （seg_delay_*）——关掉 timing 的用户行为与升级前逐字一致。
+   * 段与段之间按 seg_delay_* 抖一下，第一段立刻发。
    *
    * 引用还是 @ 由 bot.quote_reply 决定：关掉引用的用户往往嫌引用框占地方，
    * 这时退化成 @，否则群里一句话飘出来没人知道在回谁。
@@ -1491,7 +1448,6 @@ export class Engine implements EnginePort {
     ev: Event,
     segs: string[],
     s: Settings,
-    plan?: SpeechPlan,
   ): Promise<number> {
     const sender = this.sender;
     if (!sender) throw new Error('协议端未连接');
@@ -1502,16 +1458,7 @@ export class Engine implements EnginePort {
 
     let lastId = 0;
     for (let i = 0; i < segs.length; i++) {
-      // 注意顺序：先等再说。旧实现是"说完等、等完说下一句"，
-      // 两者总时长一样，但先等才能表达"第一段之前也要停一下"。
-      if (i === 0) {
-        if (plan) await sleep(plan.leadMs, this.opt.signal);
-      } else {
-        const wait = plan
-          ? (plan.gapsMs[i] ?? 0)
-          : min + Math.floor(Math.random() * (max - min));
-        await sleep(wait, this.opt.signal);
-      }
+      if (i > 0) await sleep(min + Math.floor(Math.random() * (max - min)), this.opt.signal);
 
       const parts: Segment[] = [];
 
@@ -1529,37 +1476,6 @@ export class Engine implements EnginePort {
       lastId = id;
     }
     return lastId;
-  }
-
-  /**
-   * 故意晚点回：等到 ms 毫秒，或等到有新消息为止。
-   *
-   * 放在会话队列里是刻意的——同一会话本来串行，这条没发出去就不该
-   * 开始处理下一条，否则会出现"先答后问"。而 flushLate 由 handleMessage
-   * 直接调用（在队列之外），所以对方一追话就能立刻脱身。
-   */
-  private waitLate(sid: string, ms: number): Promise<void> {
-    if (ms <= 0) return Promise.resolve();
-    const signal = this.opt.signal;
-    if (signal?.aborted) return Promise.resolve();
-
-    return new Promise<void>((resolve) => {
-      const done = (): void => {
-        clearTimeout(timer);
-        this.lateWaiters.delete(sid);
-        // 正常走完必须摘掉监听：一个长跑进程里积几百个 abort 监听会被 Node 警告
-        signal?.removeEventListener('abort', done);
-        resolve();
-      };
-      const timer = setTimeout(done, ms);
-      this.lateWaiters.set(sid, done);
-      signal?.addEventListener('abort', done, { once: true });
-    });
-  }
-
-  /** 对方又开口了：别再让他等，立刻把手上这条发出去。 */
-  private flushLate(sid: string): void {
-    this.lateWaiters.get(sid)?.();
   }
 
   /**
