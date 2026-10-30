@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/caspian-vex/qqbot-dev2/main/install
 
 **聊天**
 
-- **扫码即登录**：面板「登录」页封装了 NapCat 的扫码/快捷登录流程，请求都由服务端代理，WebUI token 不下发浏览器；登录成功后自动补一条 3001 反向 WS。
+- **扫码即登录**：面板「登录」页封装了 NapCat 的扫码/快捷登录流程，请求都由服务端代理，WebUI token 不下发浏览器；登录成功后自动补一条 3001 反向 WS，并写入服务端自动生成的 access token。
 - **随时闭嘴不用退出登录**：「登录」页一个按钮就能暂停——QQ 仍在线，只是不回复、不主动开口，暂停期间的消息也不进上下文；恢复即时，不用重新扫码。见[暂停与恢复](#暂停与恢复)。
 - **按会话分人格**：私聊 1 是女儿型、私聊 2 是傲娇、群 1 像群友……「会话」页每一行的「设置」里选；没选过的跟随全局默认，还没说过话的群/好友也能先配。见[会话定制](#会话定制)。
 - **按会话单独设置**：触发规则、主动发言、图池、图片识别、联网搜索、电脑操作、上下文、长期记忆，八组都可对单个群/私聊覆盖。
@@ -547,6 +547,8 @@ format = "text"
 
 [onebot]
 url = "ws://napcat:3001"
+# 留空 = 由 qqbot 启动时自动生成一份并加密保存，登录后同步到协议端（推荐）。
+# 要指定固定令牌，填在这里或设 etc/env 的 QQBOT_ONEBOT_TOKEN（后者优先）。
 access_token = ""
 
 [panel]
@@ -635,7 +637,9 @@ docker exec qqbot-napcat sh -c 'ls /app/.config/QQ'   # 登录态是否落盘
 | 机器人报的时间不对（差 8 小时或半天） | 容器时区不是东八区（境外服务器默认 UTC） | 在 `etc/env` 设 `TZ=Asia/Shanghai` 后 `qqbot up`；镜像已内置 tzdata，老镜像先升级 |
 | `qqbot-core` 反复重启，日志 `unable to open database file` | `data/` 属主不是 1000 | `chown -R 1000:1000 /opt/qqbot/data` |
 | 面板「登录」「网络」显示未配置 | `etc/env` 里 `WEBUI_TOKEN` 没被读到 | 代码会把短名归一成 `QQBOT_` 前缀；确认 `etc/env` 有 `WEBUI_TOKEN=` 且容器已重建（`qqbot up`） |
-| 扫码成功但机器人显示未连接 | 3001 反向 WS 没启用 | 服务端每 20 秒会自动补一次；等半分钟仍不行，去「网络」页点「修正反向 WS（:3001）」 |
+| 扫码成功但机器人显示未连接 | 3001 反向 WS 没启用 | 服务端每 20 秒会自动补一次（并把服务端令牌同步进去）；等半分钟仍不行，去「网络」页点「修正反向 WS（:3001）」 |
+| 日志出现「协议端 3001 监听的 token 与服务端不一致」 | 协议端里手填过别的令牌 | 服务端已自动改回并重连；要固定自己的令牌就写 `etc/env` 的 `QQBOT_ONEBOT_TOKEN` 后 `qqbot up`（env 优先级最高，且不会被改写） |
+| 降级回 0.10 之前后机器人一直连不上，日志 `401` | 协议端里留着新版写进去的令牌，旧版按空令牌拨号 | 把令牌写进 `etc/env` 的 `QQBOT_ONEBOT_TOKEN` 后 `qqbot up`（新旧版本都读它），或在「网络」页把 3001 那条的 token 清空 |
 | 拉镜像 `denied` | 镜像名写错，或包是私有的 | 核对 `ghcr.io/<owner>/qqbot-dev2`；私有包带 `GHCR_TOKEN` |
 | 容器重启后浏览器要重新登录 | 面板会话存在内存里，不在磁盘 | 预期行为，不是 cookie 问题 |
 | 改「网络」页保存后短暂断连 | 协议端重载 OneBot 服务 | 预期，几秒后自愈 |
@@ -654,6 +658,7 @@ docker exec qqbot-napcat sh -c 'ls /app/.config/QQ'   # 登录态是否落盘
 
 - 只对外开 `5666`，且必须经过面板登录；NapCat WebUI 与 OneBot WS 不出容器网络。
 - WebUI token 只由服务端读取并用于调用 NapCat API，浏览器完全拿不到。
+- OneBot 反向 WS 的 access token 由服务端自动生成（也可由 `etc/env` 的 `QQBOT_ONEBOT_TOKEN` 或 toml 指定），用 `QQBOT_SECRET_KEY` 加密后存在 SQLite，登录后自动同步进协议端；面板设置接口不回传它。「网络」页展示的是协议端原始配置，管理员在那里可以看到协议端当前的值。
 - 面板密码用 argon2id 哈希（放 worker 里算，1 核机器不阻塞主线程），登录失败按 IP 退避并写审计；支持 TOTP。
 - `etc/env` 权限 `0600`，只随 `qqbot backup` 备份；`etc/qqbot.toml` 不含任何密钥。
 - NapCat 原生 WebUI 不经面板暴露（6099 只在 compose 内网），因此 CSP 无需为它放宽；面板 `script-src` 只允许 `'self'`，无内联脚本、无内联事件（样式因动态 style 放宽为 `'unsafe-inline'`）。

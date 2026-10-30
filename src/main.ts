@@ -15,7 +15,14 @@ import { parseFlags, flagName } from './cli/flags';
 import { LogHub } from './log/hub';
 import { Logger, type LogLevel } from './log/logger';
 import { NapCatWebUI } from './napcat/webui';
-import { Client, getLoginInfo, portOf, sendGroupMsg, sendPrivateMsg } from './onebot';
+import {
+  Client,
+  getLoginInfo,
+  portOf,
+  resolveOnebotToken,
+  sendGroupMsg,
+  sendPrivateMsg,
+} from './onebot';
 import { hashPassword } from './panel/auth';
 import { PanelServer } from './panel/server';
 import { Box, generateToken } from './secret/box';
@@ -134,10 +141,21 @@ async function cmdRun(argv: string[]): Promise<void> {
   try {
     await ensureAdminPassword(store, log);
 
-    // 空串不能当"配了 token"：etc/env 里写了 QQBOT_ONEBOT_TOKEN= 但没填值时，
-    // ?? 不会回退到 toml 的 access_token，协议端就会因为 token 不匹配拒绝连接。
-    const secretToken = secrets['QQBOT_ONEBOT_TOKEN'] ?? '';
-    const token = secretToken !== '' ? secretToken : config.onebot.accessToken;
+    // 访问令牌的顺序：etc/env > toml > 数据库里已保存的 > 现场生成。
+    // 前两个是用户的显式配置，压过自动生成的值且不写库——否则每次启动都会拿
+    // 库里的旧值反过来盖掉用户的选择。空串不能当"配了 token"（env 里写了
+    // QQBOT_ONEBOT_TOKEN= 却没填值时就是这样），所以每个来源都 trim 后再判空。
+    const { token, source: tokenSource } = resolveOnebotToken({
+      env: secrets['QQBOT_ONEBOT_TOKEN'] ?? '',
+      toml: config.onebot.accessToken,
+      read: () => store.settings.get().onebot.access_token,
+      write: (t) => {
+        store.settings.update((v) => {
+          v.onebot.access_token = t;
+        });
+      },
+      log,
+    });
     // 待批准队列：引擎挂起申请、面板读取并点批准，必须是同一个实例。
     // 放在这里建，两边的生命周期就都由 ac.signal 统一收口。
     const approvals = new ApprovalQueue(log.with({ component: 'computer' }));
@@ -174,6 +192,9 @@ async function cmdRun(argv: string[]): Promise<void> {
       onebotPort: onebotPortOf(config.onebot.url),
       // 补出来的监听要带同一个 token，否则等于开了个无凭据的 OneBot 控制面
       onebotAccessToken: token,
+      // 令牌写进协议端之后，连接也要换成同一个值。不接的话就是"协议端认新值、
+      // 我们带旧值"，401 之后无限退避——比没配令牌更难排查。
+      applyOnebotToken: (t: string) => client.setToken(t),
       imagesDir,
       approvals,
     });
@@ -183,6 +204,8 @@ async function cmdRun(argv: string[]): Promise<void> {
       onebot: config.onebot.url,
       panel: config.panel.listen,
       data: config.dataDir,
+      // 只报来源，不报值：令牌等同 OneBot 控制面的凭据
+      onebot_token: tokenSource,
     });
 
     await panel.listen(config.panel.listen);
@@ -375,7 +398,8 @@ function cmdStatus(argv: string[]): void {
     out('  ⚠ 缺少 QQBOT_SECRET_KEY，服务将无法启动');
   }
   if ((secrets['QQBOT_ONEBOT_TOKEN'] ?? '') === '') {
-    out('  ⚠ 缺少 QQBOT_ONEBOT_TOKEN，协议端连接可能被拒绝');
+    // 不再是"问题"：服务端会自己生成一个并加密存进数据库，登录后同步给协议端。
+    out('  OneBot 令牌: 未在 etc/env 指定，使用服务端自动生成的（存在数据库里）');
   }
 
   const dbPath = join(cfg.dataDir, 'qqbot.db');
@@ -429,8 +453,12 @@ function cmdDoctor(argv: string[]): void {
   else if (key.length !== 64) fail(`QQBOT_SECRET_KEY 长度应为 64 位十六进制，当前 ${key.length} 位`);
   else ok('QQBOT_SECRET_KEY 格式正确');
 
-  if ((secrets['QQBOT_ONEBOT_TOKEN'] ?? '') === '') warn('缺少 QQBOT_ONEBOT_TOKEN');
-  else ok('QQBOT_ONEBOT_TOKEN 已配置');
+  // 令牌由服务端托管，不设它是正常状态，不该报成待修问题
+  if ((secrets['QQBOT_ONEBOT_TOKEN'] ?? '') === '') {
+    ok('QQBOT_ONEBOT_TOKEN 未设置，使用服务端自动生成的令牌');
+  } else {
+    ok('QQBOT_ONEBOT_TOKEN 已配置');
+  }
 
   out('目录');
   if (cfg) {

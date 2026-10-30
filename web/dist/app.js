@@ -3607,6 +3607,13 @@
         <div id="nw-hint" style="margin-top:12px;font-size:11.5px;color:var(--fg-mute);line-height:1.8">
           正在查询…
         </div>
+        <div style="margin-top:10px;font-size:11.5px;color:var(--fg-mute);line-height:1.9">
+          3001 监听的 access token 由服务端自动生成，登录后会同步写进协议端，不需要手工填；
+          <code>etc/qqbot.toml</code> 里那一行留空就是这个意思。想自己指定令牌，在
+          <code>etc/env</code> 写 <code>QQBOT_ONEBOT_TOKEN=</code> 再执行
+          <code>docker compose up -d</code>（<code>restart</code> 不会重读 env_file）。
+          在协议端里手填过的令牌会和它冲突，登录后会被改写成服务端的值——其它连到这个端口的客户端要换成同一个令牌。
+        </div>
       </div>
 
       <div class="card" id="nw-edit" style="display:none">
@@ -3774,12 +3781,17 @@
         if (!v) return;
         btn.disabled = true;
         try {
-          await api('/api/qq/network', {
+          const d = await api('/api/qq/network', {
             method: 'PUT',
             body: { config: v, as_string: asString },
           });
+          // 服务端会把 3001 条目里空着的 token 补成它自己那份（浏览器拿不到真实令牌，
+          // 也不该拼），所以回包里是补完之后的配置。不写回编辑框的话，页面会一直显示
+          // token: ""，而协议端里其实已经有值——下一次保存又把它抹回空。
+          const shown = d && d.config ? d.config : v;
+          writeEditor(shown);
+          renderSummary(shown);
           ok('已保存，协议端正在重启 OneBot 服务');
-          renderSummary(v);
         } catch (e) {
           bad(e.message);
         } finally {

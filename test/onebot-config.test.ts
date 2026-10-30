@@ -3,7 +3,7 @@
 // 让协议端重启一次 OneBot 服务，机器人白掉一次线。
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { ensureWsServer } from '../src/panel/api';
+import { ensureWsServer, wsTokenState } from '../src/panel/api';
 
 describe('ensureWsServer', () => {
   it('空配置里补一条启用的 3001', () => {
@@ -86,5 +86,82 @@ describe('ensureWsServer', () => {
 
     // 补过之后就是幂等的，不再回写配置（回写会让协议端重启一次）
     assert.equal(ensureWsServer(cfg, 3001, 'our-token'), false);
+  });
+});
+
+// 服务端托管令牌之后，协议端里那份必须收敛到我们的值——两边不一致的症状不是
+// "少一层保护"，而是握手 401 后无限退避重连，而面板上没有别的地方能对齐它们。
+describe('ensureWsServer 托管令牌', () => {
+  it('overwriteToken：不一致就改成服务端的值', () => {
+    const cfg = {
+      websocketServers: [{ port: 3001, enable: true, enabled: true, token: 'old' }],
+    };
+    assert.equal(ensureWsServer(cfg, 3001, 'ours', { overwriteToken: true }), true);
+    assert.equal(cfg.websocketServers[0]!.token, 'ours');
+  });
+
+  it('overwriteToken：已经一致就一个字节都不改', () => {
+    const cfg = {
+      websocketServers: [{ port: 3001, enable: true, enabled: true, token: 'ours' }],
+    };
+    // 返回 true 就会回写配置 → 协议端重启一次 OneBot → 白掉一次线
+    assert.equal(ensureWsServer(cfg, 3001, 'ours', { overwriteToken: true }), false);
+  });
+
+  it('overwriteToken：token 字段缺失（老配置）也算不一致，补上而不是当成相等', () => {
+    const cfg: { websocketServers: Array<Record<string, unknown>> } = {
+      websocketServers: [{ port: 3001, enable: true, enabled: true }],
+    };
+    assert.equal(ensureWsServer(cfg, 3001, 'ours', { overwriteToken: true }), true);
+    assert.equal(cfg.websocketServers[0]!.token, 'ours');
+  });
+
+  it('overwriteToken：服务端没有令牌时不去清空协议端的值', () => {
+    const cfg = {
+      websocketServers: [{ port: 3001, enable: true, enabled: true, token: 'keep-me' }],
+    };
+    assert.equal(ensureWsServer(cfg, 3001, '', { overwriteToken: true }), false);
+    assert.equal(cfg.websocketServers[0]!.token, 'keep-me');
+  });
+
+  it('createIfMissing:false 时条目不存在也不新建', () => {
+    const cfg: Record<string, unknown> = { websocketServers: [] };
+    assert.equal(ensureWsServer(cfg, 3001, 'ours', { createIfMissing: false }), false);
+    assert.equal((cfg.websocketServers as unknown[]).length, 0);
+  });
+});
+
+describe('wsTokenState', () => {
+  it('条目不存在', () => {
+    assert.equal(wsTokenState({}, 3001, 'ours'), 'absent');
+    assert.equal(wsTokenState({ websocketServers: [] }, 3001, 'ours'), 'absent');
+    // 只有别的端口，不算 3001 存在
+    assert.equal(wsTokenState({ websocketServers: [{ port: 3000 }] }, 3001, 'ours'), 'absent');
+  });
+
+  it('条目存在但 token 为空或字段缺失', () => {
+    assert.equal(wsTokenState({ websocketServers: [{ port: 3001, token: '' }] }, 3001, 'ours'), 'no-token');
+    assert.equal(wsTokenState({ websocketServers: [{ port: 3001 }] }, 3001, 'ours'), 'no-token');
+    // 空白串在线协议上等于没有，别当成"配了别的值"
+    assert.equal(wsTokenState({ websocketServers: [{ port: 3001, token: '   ' }] }, 3001, 'ours'), 'no-token');
+  });
+
+  it('与服务端相同', () => {
+    assert.equal(wsTokenState({ websocketServers: [{ port: 3001, token: 'ours' }] }, 3001, 'ours'), 'match');
+  });
+
+  it('不同（这就是要打告警的那种）', () => {
+    assert.equal(
+      wsTokenState({ websocketServers: [{ port: 3001, token: 'theirs' }] }, 3001, 'ours'),
+      'conflict',
+    );
+  });
+
+  it('配置被 network 包一层、以及老的单对象格式也能认', () => {
+    assert.equal(
+      wsTokenState({ network: { websocketServers: [{ port: 3001, token: 'theirs' }] } }, 3001, 'ours'),
+      'conflict',
+    );
+    assert.equal(wsTokenState({ websocketServer: { port: 3001, token: 'ours' } }, 3001, 'ours'), 'match');
   });
 });

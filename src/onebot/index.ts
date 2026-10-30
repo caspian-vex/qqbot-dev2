@@ -1,6 +1,14 @@
 // OneBot v11 协议层。
 export { Client, type EventHandler, type Response } from './client';
 export {
+  resolveOnebotToken,
+  TOKEN_BYTES,
+  type ResolveTokenOptions,
+  type ResolvedToken,
+  type TokenLogger,
+  type TokenSource,
+} from './token';
+export {
   getLoginInfo,
   getGroupList,
   getFriendList,

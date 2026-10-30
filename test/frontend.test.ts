@@ -187,3 +187,22 @@ test('记忆页横幅有三支：全局开、部分会话开、全关', () => {
   // 旧后端/旧缓存没有这个字段时不能崩，要回落到"全关"那一支
   assert.match(js, /Number\(st\.enabled_sessions\) \|\| 0/);
 });
+
+test('网络页说明：令牌由服务端生成，自定义才需要改 env 重建容器', () => {
+  // 回归点：以前「网络」页只让用户看一段裸 JSON 和一个「修正反向 WS」按钮，
+  // 而日志里那条「未设置 access token」没有出路——页面既没输入框，
+  // 也没说清 token 该去哪儿配。这段说明就是那条出路。
+  assert.match(js, /由服务端自动生成/);
+  assert.match(js, /QQBOT_ONEBOT_TOKEN/);
+  assert.match(js, /docker compose up -d/);
+  // restart 不重读 env_file 是最容易踩的一脚：改了 env 却用 restart，
+  // 表现成"改了没生效"，然后开始怀疑代码。
+  assert.match(js, /restart<\/code> 不会重读 env_file/);
+});
+
+test('保存网络配置后回写服务端补完的配置', () => {
+  // 服务端会把空 token 补成它自己那份。前端不回写编辑框的话，
+  // 页面会一直显示 token: ""，下一次保存又把协议端写回空。
+  assert.match(js, /d\.config \? d\.config : v/);
+  assert.match(js, /writeEditor\(shown\)/);
+});

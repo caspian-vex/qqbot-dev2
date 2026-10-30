@@ -121,8 +121,15 @@ export interface ApiDeps {
   qq: QQLoginPort;
   /** 机器人要连的反向 WS 端口（默认 3001），登录后自动补齐用 */
   onebotPort?: number;
-  /** 自动补齐反向 WS 时写进监听条目的 token；空串表示"没配 token"。 */
+  /** 自动补齐反向 WS 时写进监听条目的 token；空串表示"服务端没给出令牌"。 */
   onebotAccessToken?: string;
+  /**
+   * 令牌同步进协议端之后，让运行时连接也用它（Client.setToken）。
+   *
+   * 不传就只改协议端配置——那会造成"协议端认新值、我们还用旧值"的 401 循环，
+   * 所以 main.ts 里必须接上；只有测试与嵌入方才允许不传。
+   */
+  applyOnebotToken?: (token: string) => void;
   /** 图池目录；未配置时图池接口返回空列表。 */
   imagesDir?: string;
   /**
@@ -143,14 +150,30 @@ export interface ApiDeps {
  * 接口）无凭据地暴露出去。host 保持 0.0.0.0 是必要的——协议端在另一个容器里，
  * 绑回环就再也连不上了，隔离交给 compose 的 expose/ports 控制。
  */
+/** 判断是不是普通对象（数组不算）。协议端配置的每一层都可能缺席，到处要用。 */
+function isObj(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+export interface EnsureWsOptions {
+  /**
+   * 已有条目的 token 与服务端不一致时，改成服务端的值。
+   *
+   * 只有"服务端托管令牌"那条自动路径该传 true。默认 false 是为了保住老语义：
+   * 用户在协议端手写过的 token 不该被一次自动补齐悄悄覆盖——那会把已经连上的
+   * 客户端踢下线，而且改了什么面板上看不出来。
+   */
+  overwriteToken?: boolean;
+  /** 条目不存在时是否新建。默认 true；面板手工保存时传 false（用户删掉的别偷偷加回来）。 */
+  createIfMissing?: boolean;
+}
+
 export function ensureWsServer(
   cfg: Record<string, unknown>,
   port: number,
   token = '',
+  opts: EnsureWsOptions = {},
 ): boolean {
-  const isObj = (v: unknown): v is Record<string, unknown> =>
-    v !== null && typeof v === 'object' && !Array.isArray(v);
-
   // 真机配置是 { network: {...}, musicSignUrl } ；裁剪过的版本把这几项平铺在顶层
   const net = isObj(cfg.network) ? cfg.network : cfg;
 
@@ -159,6 +182,10 @@ export function ensureWsServer(
     if (legacy.enable !== true || legacy.enabled !== true) {
       legacy.enable = true;
       legacy.enabled = true;
+      return true;
+    }
+    if (opts.overwriteToken === true && token !== '' && legacy.token !== token) {
+      legacy.token = token;
       return true;
     }
     return false;
@@ -171,6 +198,7 @@ export function ensureWsServer(
 
   const hit = arr.find((s) => Number(s.port) === port);
   if (!hit) {
+    if (opts.createIfMissing === false) return false;
     arr.push({
       name: 'ws',
       enable: true,
@@ -191,13 +219,50 @@ export function ensureWsServer(
     hit.enabled = true;
     return true;
   }
-  // 已有条目一律不动 token：用户可能手写了别的值，改它等于把已经连上的
-  // 协议端踢下线；而 token 为空的话，补一次就是我们能做的全部。
-  if (hit.token === '' && token !== '') {
+  // 老配置里可能压根没有 token 字段，undefined 与空串在线协议上是一回事，
+  // 先收敛成字符串再比，免得 undefined !== token 恒成立、每次都判定为"不一致"。
+  const cur = typeof hit.token === 'string' ? hit.token : '';
+  if (opts.overwriteToken === true && token !== '' && cur !== token) {
+    hit.token = token;
+    return true;
+  }
+  // 默认路径：只补空的那一份。用户手写的值一律原样保留。
+  if (cur === '' && token !== '') {
     hit.token = token;
     return true;
   }
   return false;
+}
+
+/** 协议端那条监听与我们的令牌是什么关系。只判定不改写。 */
+export type WsTokenState = 'absent' | 'no-token' | 'match' | 'conflict';
+
+/**
+ * 判定 3001 条目里的令牌与我们的是否一致。
+ *
+ * 存在的意义只有一件事：决定要不要打那条"已改成服务端令牌"的告警。
+ * 不能靠 `ensureWsServer` 的返回值代替——它把"补了开关""新建了条目""换了令牌"
+ * 混在同一个 boolean 里，用返回值判定会在首次部署时误报冲突。
+ */
+export function wsTokenState(cfg: Record<string, unknown>, port: number, ours: string): WsTokenState {
+  const net = isObj(cfg.network) ? cfg.network : cfg;
+
+  // 老格式是单对象且不按端口区分（ensureWsServer 同样如此），这里保持一致：
+  // 有它就当命中，免得新老配置给出两套结论。
+  const legacy = net.websocketServer;
+  if (isObj(legacy)) return stateOf(legacy.token, ours);
+
+  const list = Array.isArray(net.websocketServers) ? net.websocketServers : [];
+  const hit = list.filter(isObj).find((s) => Number(s.port) === port);
+  if (!hit) return 'absent';
+  return stateOf(hit.token, ours);
+}
+
+function stateOf(raw: unknown, ours: string): WsTokenState {
+  const cur = typeof raw === 'string' ? raw.trim() : '';
+  if (cur === '') return 'no-token';
+  if (ours !== '' && cur === ours.trim()) return 'match';
+  return 'conflict';
 }
 
 /** 读 JSON body，失败一律翻译成 400 请求格式错误。 */
@@ -875,6 +940,9 @@ export class Api {
     out.llm.api_key = maskKey(v.llm.api_key);
     out.panel.password_hash = '';
     out.panel.totp_secret = '';
+    // 令牌永不出面板：它是 OneBot 控制面的凭据，而面板上没有任何输入框能改它，
+    // 回传只会扩大泄露面。掩码也没意义——32 位随机串留头尾 4 位给不出任何信息。
+    out.onebot.access_token = '';
     writeJSON(ctx.res, 200, out);
   }
 
@@ -923,6 +991,10 @@ export class Api {
           allow_groups: [...inp.computer.allow_groups],
         };
         v.memory = { ...inp.memory };
+        // 令牌同样只能由服务端生成/清理。前端会把 GET 回来的整份设置
+        // （其中 onebot.access_token 是空串）原样 PUT 回来，漏这一行就会把它清空，
+        // 下一次启动重新生成、协议端再同步一次、连接再断一次。
+        v.onebot = { ...cur.onebot };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });
@@ -936,6 +1008,7 @@ export class Api {
     out.llm.api_key = maskKey(updated.llm.api_key);
     out.panel.password_hash = '';
     out.panel.totp_secret = '';
+    out.onebot.access_token = '';
     writeJSON(ctx.res, 200, out);
   }
 
@@ -2136,12 +2209,17 @@ export class Api {
   }
 
   /**
-   * 登录成功后自动确保协议端开了反向 WS。
+   * 登录成功后自动确保协议端开了反向 WS，并把服务端的令牌同步过去。
    *
    * 为什么非做不可：NapCat 的出厂配置里没有任何 3001 监听。扫码只代表 QQ 登上了，
    * 机器人照样一直重连——以前的说明书是让用户自己去「网络」页点一次
    * 「修正反向 WS（:3001）」，第一次部署十有八九卡在这一步。
    * 这里做成幂等 + 退避：成功一次就收手，失败按 1s/2s/4s…最多 60s 重试。
+   *
+   * 令牌以服务端为准：协议端里手填过的值会被改写成我们拨号时用的那一个。
+   * 两边不一致的后果不是"少一层保护"，而是握手 401 后无限退避重连——而面板上
+   * 没有任何地方能把它们对齐，所以收敛是唯一自洽的做法。代价是协议端会重启一次
+   * OneBot 服务（断连几秒），因此只在真的不一致时才写，一致的部署一个字节都不动。
    */
   private maybeFixOneBotWs(): void {
     const port = this.d.onebotPort ?? 3001;
@@ -2156,14 +2234,31 @@ export class Api {
     void (async () => {
       try {
         const cfg = await this.d.qq.networkConfig();
-        const token = this.d.onebotAccessToken ?? '';
-        if (ensureWsServer(cfg.config, port, token)) {
+        const token = (this.d.onebotAccessToken ?? '').trim();
+        const state = wsTokenState(cfg.config, port, token);
+        if (ensureWsServer(cfg.config, port, token, { overwriteToken: token !== '' })) {
           await this.d.qq.setNetworkConfig(cfg.config, cfg.asString);
           this.d.log.info('已自动开启协议端反向 WS', { port, token: token !== '' ? '已设置' : '未设置' });
+          // 刚写进协议端的就是我们要拨号的值，两边必须是同一个。
+          // 值没变时 setToken 自己会跳过，不会白断一次连接。
+          if (token !== '') this.d.applyOnebotToken?.(token);
         }
-        if (token === '') {
-          // 只在自动化这一步提醒一次：没 token 的监听等于把控制面敞开
-          this.d.log.warn('反向 WS 未设置 access token，建议为协议端配置 token 后再暴露端口', { port });
+        if (state === 'conflict' && token !== '') {
+          this.d.log.warn(
+            '协议端 3001 监听的 token 与服务端不一致，已改成服务端令牌：协议端会重启 OneBot 服务，' +
+              '机器人几秒后自动重连。若还有别的客户端连 3001，需要改成同一个令牌；' +
+              '想自己指定令牌，在 etc/env 写 QQBOT_ONEBOT_TOKEN=<令牌> 后执行 docker compose up -d' +
+              '（restart 不会重读 env_file）',
+            { port },
+          );
+        } else if (token === '') {
+          // 生产路径走不到（令牌由服务端生成并传进来）。留着是为了嵌入方或测试
+          // 没给令牌时仍然把"这条监听是裸的"说清楚，而不是静默开一个无凭据控制面。
+          this.d.log.warn(
+            '反向 WS 没有可用的 access token（服务端未提供令牌），这条监听将以无凭据方式运行；' +
+              '请查看启动日志里的 OneBot 令牌解析结果',
+            { port },
+          );
         }
         s.done = true;
         s.failures = 0;
@@ -2292,13 +2387,30 @@ export class Api {
       throw new HttpError(400, '配置必须是一个 JSON 对象');
     }
 
+    // 面板「修正反向 WS」新建的条目 token 是空的（浏览器拿不到真实令牌，也不该拼）；
+    // 也有人会直接在这份 JSON 里手填一个——两种都行不通：机器人拨号用的令牌来自
+    // etc/env / toml / 数据库，浏览器里改这一处不可能同时改到那边。
+    // 所以在保存前统一收敛成服务端的值。留着手填的值不是"尊重用户配置"，
+    // 而是让他下次重启前一直 401。
+    // createIfMissing: false —— 用户主动删掉的监听不该被他下一次保存偷偷加回来，
+    // 那种情况交给「网络」页的提示。
+    const token = (this.d.onebotAccessToken ?? '').trim();
+    if (token !== '') {
+      ensureWsServer(cfg as Record<string, unknown>, this.d.onebotPort ?? 3001, token, {
+        createIfMissing: false,
+        overwriteToken: true,
+      });
+    }
+
     try {
       await qq.setNetworkConfig(cfg as Record<string, unknown>, req.as_string === true);
     } catch (e) {
       throw new HttpError(502, `保存网络配置失败：${(e as Error).message}`);
     }
     this.store.audit.record('qq.network_updated', sess.user, clientIP(ctx.req));
-    writeJSON(ctx.res, 200, { ok: true });
+    // 回传补完之后的配置：前端拿它刷新编辑器，否则页面上会一直显示 token: ""
+    // 而协议端里其实已经有值了，下一次保存又会把它抹掉。
+    writeJSON(ctx.res, 200, { ok: true, config: cfg });
   }
 
   // ---- 内部 ----

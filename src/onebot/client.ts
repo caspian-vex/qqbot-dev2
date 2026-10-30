@@ -74,7 +74,7 @@ export class Client {
 
   constructor(
     private readonly url: string,
-    private readonly token: string,
+    private token: string,
     log: Logger,
     handler?: EventHandler,
   ) {
@@ -85,6 +85,28 @@ export class Client {
   /** 允许构造后再注入，避免与上层循环依赖。 */
   setHandler(h: EventHandler): void {
     this.handler = h;
+  }
+
+  /**
+   * 运行时换访问令牌，并重建连接。
+   *
+   * 场景只有一个：面板把服务端的令牌同步进协议端之后，这边得用同一个值去拨号，
+   * 否则协议端认新值、我们带旧值，握手 401 之后无限退避——症状比"没配令牌"更难查。
+   *
+   * 为什么不重建 Client：`engine.setSender` / `setHandler` 的闭包都绑在实例上
+   * （见 main.ts 的装配），换实例等于把整套装配重写一遍，收益为零。而 `dial()`
+   * 每轮都现读 `this.token`，改字段就够。
+   *
+   * 用 terminate 而不是 close(1000)：要的是立刻走 readLoop 的 reject，进而让
+   * `run()` 退避 1 秒后重拨。优雅关闭要等挥手，而对端此刻可能正卡在鉴权失败里。
+   * 不在这里手动 `failPending()`——`serve()` 的 finally 已经做了，重复会二次 reject。
+   */
+  setToken(t: string): void {
+    if (t === this.token) return;
+    const had = this.token !== '';
+    this.token = t;
+    this.log.info('OneBot 访问令牌已更新，重建连接', { had_token: had, has_token: t !== '' });
+    this.ws?.terminate();
   }
 
   status(): BotStatus {

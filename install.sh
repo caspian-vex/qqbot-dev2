@@ -218,7 +218,8 @@ format = "text"
 [onebot]
 # 容器网络内用服务名寻址
 url = "ws://napcat:3001"
-# 留空。3001 只在 compose 内网可达，外部拿不到。
+# 留空 = 由 qqbot 启动时自动生成一份并加密保存，登录后同步到协议端（推荐）。
+# 要指定固定令牌，填在这里或设 etc/env 的 QQBOT_ONEBOT_TOKEN（后者优先）。
 access_token = ""
 
 [panel]

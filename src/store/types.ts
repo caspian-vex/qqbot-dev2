@@ -244,6 +244,21 @@ export interface PanelSettings {
   totp_secret: string;
   totp_enabled: boolean;
 }
+
+/**
+ * OneBot 反向 WS 的访问令牌。
+ *
+ * 由服务端自动生成、加密保存、登录后同步写进协议端，面板不提供编辑——
+ * 面板里能填就意味着「面板填一个、协议端填另一个」这种各自为政的失效，
+ * 而症状是握手 401 后无限退避重连，比不给填更难排查。
+ *
+ * 想指定固定令牌仍然可以：etc/env 的 QQBOT_ONEBOT_TOKEN 或 etc/qqbot.toml 里的
+ * onebot.access_token，两处都优先于这里的值（显式配置压过自动生成的）。
+ */
+export interface OnebotSettings {
+  access_token: string;
+}
+
 /** 全部运行期设置，整体以一个 JSON 文档存放。 */
 export interface Settings {
   llm: LLMSettings;
@@ -255,6 +270,7 @@ export interface Settings {
   computer: ComputerSettings;
   context: ContextSettings;
   memory: MemorySettings;
+  onebot: OnebotSettings;
   panel: PanelSettings;
 }
 
@@ -393,6 +409,7 @@ export function defaultSettings(): Settings {
       token_budget: 3000,
     },
     memory: defaultMemory(),
+    onebot: { access_token: '' },
     panel: {
       admin_user: 'admin',
       password_hash: '',
@@ -582,6 +599,7 @@ export function cloneSettings(v: Settings): Settings {
     },
     context: { ...v.context },
     memory: { ...v.memory },
+    onebot: { ...v.onebot },
     panel: { ...v.panel },
   };
 }

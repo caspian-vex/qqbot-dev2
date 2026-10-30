@@ -718,7 +718,11 @@ describe('面板 /api/qq/network', () => {
         };
         const r = await put({ config: next, as_string: false });
         assert.equal(r.status, 200);
-        assert.deepEqual(await r.json(), { ok: true });
+        const resp = (await r.json()) as { ok: boolean; config: unknown };
+        assert.equal(resp.ok, true);
+        // 回包里带回补完令牌之后的配置：前端拿它刷新编辑框，
+        // 否则页面会一直显示 token: ""，下一次保存又把协议端写回空。
+        assert.deepEqual(resp.config, next);
 
         const saved = f.state.network.network as { websocketClients: unknown[] };
         assert.equal(saved.websocketClients.length, 1);

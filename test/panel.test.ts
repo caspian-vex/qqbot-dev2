@@ -36,6 +36,13 @@ interface Harness {
   base: string;
   store: Store;
   panel: PanelServer;
+  /**
+   * 面板的日志环形缓冲。
+   *
+   * Logger 的 level 只过滤标准输出，hub 恒通；所以即使这里配成 error，
+   * warn/info 也会进 hub，可以拿来断言"某条告警发没发"。
+   */
+  hub: LogHub;
   /** 注入的待批准队列（传了就与面板共用这一个实例）。 */
   approvals?: ApprovalQueue;
   stop: () => Promise<void>;
@@ -50,6 +57,7 @@ async function harness(
     qq?: QQLoginPort;
     onebotPort?: number;
     onebotAccessToken?: string;
+    applyOnebotToken?: (token: string) => void;
   } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-panel-'));
@@ -66,15 +74,19 @@ async function harness(
     }
   });
 
+  const hub = new LogHub(200);
   const panel = new PanelServer({
     store,
-    log: Logger.create({ level: 'error', format: 'text' }),
-    hub: new LogHub(50),
+    // 日志挂到 hub 上：控制台仍然是静音的（level=error 只过滤标准输出），
+    // 但用例可以据此断言某条告警到底发没发。
+    log: Logger.create({ level: 'error', format: 'text', hub }),
+    hub,
     webDir: join(process.cwd(), 'web', 'dist'),
     approvals: opts.approvals,
     qq: opts.qq,
     onebotPort: opts.onebotPort,
     onebotAccessToken: opts.onebotAccessToken,
+    applyOnebotToken: opts.applyOnebotToken,
   });
   const port = await panel.listen('127.0.0.1:0');
 
@@ -82,6 +94,7 @@ async function harness(
     base: `http://127.0.0.1:${port}`,
     store,
     panel,
+    hub,
     approvals: opts.approvals,
     stop: async () => {
       await panel.close(500);
@@ -581,6 +594,42 @@ describe('设置接口', () => {
     }
   });
 
+  // OneBot 令牌与 API Key 的差别：面板上没有它的输入框，所以「读不出去、也改不动」
+  // 必须由接口自己保证。漏掉任何一半，症状分别是"凭据进浏览器"和
+  // "下次启动重新生成 → 协议端再同步一次 → 连接再断一次"。
+  it('设置接口不回传 OneBot 令牌，也改不动它', async () => {
+    const h = await harness();
+    try {
+      h.store.settings.update((v) => {
+        v.onebot.access_token = 'aaaaaaaabbbbbbbbccccccccdddddddd';
+      });
+      const c = await authed(h);
+
+      const got = await fetch(`${h.base}/api/settings`, { headers: { Cookie: c.header } });
+      assert.equal(got.status, 200);
+      const body = (await got.json()) as { onebot: { access_token: string } };
+      assert.equal(body.onebot.access_token, '', '这是 OneBot 控制面的凭据，不该出现在浏览器里');
+
+      const put = (onebot: unknown): Promise<Response> =>
+        fetch(`${h.base}/api/settings`, {
+          method: 'PUT',
+          headers: { Cookie: c.header, 'Content-Type': 'application/json', 'X-CSRF-Token': c.csrf },
+          body: JSON.stringify({ onebot }),
+        });
+
+      // 前端会把 GET 回来的整份设置原样 PUT 回来，里面是空串——不能因此清空
+      assert.equal((await put({ access_token: '' })).status, 200);
+      assert.equal(h.store.settings.get().onebot.access_token, 'aaaaaaaabbbbbbbbccccccccdddddddd');
+
+      // 掩码、以及随便塞一个值，都不该覆盖
+      assert.equal((await put({ access_token: 'aaaa****dddd' })).status, 200);
+      assert.equal((await put({ access_token: 'hijacked' })).status, 200);
+      assert.equal(h.store.settings.get().onebot.access_token, 'aaaaaaaabbbbbbbbccccccccdddddddd');
+    } finally {
+      await h.stop();
+    }
+  });
+
   it('校验失败返回中文原文', async () => {
     const h = await harness();
     try {
@@ -796,7 +845,9 @@ describe('日志 SSE', () => {
       };
 
       await readUntil('历史一');
-      assert.match(buf, /^data: \{"time":"2024-01-01T00:00:00Z","level":"INFO","msg":"历史一"\}\n\n/);
+      // 不能锚在开头：面板启动时自己会往 hub 里写一条「面板已启动」，
+      // 补发的历史排在它后面。要钉的是这一行的 JSON 形状与"确实被补发了"。
+      assert.match(buf, /data: \{"time":"2024-01-01T00:00:00Z","level":"INFO","msg":"历史一"\}\n\n/);
 
       h.panel.hub.push({ time: '2024-01-01T00:00:01Z', level: 'WARN', msg: '实时二' });
       await readUntil('实时二');
@@ -1448,7 +1499,10 @@ describe('自动补反向 WS 的触发时机', () => {
    * 被爬虫扫到都会执行，一旦它顺手改协议端配置，等于任何一次页面加载
    * 都在重启 OneBot 服务。
    */
-  function qqStub(): { port: QQLoginPort; writes: string[] } {
+  function qqStub(initial: Record<string, unknown> = { network: {} }): {
+    port: QQLoginPort;
+    writes: string[];
+  } {
     const writes: string[] = [];
     const port: QQLoginPort = {
       configured: true,
@@ -1467,7 +1521,8 @@ describe('自动补反向 WS 的触发时机', () => {
       quickLoginList: () => Promise.resolve([]),
       quickLogin: () => Promise.resolve(),
       logout: () => Promise.resolve(),
-      networkConfig: () => Promise.resolve({ config: { network: {} }, asString: false }),
+      networkConfig: () =>
+        Promise.resolve({ config: JSON.parse(JSON.stringify(initial)) as Record<string, unknown>, asString: false }),
       setNetworkConfig: (cfg) => {
         writes.push(JSON.stringify(cfg));
         return Promise.resolve();
@@ -1506,6 +1561,139 @@ describe('自动补反向 WS 的触发时机', () => {
       assert.equal(stub.writes.length, 1);
       assert.match(stub.writes[0]!, /panel-token/);
       assert.match(stub.writes[0]!, /"port":3001/);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  // 这三条守的是同一个回归点：服务端已经有令牌时，那条「未设置 access token」
+  // 的告警不该再出现。它以前只判 token === ''，而面板上没有地方填，
+  // 于是每个默认部署都会看到一句没有出路的话。
+  // 注意 hub 里的 level 是大写（Logger 用 LABEL 映射，与标准输出一致）。
+  const tokenWarnings = (h: Harness): number =>
+    h.hub.recent(200).filter((l) => l.level === 'WARN' && /token|令牌/.test(l.msg)).length;
+
+  it('已有令牌且协议端为空时：补上令牌，不再输出「未设置 access token」', async () => {
+    const stub = qqStub();
+    const h = await harness({
+      qq: stub.port,
+      onebotPort: 3001,
+      onebotAccessToken: 'panel-token',
+    });
+    try {
+      await h.panel.tick();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stub.writes.length, 1);
+      assert.equal(tokenWarnings(h), 0, h.hub.recent(20).map((l) => l.msg).join(' | '));
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('协议端里是别的 token 时：改成服务端的值，并给一条可操作的告警', async () => {
+    const stub = qqStub({
+      network: {
+        websocketServers: [{ port: 3001, enable: true, enabled: true, token: 'old-token' }],
+      },
+    });
+    const applied: string[] = [];
+    const h = await harness({
+      qq: stub.port,
+      onebotPort: 3001,
+      onebotAccessToken: 'panel-token',
+      applyOnebotToken: (t) => applied.push(t),
+    });
+    try {
+      await h.panel.tick();
+      await new Promise((r) => setTimeout(r, 100));
+
+      assert.equal(stub.writes.length, 1);
+      assert.match(stub.writes[0]!, /panel-token/);
+      assert.equal(stub.writes[0]!.includes('old-token'), false, '旧值必须被换掉，否则我们带新值去握手就是 401');
+
+      // 协议端换了值，运行时连接也得跟着换——否则协议端认新值、我们带旧值
+      assert.deepEqual(applied, ['panel-token']);
+
+      const warn = h.hub.recent(50).find((l) => l.level === 'WARN');
+      assert.ok(warn, '覆盖了用户手写的值，必须留一条痕迹');
+      // 告警要能照着做：文件、变量名、命令缺一不可
+      assert.match(warn.msg, /QQBOT_ONEBOT_TOKEN/);
+      assert.match(warn.msg, /docker compose up -d/);
+      assert.match(warn.msg, /restart/);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('令牌已经一致时一个字节都不写（避免每次登录都重启一次 OneBot）', async () => {
+    const stub = qqStub({
+      network: {
+        websocketServers: [{ port: 3001, enable: true, enabled: true, token: 'panel-token' }],
+      },
+    });
+    const applied: string[] = [];
+    const h = await harness({
+      qq: stub.port,
+      onebotPort: 3001,
+      onebotAccessToken: 'panel-token',
+      applyOnebotToken: (t) => applied.push(t),
+    });
+    try {
+      await h.panel.tick();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stub.writes.length, 0);
+      assert.deepEqual(applied, [], '值没变就不该断一次连接');
+      assert.equal(tokenWarnings(h), 0);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('手工保存网络配置时给空 token 补上服务端的值，但不会新建条目', async () => {
+    const cfgWithEmpty = {
+      network: { websocketServers: [{ port: 3001, enable: true, enabled: true, token: '' }] },
+    };
+    const stub = qqStub(cfgWithEmpty);
+    const h = await harness({ qq: stub.port, onebotPort: 3001, onebotAccessToken: 'panel-token' });
+    try {
+      const c = await authed(h);
+      const put = (config: unknown): Promise<Response> =>
+        fetch(`${h.base}/api/qq/network`, {
+          method: 'PUT',
+          headers: {
+            Cookie: c.header,
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': c.csrf,
+          },
+          body: JSON.stringify({ config, as_string: false }),
+        });
+
+      const r = await put(cfgWithEmpty);
+      assert.equal(r.status, 200);
+      assert.match(stub.writes[0]!, /panel-token/, '空 token 存进协议端等于开一个无凭据的控制面');
+
+      // 回包要带补完的配置，否则前端编辑框里会一直显示 token: ""，
+      // 下一次保存又把它抹掉。
+      const back = (await r.json()) as { ok: boolean; config: unknown };
+      assert.equal(back.ok, true);
+      assert.match(JSON.stringify(back.config), /panel-token/);
+
+      // 用户把 3001 那个条目整条删掉再保存：不该被我们偷偷加回来
+      const empty = { network: { websocketServers: [] } };
+      const r2 = await put(empty);
+      assert.equal(r2.status, 200);
+      const saved = JSON.parse(stub.writes[1]!) as { network: { websocketServers: unknown[] } };
+      assert.equal(saved.network.websocketServers.length, 0);
+
+      // 手改成别的值也收敛回来：这一处改了不可能同时改到机器人那边，
+      // 留着只会让它在下次重启前一直 401。
+      const wrong = {
+        network: { websocketServers: [{ port: 3001, enable: true, enabled: true, token: 'typed-by-hand' }] },
+      };
+      const r3 = await put(wrong);
+      assert.equal(r3.status, 200);
+      assert.match(stub.writes[2]!, /panel-token/);
+      assert.equal(stub.writes[2]!.includes('typed-by-hand'), false);
     } finally {
       await h.stop();
     }

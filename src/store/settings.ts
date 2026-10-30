@@ -131,6 +131,7 @@ export class SettingsRepo {
   private encryptSensitive(v: Settings): Settings {
     v.llm.api_key = this.encodeSecret(v.llm.api_key);
     v.panel.totp_secret = this.encodeSecret(v.panel.totp_secret);
+    v.onebot.access_token = this.encodeSecret(v.onebot.access_token);
     return v;
   }
 
@@ -153,9 +154,16 @@ export class SettingsRepo {
   private decryptSensitive(v: Settings): void {
     v.llm.api_key = this.decodeSecret('LLM API Key', v.llm.api_key);
     v.panel.totp_secret = this.decodeSecret('TOTP 密钥', v.panel.totp_secret);
+    // 提示必须与真实出路一致：这个令牌没有面板输入框，说"请在面板重新填写"
+    // 等于把人指到一堵墙上。解不开就重新生成，启动日志里会说清楚。
+    v.onebot.access_token = this.decodeSecret(
+      'OneBot 访问令牌',
+      v.onebot.access_token,
+      '将自动重新生成并同步到协议端',
+    );
   }
 
-  private decodeSecret(label: string, raw: string): string {
+  private decodeSecret(label: string, raw: string, hint = '请在面板重新填写'): string {
     if (raw.startsWith(RAW_PREFIX)) return raw.slice(RAW_PREFIX.length);
     if (!raw.startsWith(ENC_PREFIX)) return raw;
 
@@ -172,7 +180,7 @@ export class SettingsRepo {
     } catch (e) {
       // 主密钥换了或密文被截断。抛出去会锁死面板（见 load 的说明），
       // 这里降级成空值：用户还能登进去重新填一次。
-      this.log?.error(`${label} 解密失败，已按空值处理（请在面板重新填写）`, { err: e });
+      this.log?.error(`${label} 解密失败，已按空值处理（${hint}）`, { err: e });
       return '';
     }
   }

@@ -34,8 +34,15 @@ export interface PanelOptions {
   qq?: QQLoginPort;
   /** 机器人要连的反向 WS 端口；登录成功后自动补齐这条监听。 */
   onebotPort?: number;
-  /** 自动补齐反向 WS 时写进监听条目的 token（空串 = 不设 token）。 */
+  /** 自动补齐反向 WS 时写进监听条目的 token（空串 = 服务端没有可用令牌）。 */
   onebotAccessToken?: string;
+  /**
+   * 令牌写进协议端之后，让运行时连接也换成它（Client.setToken）。
+   *
+   * 不接的后果是协议端认新值、机器人带旧值拨号，401 后无限退避——所以 main.ts
+   * 必须接上；只有测试与嵌入方才允许省略。
+   */
+  applyOnebotToken?: (token: string) => void;
   /** 图池目录（数据目录下的 images/）；不传时图池页显示为空。 */
   imagesDir?: string;
   /**
@@ -73,6 +80,7 @@ export class PanelServer {
       qq: opt.qq ?? nullQQLogin(),
       onebotPort: opt.onebotPort,
       onebotAccessToken: opt.onebotAccessToken,
+      applyOnebotToken: opt.applyOnebotToken,
       imagesDir: opt.imagesDir,
       computer: opt.approvals,
     });
