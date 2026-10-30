@@ -261,6 +261,9 @@ describe('定时消息链路', () => {
     // 默认设置：computer.enabled = false，主人为空
     store.settings.update((v) => {
       v.bot.seg_delay_min_ms = 0;
+      // 搜索出厂是开的，这里要断言"一个工具都不带"，先把搜索关掉，
+      // 否则测的就不是「没权限」而是「搜索还能用」。
+      v.search.enabled = false;
     });
     const llm = {
       chat: async (_c: unknown, msgs: LlmMessage[], _s?: unknown, tools?: ToolDef[]) => {

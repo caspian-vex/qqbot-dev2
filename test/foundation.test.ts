@@ -482,10 +482,33 @@ test('会话名：说话时记下，空值不擦旧名，且优先于预设快�
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('联网搜索：出厂关闭，缺块与缺字段都要能自己补齐', () => {
+test('图池：出厂开启，但用户关掉后不能被兜底改回来', () => {
   const { store, dir } = tempDb();
   const s = store.settings.get();
-  assert.equal(s.search.enabled, false, '要花钱的能力不能默认开');
+  // 池子为空时提示词里根本不出现图池块，所以"开着"不会误发任何东西；
+  // 反过来，放了一池子图却发现一张都不发，最容易被当成功能坏了。
+  assert.equal(s.images.enabled, true, '发图应默认允许');
+  assert.equal(s.images.max_per_reply, 1);
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+
+  // 整块缺失（图池上线之前的库）：补成默认值
+  const old = defaultSettings() as unknown as Record<string, unknown>;
+  delete old.images;
+  assert.equal(normalizeSettings(old as unknown as Settings).images.enabled, true);
+
+  // 块在且写着 false：这是用户自己关的，任何兜底都不许翻成 true
+  const off = defaultSettings();
+  off.images.enabled = false;
+  assert.equal(normalizeSettings(off).images.enabled, false, '用户关掉的开关不能被默认值顶回去');
+});
+
+test('联网搜索：出厂开启，缺块与缺字段都要能自己补齐', () => {
+  const { store, dir } = tempDb();
+  const s = store.settings.get();
+  // 出厂开着：查不查由模型判断，成本由 max_calls 兜住——"问了今天的新闻它
+  // 一本正经地编"比多花几分钱难堪得多。
+  assert.equal(s.search.enabled, true, '联网搜索应默认允许');
   assert.equal(s.search.max_calls, 2);
   assert.equal(s.search.timeout_sec, 8);
   store.close();
@@ -495,7 +518,7 @@ test('联网搜索：出厂关闭，缺块与缺字段都要能自己补齐', ()
   const old = defaultSettings() as unknown as Record<string, unknown>;
   delete old.search;
   const filled = normalizeSettings(old as unknown as Settings);
-  assert.equal(filled.search.enabled, false);
+  assert.equal(filled.search.enabled, true);
   assert.equal(filled.search.max_calls, 2);
 
   // 块在但字段被写坏：max_calls 缺失会让引擎的额度比较永远为假。

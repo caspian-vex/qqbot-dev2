@@ -20,7 +20,7 @@ import {
   type ReqCtx,
 } from './http';
 import type { ApprovalQueue } from '../bot/computer-approval';
-import { nullEngine, nullOneBot, nullQQLogin, type EnginePort, type OneBotPort, type QQLoginPort } from './ports';
+import { isProtocolError, nullEngine, nullOneBot, nullQQLogin, type EnginePort, type OneBotPort, type QQLoginPort } from './ports';
 import { SessionStore, type SessionInfo } from './session-store';
 
 export interface PanelOptions {
@@ -279,6 +279,14 @@ export class PanelServer {
       }
       if (e instanceof HttpError) {
         writeErr(res, e.status, e.message);
+        return;
+      }
+      // 协议端返回的业务错误（code!=0、路由 404、鉴权失败、连接超时）不是
+      // "服务器内部错误"：它有自己的原因，而那句泛化文案会把用户引向"面板坏了"。
+      // 502 才是准确的——是我们的上游（协议端）没办成这件事。
+      if (isProtocolError(e)) {
+        this.log.warn('协议端请求失败', { path, err: e.message });
+        writeErr(res, 502, e.message);
         return;
       }
       this.log.error('面板请求处理失败', {

@@ -119,6 +119,16 @@ export interface QQLoginPort {
   setNetworkConfig(config: Record<string, unknown>, asString: boolean): Promise<void>;
 }
 
+/**
+ * 是不是协议端（NapCat）返回的业务错误。
+ *
+ * 按 name 判断而不是 instanceof：面板只依赖端口接口，不 import napcat 模块，
+ * 否则"面板可以脱离真实协议端单独测试"这条设计就被打破了。
+ */
+export function isProtocolError(e: unknown): e is Error {
+  return e instanceof Error && e.name === 'NapCatError';
+}
+
 /** 未配置协议端 WebUI 时的占位实现。 */
 export function nullQQLogin(): QQLoginPort {
   const fail = (): Promise<never> => Promise.reject(new Error('未配置协议端 WebUI'));

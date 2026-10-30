@@ -100,8 +100,11 @@ export interface ProactiveSettings {
  *
  * 图池是数据目录下的 images/ 文件夹，用户放图进去即可。
  * 模型在回复里用 [图:文件名] 标记表达"想发图"，由引擎解析发送。
- * 池子为空时功能天然无效，但开关仍默认关闭——
- * 与回声式跟进同一哲学：新能力出厂全关，让用户自己决定。
+ *
+ * 出厂开启：池子为空时什么都不发生（提示词里根本不出现图池块），
+ * 所以"开着"不会误发任何东西；而放了一池子图却发现机器人一张都不发，
+ * 是最容易被当成"功能坏了"的情况——用户放图这个动作本身就是在要它发。
+ * 真不想让它发图，在面板上关掉即可。
  */
 export interface ImageSettings {
   /** 是否允许模型在回复里发图。 */
@@ -185,7 +188,9 @@ export interface VisionSettings {
  * 搜索后端固定用 DeepSeek 官方 Search API，和模型共用一个 API Key，
  * 所以这里没有 provider / api_key / base_url——没得选，也就不需要配。
  *
- * 出厂关闭：每次搜索都单独计费，默认替用户花钱不合适。
+ * 出厂开启：搜不搜由模型自己判断，闲聊不会去查；而"你问它今天的新闻，它
+ * 一本正经地编"，比多花几分钱难堪得多。按次计费的顾虑用 max_calls 兜住
+ * （一条消息最多两次），真嫌贵就把开关关掉。
  */
 export interface SearchSettings {
   /** 是否允许模型联网搜索。 */
@@ -272,10 +277,10 @@ export function defaultProactive(): ProactiveSettings {
   };
 }
 
-/** 图池的出厂默认值。功能关闭，单条回复至多一张图。 */
+/** 图池的出厂默认值。开启，单条回复至多一张图（多发的会被丢）。 */
 export function defaultImages(): ImageSettings {
   return {
-    enabled: false,
+    enabled: true,
     max_per_reply: 1,
   };
 }
@@ -297,12 +302,12 @@ export function defaultVision(): VisionSettings {
 /**
  * 联网搜索的出厂默认值。
  *
- * 关着，而且除 provider 外都是保守值：搜索是一次额外的外部请求，
- * 既花钱又多一跳延迟，该由用户明确开启。
+ * 开着，但除开关外都是保守值：每次最多 2 次搜索、最多 5 条结果、8 秒超时。
+ * 要不要查由模型判断，成本由 max_calls 兜住；嫌贵就在面板里关掉。
  */
 export function defaultSearch(): SearchSettings {
   return {
-    enabled: false,
+    enabled: true,
     max_results: 5,
     timeout_sec: 8,
     max_calls: 2,
@@ -476,7 +481,8 @@ export function normalizeSettings(v: Settings): Settings {
   // 这里主动丢掉：留着的话每次保存都会把它原样写回去，面板上却再也
   // 看不到、改不了，成了谁也解释不清的幽灵字段。
   delete (v as unknown as Record<string, unknown>).timing;
-  // 旧库没有 images 块：整个补成默认值，理由同 proactive。
+  // 旧库没有 images 块：整个补成默认值（开着），理由同 vision。
+  // 注意这只影响"整块都没有"的极老库——块在的话，里面存的值一个都不改。
   if (v.images === undefined || v.images === null || typeof v.images !== 'object') {
     v.images = defaultImages();
   }
@@ -486,7 +492,9 @@ export function normalizeSettings(v: Settings): Settings {
   if (v.vision === undefined || v.vision === null || typeof v.vision !== 'object') {
     v.vision = defaultVision();
   }
-  // 旧库没有 search 块：整块补默认值（关着的），升级不会突然开始对外发请求。
+  // 旧库没有 search 块：整块补默认值（开着）。整块缺失只发生在搜索功能上线
+  // 之前的库上，那种库里没有任何"用户选过关"的证据，按出厂值补是合理的；
+  // 只要块在（哪怕只有半块），下面那条分支就会保住用户自己的选择。
   if (v.search === undefined || v.search === null || typeof v.search !== 'object') {
     v.search = defaultSearch();
   } else {

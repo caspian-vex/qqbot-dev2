@@ -3309,16 +3309,21 @@
         await loadQr(true);
       },
       'qq-logout': async (btn) => {
-        if (!confirm('退出后机器人会离线，需要重新扫码才能恢复。确定退出？')) return;
+        // 说清代价：NapCat 没有登出接口，退出＝重启协议端，所以是"要等一会儿"
+        // 而不是"立刻生效"。含糊其辞会让用户以为点完没反应。
+        if (!confirm('退出后协议端会重启（约 10 秒），QQ 需要重新扫码或一键重登才能恢复。确定退出？')) return;
         btn.disabled = true;
+        qrNote('正在重启协议端，稍等几秒…');
         try {
+          // 这个请求会一直等到协议端重启回来、并确认已退出登录才返回，
+          // 所以下面不需要再猜时序。
           await api('/api/qq/logout', { method: 'POST' });
           ok('已退出登录');
           loggedIn = false;
-          setTimeout(refresh, 800);
-          // 退出后协议端要一点时间落状态，稍等再取码，别紧接着挨一次拒绝
-          setTimeout(() => loadQr(true), 800);
+          await refresh();
+          await loadQr(true);
         } catch (e) {
+          qrNote('');
           bad(e.message);
         } finally {
           btn.disabled = false;
@@ -3516,7 +3521,7 @@
         location.hash = '#/network';
       },
       'nc-logout': async (btn) => {
-        if (!confirm('退出后机器人会离线，需要重新扫码才能恢复。确定退出？')) return;
+        if (!confirm('退出后协议端会重启（约 10 秒），QQ 需要重新扫码或一键重登才能恢复。确定退出？')) return;
         btn.disabled = true;
         try {
           await api('/api/qq/logout', { method: 'POST' });

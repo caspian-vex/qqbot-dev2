@@ -585,6 +585,10 @@ describe('联网搜索', () => {
     const tools: (ToolDef[] | undefined)[] = [];
     const s = searchStub();
     const h = makeHarness({
+      // 出厂是开着的，这里要测的是"关掉之后的降级"，所以显式关一次
+      patch: (v) => {
+        v.search.enabled = false;
+      },
       searchFetch: s.fetchImpl,
       llm: async (_msgs, t) => {
         tools.push(t);
@@ -917,6 +921,9 @@ describe('电脑操作', () => {
   }): Harness {
     return makeHarness({
       patch: (v) => {
+        // 这一组只关心电脑操作下发哪几个工具。搜索出厂是开的，不关掉的话
+        // web_search 会混进 tools 列表，断言就从"电脑操作"变成了"顺带测搜索"。
+        v.search.enabled = false;
         v.computer.enabled = true;
         v.computer.owner_qq = OWNER;
         v.computer.require_approval = true;

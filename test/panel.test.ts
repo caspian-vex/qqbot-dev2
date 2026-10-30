@@ -1562,15 +1562,34 @@ describe('联网搜索的设置', () => {
     });
   }
 
-  it('开着却连模型 Key 都没有，直接 400，不要存成"看起来配好了"', async () => {
+  it('从关拨到开却没配模型 Key，直接 400，不要存成"看起来配好了"', async () => {
     const h = await harness();
     try {
       const c = await authed(h);
+      // 出厂是开着的，所以"刚把它拨到开"这个动作得先自己造出来。
+      const off = await put(h, c, { search: { enabled: false } });
+      assert.equal(off.status, 200, '关掉不该被拦');
+
       const res = await put(h, c, { search: { enabled: true } });
       assert.equal(res.status, 400);
       assert.deepEqual(await res.json(), {
         error: '开启联网搜索需要先填写模型 API Key（搜索与模型共用同一把）',
       });
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('搜索出厂开着、Key 还没填时，改别的设置不该被它挡下来', async () => {
+    // 否则新用户在设置页改个唤醒词都会撞上"开启联网搜索需要先填 Key"，
+    // 而他压根没点过那个开关——出厂状态本来就是这个样子。
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await put(h, c, { bot: { wake_words: ['小助手'], passive_rate: 0.5 } });
+      assert.equal(res.status, 200);
+      const got = (await res.json()) as { search: { enabled: boolean } };
+      assert.equal(got.search.enabled, true, '没被改动过的开关应保持开');
     } finally {
       await h.stop();
     }
@@ -1736,6 +1755,28 @@ describe('会话级设置（按对话对象覆盖）', () => {
         assert.equal(res.status, 400, JSON.stringify(payload));
         assert.deepEqual(await res.json(), { error: msg });
       }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('单群打开联网搜索同样要 Key；本来就开着的不会被反复拦', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      // 全局关掉搜索：此时"让这个群单独打开"是一次真正的从关到开。
+      await putGlobal(h, c, { search: { enabled: false } });
+      const bad = await putCfg(h, c, { id: 'group:1', overrides: { search: { enabled: true } } });
+      assert.equal(bad.status, 400, '没 Key 的单群开关不该悄悄存进去');
+      assert.deepEqual(await bad.json(), {
+        error: '开启联网搜索需要先填写模型 API Key（搜索与模型共用同一把）',
+      });
+
+      // 全局本来就是开的（出厂状态）+ 填了 Key：同一份覆盖再保存一次不该报错——
+      // 那不是"刚拨到开"，报错的只会是用户改别的字段时顺手带上的这一组。
+      await putGlobal(h, c, { llm: { api_key: 'sk-test-key' }, search: { enabled: true } });
+      const ok = await putCfg(h, c, { id: 'group:1', overrides: { search: { enabled: true } } });
+      assert.equal(ok.status, 200);
     } finally {
       await h.stop();
     }

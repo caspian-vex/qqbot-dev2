@@ -288,7 +288,13 @@ function checkModelURL(raw: string): void {
   }
 }
 
-function validateSettings(v: Settings): void {
+/**
+ * 校验一份设置。
+ *
+ * `prev` 是「这次改动之前实际生效的设置」，只在需要判断"用户是不是刚把它拨到开"
+ * 这类状态迁移时用得上；传不进来（无从得知旧值）时按"不拦"处理。
+ */
+function validateSettings(v: Settings, prev?: Settings): void {
   if (v.llm.base_url === '') throw new HttpError(400, '模型地址不能为空');
   // 解析 + 协议 + 目标地址三件事都在里面，顺序别调：先解析才知道协议，
   // 而 "不是网址" 这类输入应该报"不是合法的 URL"，不是"必须以 http 开头"。
@@ -366,7 +372,11 @@ function validateSettings(v: Settings): void {
   }
   // 搜索复用模型 Key。开着搜索却没配 Key，每次都要走一趟注定 401 的请求，
   // 而用户以为功能已经配好了——这种"静默不生效"比直接报错难查得多。
-  if (v.search.enabled && v.llm.api_key === '') {
+  //
+  // 只拦「这一次把它拨到开」的动作，不拦"当前就是开着"。搜索出厂是开的，
+  // 所以"开着 + 还没填 Key"是全新部署的**正常初态**；拿它当错误的话，新用户
+  // 在设置页改个唤醒词都会被这句话挡住，而他压根没点过搜索开关。
+  if (v.search.enabled && v.llm.api_key === '' && prev !== undefined && !prev.search.enabled) {
     throw new HttpError(400, '开启联网搜索需要先填写模型 API Key（搜索与模型共用同一把）');
   }
 
@@ -876,7 +886,7 @@ export class Api {
     } catch {
       throw new HttpError(400, '请求格式错误');
     }
-    validateSettings(inp);
+    validateSettings(inp, cur);
 
     let updated: Settings;
     try {
@@ -1231,7 +1241,12 @@ export class Api {
 
     // 校验的是「合并后实际生效的值」：所有范围规则与中文文案都在
     // validateSettings 里，这里不该再写一份（两份必然会漂移）。
-    validateSettings(resolveSettings(global, overrides));
+    // 旧值按同一个会话当前的覆盖算，这样"单群刚打开联网搜索"也能被那条
+    // 没配 Key 的检查拦到，而"本来就开着"不会在每次保存时重复报错。
+    validateSettings(
+      resolveSettings(global, overrides),
+      resolveSettings(global, this.store.sessionSettings.get(id)),
+    );
 
     const name = typeof req.name === 'string' ? req.name.trim().slice(0, 64) : '';
     const groups = overriddenGroups(overrides);

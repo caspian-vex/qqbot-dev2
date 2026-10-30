@@ -37,6 +37,20 @@ export interface FakeNapCatState {
   networkBare: boolean;
   /** SetConfig 收到的 config 原文（按顺序），用来断言我们发的是文本还是对象 */
   setPayloads: unknown[];
+  /**
+   * 自动登录账号（napcat.json 的 autoLoginAccount）。
+   *
+   * 真机上它决定"进程重启后要不要自己登回去"。空串 = 重启后停在扫码页，
+   * 这正是「退出登录」想达到的状态；非空则重启会静默登回去，
+   * 客户端必须把这种"退了个寂寞"如实报出来。
+   */
+  autoLoginUin: string;
+  /** RestartNapCat 被调用的次数 */
+  restarts: number;
+  /** true 时 SetQuickLoginQQ 按"老版本没有这条路由"回 404 */
+  noAutoLoginRoute: boolean;
+  /** true 时 RestartNapCat 回 404（更老的版本连重启接口都没有） */
+  noRestartRoute: boolean;
 }
 
 export interface FakeNapCat {
@@ -85,6 +99,10 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
     networkAsString: false,
     networkBare: false,
     setPayloads: [],
+    autoLoginUin: '',
+    restarts: 0,
+    noAutoLoginRoute: false,
+    noRestartRoute: false,
   };
 
   const calls: string[] = [];
@@ -207,11 +225,44 @@ export async function startFakeNapCat(token: string): Promise<FakeNapCat> {
           return;
         }
 
-        case '/api/QQLogin/Logout':
-          state.uin = '';
-          state.nick = '';
-          ok({});
+        // 真机行为：这两个接口只是写 napcat.json 的 autoLoginAccount，
+        // 不影响当前登录态，只影响"进程重启后要不要自己登回去"。
+        case '/api/QQLogin/SetQuickLoginQQ': {
+          // 老版本协议端没有这条路由：回 404，客户端只能带着自动登录继续重启
+          if (state.noAutoLoginRoute) {
+            send(404, { code: -1, message: 'Not Found' });
+            return;
+          }
+          const uin = String((JSON.parse(raw || '{}') as { uin?: string }).uin ?? '');
+          state.autoLoginUin = uin;
+          ok(null);
           return;
+        }
+
+        case '/api/QQLogin/GetQuickLoginQQ':
+          ok(state.autoLoginUin);
+          return;
+
+        // 真机没有 /QQLogin/Logout 这条路由（这是本次 bug 的根因），所以这里
+        // 刻意不实现它：一旦谁再把它写回客户端，这里就回 404，测试立刻红。
+        //
+        // 「退出登录」在 NapCat 的语义里就是重启进程：进程一没，登录会话也没了，
+        // 重启后停在扫码页（除非配了 autoLoginAccount）。
+        case '/api/QQLogin/RestartNapCat': {
+          // 太老的协议端没有这条路由
+          if (state.noRestartRoute) {
+            send(404, { code: -1, message: 'Not Found' });
+            return;
+          }
+          state.restarts++;
+          // 新进程的 Credential 与旧的不通用
+          state.invalidateCredential = true;
+          state.uin = state.autoLoginUin;
+          state.nick = state.saved.find((s) => s.uin === state.autoLoginUin)?.nick ?? '';
+          state.loginPhase = state.uin === '' ? 'waiting_qrcode' : 'login_success';
+          ok({ message: 'Restart initiated' });
+          return;
+        }
 
         // 真机行为：未登录时这两个接口直接回 Not Login（HTTP 200 + code!=0）
         case '/api/OB11Config/GetConfig': {

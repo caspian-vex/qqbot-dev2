@@ -47,6 +47,15 @@ const QR_TTL_MS = 110_000;
 const QR_POLL_ATTEMPTS = 3;
 const QR_POLL_DELAY_MS = 400;
 
+/**
+ * 退出登录：重启协议端后等它回来的参数。
+ *
+ * 容器的重启通常 3-8 秒，给 30 秒是留够慢机器与镜像冷启动的余量——
+ * 超时不是"操作失败"，而是"协议端没起来"，报错文案就照这个说。
+ */
+const LOGOUT_TIMEOUT_MS = 30_000;
+const LOGOUT_POLL_MS = 500;
+
 /** 协议端登录状态（归一化后的形状，字段名由我们自己定）。 */
 export interface QQLoginStatus {
   /** 已登录 */
@@ -185,6 +194,11 @@ export class NapCatWebUI {
     private readonly baseUrl: string,
     private readonly token: string,
     log: Logger,
+    /**
+     * 只给测试用：把"等协议端重启"的上限压到毫秒级。
+     * 线上永远用默认值——这个超时不参与任何判断，只决定"等多久算它没起来"。
+     */
+    private readonly opt: { logoutTimeoutMs?: number } = {},
   ) {
     this.log = log.with({ component: 'napcat' });
   }
@@ -267,7 +281,9 @@ export class NapCatWebUI {
       throw new NapCatError(-1, 'NapCat 鉴权失败，请检查 WEBUI_TOKEN');
     }
     if (!res.ok) {
-      throw new NapCatError(-1, `NapCat 返回 HTTP ${res.status}`);
+      // 带上路径：404 基本只有一个原因——我们调了一条协议端没有的路由。
+      // 不带路径的话，日志里只剩一句 "HTTP 404"，得回去翻代码猜是哪一条。
+      throw new NapCatError(-1, `NapCat 返回 HTTP ${res.status}（${path}）`);
     }
 
     let body: Record<string, unknown>;
@@ -452,11 +468,72 @@ export class NapCatWebUI {
     await this.call('/QQLogin/SetQuickLogin', { uin });
   }
 
-  /** 退出当前 QQ 登录（换号前先退，否则 NapCat 会拒绝新登录）。 */
+  /**
+   * 退出当前 QQ 登录（换号前先退，否则 NapCat 会拒绝新登录）。
+   *
+   * 这里有个必须写下来的事实：**NapCat 根本没有登出接口**。
+   * WebUI 的 QQLogin 路由表里只有登录 / 取码 / 刷新 / 快捷登录 / 重启这几条，
+   * 从来没有 `/QQLogin/Logout`——所以早先那版代码请求它必然是 404，面板上
+   * 表现成一句「服务器内部错误」，而且永远不会自己好。
+   * （对照 NapCat 自己的 OneBot 动作 `bot_exit`：摘要就写作「退出登录」，
+   *  实现是 `process.exit(0)`——在协议端的语义里，"退出登录"＝进程结束、
+   *  下次启动重新走登录流程。）
+   *
+   * 所以这里按它的语义做两件事：
+   *   1. 清掉自动登录账号。不清的话重启回来它会一声不响地登回去，
+   *      用户看到的是"点了没反应"；
+   *   2. 重启协议端进程（docker 的 restart 策略会把它重新拉起），进入扫码阶段。
+   *
+   * 判据不看调用是否成功：重启会把进程连同这条 HTTP 连接一起干掉，
+   * 拿不到响应是预期行为。真正的判据是**状态**——轮询到 login=false 才算退出成功。
+   */
   async logout(): Promise<void> {
-    await this.call('/QQLogin/Logout');
-    // 退出后凭据可能被重置，下一次调用重新登录
+    // 老版本可能没有这条路由，清不掉也要继续，最多是重启后自己登回来
+    await this.call('/QQLogin/SetQuickLoginQQ', { uin: '' }).catch((e: unknown) => {
+      this.log.debug('清除自动登录账号失败，继续重启协议端', { err: (e as Error).message });
+    });
+    await this.call('/QQLogin/RestartNapCat').catch((e: unknown) => {
+      const msg = (e as Error).message;
+      // 路由不存在是另一回事：说明这个版本的协议端没有重启接口，那我们连
+      // "让账号下线"的手段都没有，不能装作已经退了（也不能去等一个不会来的重启）。
+      if (/HTTP 404/.test(msg)) {
+        throw new NapCatError(-1, '协议端没有 RestartNapCat 接口，无法退出登录（NapCat 版本过旧？）');
+      }
+      // 其余（连接中断、超时）是进程退出时的预期现象：下面用状态收敛结论
+      this.log.debug('重启协议端时连接中断（预期）', { err: msg });
+    });
+    // 新进程的 Credential 与旧的不通用
     this.credential = '';
+    await this.waitLoggedOut(this.opt.logoutTimeoutMs ?? LOGOUT_TIMEOUT_MS);
+  }
+
+  /**
+   * 等协议端重启完、并且确认已经不处于登录状态。
+   *
+   * 只在"状态能读到"时下结论，读不到就继续等——重启过程中的连接被拒、
+   * 超时都属正常。超时之后再分两种情况报错，因为原因是两回事：
+   * 能读到状态说明进程活着（那就是登回去了），读不到说明它根本没起来。
+   */
+  private async waitLoggedOut(timeoutMs: number): Promise<void> {
+    const started = Date.now();
+    let alive = false;
+    while (Date.now() - started < timeoutMs) {
+      try {
+        const st = await this.status();
+        alive = true;
+        if (!st.login) return;
+      } catch {
+        // 进程正在退出，或容器还没把新进程拉起来
+      }
+      await sleep(LOGOUT_POLL_MS);
+    }
+    if (alive) {
+      throw new NapCatError(
+        -1,
+        '协议端重启后 QQ 仍是登录状态（多半是开了自动登录）。请在协议端关掉自动登录再试。',
+      );
+    }
+    throw new NapCatError(-1, '协议端在 30 秒内没有恢复，请检查 napcat 容器是否在运行');
   }
 
   // ---- OneBot11 网络配置 ----

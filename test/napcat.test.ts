@@ -414,6 +414,49 @@ describe('面板 /api/qq/*', () => {
     });
   });
 
+  it('退出登录走的是"清自动登录 + 重启协议端"，没有那条不存在的 Logout 路由', async () => {
+    // 这条用例钉住本次的根因：NapCat 的 WebUI 路由表里从来没有 /QQLogin/Logout，
+    // 请求它必然 404，面板上就显示成一句「服务器内部错误」。
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log());
+      f.state.uin = '10001';
+      f.state.nick = '测试号';
+      f.state.autoLoginUin = '10001';
+      f.state.saved = [{ uin: '10001', nick: '测试号' }];
+
+      await c.logout();
+
+      assert.ok(f.calls.includes('/api/QQLogin/RestartNapCat'), '要靠重启协议端把登录会话带走');
+      assert.ok(!f.calls.includes('/api/QQLogin/Logout'), '不该再调根本不存在的路由');
+      assert.equal(f.state.restarts, 1);
+      assert.equal(f.state.autoLoginUin, '', '自动登录必须先清掉，否则重启后自己登回去');
+      assert.equal((await c.status()).login, false, '退出后应停在未登录状态');
+    });
+  });
+
+  it('自动登录清不掉时如实报错，不假装退出成功', async () => {
+    // 老版本协议端没有 SetQuickLoginQQ：清不掉自动登录，重启会静默登回去。
+    // 这种情况必须明确失败——否则用户看到的是一次"成功"的退出，实际什么都没变。
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log(), { logoutTimeoutMs: 800 });
+      f.state.saved = [{ uin: '10001', nick: '一号' }];
+      f.state.uin = '10001';
+      f.state.noAutoLoginRoute = true;
+      f.state.autoLoginUin = '10001';
+
+      await assert.rejects(() => c.logout(), /仍是登录状态/);
+    });
+  });
+
+  it('协议端连重启接口都没有时，直接说"退不了"，不去等一个不会来的重启', async () => {
+    await withFake(async (f) => {
+      const c = new NapCatWebUI(f.base, TOKEN, log(), { logoutTimeoutMs: 200 });
+      f.state.uin = '10001';
+      f.state.noRestartRoute = true;
+      await assert.rejects(() => c.logout(), /没有 RestartNapCat 接口/);
+    });
+  });
+
   it('快捷登录与退出登录', async () => {
     await withFake(async (f) => {
       const h = await panelWith(f);
@@ -443,6 +486,30 @@ describe('面板 /api/qq/*', () => {
 
         assert.equal((await post('/api/qq/logout', {})).status, 200);
         assert.equal(f.state.uin, '');
+      } finally {
+        await h.stop();
+      }
+    });
+  });
+
+  it('协议端办不成事时给 502 + 原文，不再是「服务器内部错误」', async () => {
+    // 这正是本次故障在界面上的样子：NapCat 明明给了一句具体原因（旧代码是
+    // "HTTP 404"，因为路由根本不存在），却被 dispatch 的兜底吞成 500。
+    await withFake(async (f) => {
+      const h = await panelWith(f);
+      try {
+        f.state.failNextWith = { code: -1, message: '没有可快捷登录的账号 99999' };
+        const res = await fetch(`${h.base}/api/qq/quick-login`, {
+          method: 'POST',
+          headers: {
+            Cookie: h.cookie,
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': h.csrf,
+          },
+          body: JSON.stringify({ uin: '99999' }),
+        });
+        assert.equal(res.status, 502);
+        assert.deepEqual(await res.json(), { error: '没有可快捷登录的账号 99999' });
       } finally {
         await h.stop();
       }
