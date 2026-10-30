@@ -499,6 +499,9 @@ export class Engine implements EnginePort {
       // 只给"当前这一句"的发言者。历史里谁说的不带标签（要标就得改重放，
       // 那会把每条历史都变长，见 ctx.build）；没有事件的那两条主动通路也不给。
       qq: qqOf(ev),
+      // 名片在外、昵称在内：群里人人都有名片，只给 displayOf 的话模型看到的
+      // 是"3 号床"这种可随时改的称呼，对方真名叫什么它永远答不上来。
+      qqNickname: nickOf(ev),
       // 群临时会话（message_type=private 却带 group_id）不算群聊：
       // 不判 isGroup 的话，私聊的「当前群聊」会被填成那个群的名字。
       groupName: isGroup(ev) ? await this.groupName(ev.group_id ?? 0) : '',
@@ -1857,6 +1860,19 @@ function displayOf(ev: Event): string {
   const s = ev.sender;
   if (!s) return '';
   return s.card || s.nickname || '';
+}
+
+/**
+ * 对方真实的 QQ 昵称，不看群名片。
+ *
+ * 与 displayOf 的分工是"叫什么"和"本名叫什么"：群名片随时可改、可以是
+ * "熬夜冠军"这种外号，昵称才是这个号本来的名字。只要昵称，不拿名片兜底——
+ * 兜底会让没设名片的人多出一行与称呼一模一样的噪音（build 那里还会再去一次重）。
+ *
+ * 拿不到就留空，绝不退到号码：那会变成「对方昵称：2083882365」，模型照着叫。
+ */
+function nickOf(ev: Event): string {
+  return ev.sender?.nickname || '';
 }
 
 /**

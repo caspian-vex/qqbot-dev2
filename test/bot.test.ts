@@ -15,7 +15,7 @@ import { Manager as ContextManager } from '../src/ctxmgr';
 import { LlmClient, endpoint, estimateTokens } from '../src/llm/client';
 import type { Event } from '../src/onebot/types';
 import { atTargets, mentions, parseCQ, plainText } from '../src/onebot/types';
-import { build as buildSystem, expand } from '../src/persona';
+import { build as buildSystem, emptyVars, expand } from '../src/persona';
 import { Store } from '../src/store';
 import { defaultSettings, type BotSettings } from '../src/store/types';
 
@@ -541,11 +541,19 @@ describe('OneBot 消息解析', () => {
 
 describe('人格提示', () => {
   it('expand 只替换已知变量，未知占位符原样保留', () => {
-    const v = { time: 'T', groupName: 'G', nickname: 'N', botName: 'B', qq: 'Q' };
+    const v = { time: 'T', groupName: 'G', nickname: 'N', botName: 'B', qq: 'Q', qqNickname: 'RN' };
     assert.equal(
-      expand('{{bot_name}}/{{nickname}}/{{qq}}/{{group_name}}/{{time}}/{{unknown}}', v),
-      'B/N/Q/G/T/{{unknown}}',
+      expand('{{bot_name}}/{{nickname}}/{{qq_nickname}}/{{qq}}/{{group_name}}/{{time}}/{{unknown}}', v),
+      'B/N/RN/Q/G/T/{{unknown}}',
     );
+  });
+
+  it('{{nickname}} 与 {{qq_nickname}} 各取各的值', () => {
+    // 两个占位符前缀相同：分支顺序写错时短的会先吃掉长的那一段
+    const v = emptyVars();
+    v.nickname = '名片名';
+    v.qqNickname = '真名';
+    assert.equal(expand('{{nickname}}|{{qq_nickname}}', v), '名片名|真名');
   });
 
   it('build 依次拼用户人格、上下文变量、格式约束', () => {
@@ -555,6 +563,7 @@ describe('人格提示', () => {
       nickname: '小明',
       botName: '咪咪',
       qq: '123456789',
+      qqNickname: '小明',
     });
     assert.ok(out.startsWith('你是猫娘\n\n上下文：\n'));
     assert.ok(out.includes('- 你的名字：咪咪'));
@@ -566,6 +575,24 @@ describe('人格提示', () => {
     assert.match(out, /- 对方 QQ：123456789（[^）]*问[^）]*）/);
     assert.ok(out.includes('输出要求：'));
     assert.ok(out.includes('不要使用 Markdown'));
+    // 昵称与称呼相同（没设群名片）时不重复输出
+    assert.ok(!out.includes('- 对方昵称'));
+  });
+
+  it('群名片与 QQ 昵称不同时两行都给', () => {
+    const out = buildSystem('你是助手', {
+      time: '',
+      groupName: '测试群',
+      nickname: '3 号床',
+      botName: '咪咪',
+      qq: '123456789',
+      qqNickname: '陈小明',
+    });
+    assert.ok(out.includes('- 对方称呼：3 号床'));
+    assert.ok(out.includes('- 对方昵称：陈小明'));
+    // 顺序：称呼 → 昵称 → 号码，说的是同一个人的三件事
+    assert.ok(out.indexOf('- 对方称呼') < out.indexOf('- 对方昵称'));
+    assert.ok(out.indexOf('- 对方昵称') < out.indexOf('- 对方 QQ'));
   });
 
   it('没有变量时不输出空上下文段', () => {
@@ -575,9 +602,11 @@ describe('人格提示', () => {
       nickname: '',
       botName: '',
       qq: '',
+      qqNickname: '',
     });
     assert.ok(!out.includes('上下文：'));
     assert.ok(!out.includes('对方 QQ'), '不知道号码时不能留一行空的');
+    assert.ok(!out.includes('对方昵称'), '不知道昵称时不能留一行空的');
     assert.ok(out.includes('输出要求：'));
   });
 });

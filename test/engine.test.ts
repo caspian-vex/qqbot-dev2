@@ -501,6 +501,43 @@ describe('提示词里的说话人', () => {
     }
   });
 
+  it('群名片与 QQ 昵称不同时，称呼给名片、昵称另起一行', async () => {
+    const c = collect();
+    const h = makeHarness({ llm: c.llm });
+    try {
+      h.engine.handleEvent({
+        ...groupEv(),
+        sender: { user_id: 20000, nickname: '陈小明', card: '3 号床', role: 'member' },
+      });
+      await waitFor(() => h.sent.length >= 1);
+      const p = c.prompts[0]!;
+      // 叫人的时候还得叫群名片：那是这个人在这群人里的自称
+      assert.ok(p.includes('- 对方称呼：3 号床'));
+      // 但本名也要在，否则"这人叫啥"只能答名片
+      assert.ok(p.includes('- 对方昵称：陈小明'), '群名片之外的 QQ 昵称不能丢');
+      assert.ok(p.indexOf('- 对方称呼') < p.indexOf('- 对方昵称'));
+      assert.ok(p.indexOf('- 对方昵称') < p.indexOf('- 对方 QQ'));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('没设群名片时不再重复输出昵称那一行', async () => {
+    const c = collect();
+    const h = makeHarness({ llm: c.llm });
+    try {
+      h.engine.handleEvent({
+        ...groupEv(),
+        sender: { user_id: 20000, nickname: '陈小明', card: '', role: 'member' },
+      });
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(c.prompts[0]!.includes('- 对方称呼：陈小明'));
+      assert.ok(!c.prompts[0]!.includes('- 对方昵称：'), '称呼就是昵称，不必说两遍');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('协议端没带 sender 时只给号码，绝不把号码当称呼', async () => {
     const c = collect();
     // groupEv() 本身不带 sender：这是协议端省略 sender 时的样子
