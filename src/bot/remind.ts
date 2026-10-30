@@ -145,7 +145,12 @@ export function parseDueAt(at: string, afterMinutes: number, now: Date): DueOk |
 
     const d = new Date(now);
     d.setHours(h, mm, 0, 0);
-    if (d.getTime() <= now.getTime() + GRACE_MS) d.setDate(d.getDate() + 1);
+    // 判据必须是"已经过去超过 30 秒"，不是"未来 30 秒内"。
+    // 写成 d <= now + GRACE_MS 会把还没到点的时刻一起推到明天：用户 12:59:40
+    // 说"13:00 提醒我"，等 20 秒的事变成等一天，而且日志里看不出任何异常
+    // （到点照发，只是发在了 24 小时后）。落成"过去几秒"没问题——
+    // due() 会在下一个 tick 就把它捞出来发掉。
+    if (d.getTime() <= now.getTime() - GRACE_MS) d.setDate(d.getDate() + 1);
     return { dueAt: d.getTime(), note: '' };
   }
 

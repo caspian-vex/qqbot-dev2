@@ -384,12 +384,49 @@ export function defaultSettings(): Settings {
 }
 
 /**
+ * 顶层块的「存在性 + 字段类型」兜底。
+ *
+ * 下面每一段都直接写 `v.bot.xxx` 这样的路径。手改坏的库、跨大版本升级、
+ * 磁盘写到一半，都会让某个块整个缺失、或某个字段变成 null 与字符串——
+ * 那时抛出的 TypeError 会一路冒到登录流程（认证要读 panel.password_hash），
+ * 面板 500，而修面板又必须先登录，整个实例就此锁死只能删库。
+ *
+ * 所以先做一遍与语义无关的兜底：块不在就补默认块，字段缺失或类型完全对不上
+ * 就补默认值。各段自己的语义校验仍然保留（NaN、越界、业务约束在那儿）。
+ */
+function fillDefaults<T extends object>(cur: unknown, def: T): T {
+  if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) {
+    return { ...def };
+  }
+  const o = cur as Record<string, unknown>;
+  const d = def as unknown as Record<string, unknown>;
+  for (const [k, dv] of Object.entries(d)) {
+    const cv = o[k];
+    if (cv === undefined) {
+      o[k] = Array.isArray(dv) ? [...dv] : dv;
+      continue;
+    }
+    // 只在默认值是标量时比类型：对象/数组的形状差异交给各自那一段校验，
+    // 这里强行覆盖反而会把"块在但缺后加字段"的常态搞复杂。
+    if ((typeof dv !== 'object' || dv === null) && typeof cv !== typeof dv) {
+      o[k] = dv;
+    }
+  }
+  return o as unknown as T;
+}
+
+/**
  * 把 nil 切片收敛成空数组。
  *
  * JSON 里 null 与 [] 反序列化后长度都是 0，但序列化出去一个 null 一个 []。
  * 前端拿到 null 直接 .map 会抛异常，所以对外统一成 []。
  */
 export function normalizeSettings(v: Settings): Settings {
+  const d = defaultSettings();
+  const rec = v as unknown as Record<string, unknown>;
+  for (const key of Object.keys(d) as (keyof Settings)[]) {
+    rec[key] = fillDefaults(rec[key], d[key] as unknown as object);
+  }
   if (!Array.isArray(v.bot.wake_words)) v.bot.wake_words = [];
   if (!Array.isArray(v.bot.whitelist_groups)) v.bot.whitelist_groups = [];
   if (!Array.isArray(v.bot.blacklist_users)) v.bot.blacklist_users = [];

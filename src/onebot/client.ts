@@ -6,7 +6,7 @@
 // 同一连接既收事件也发动作，用 echo 字段把响应和请求对上。
 import WebSocket from 'ws';
 import type { Logger } from '../log/logger';
-import { rfc3339, ZERO_TIME } from '../util/time';
+import { rfc3339, sleep, ZERO_TIME } from '../util/time';
 import type { BotStatus } from '../panel/ports';
 import type { Event } from './types';
 
@@ -167,6 +167,9 @@ export class Client {
       const ws = new WebSocket(this.url, { headers, handshakeTimeout: DIAL_TIMEOUT });
 
       const timer = setTimeout(() => {
+        // 超时也要摘 abort 监听：另外三个出口都摘了，只有这条漏。
+        // 端口被防火墙 DROP 时每 10 秒超时一次，监听器会一直挂在进程级 signal 上。
+        signal.removeEventListener('abort', onAbort);
         ws.terminate();
         reject(new Error('拨号失败: 握手超时'));
       }, DIAL_TIMEOUT);
@@ -407,22 +410,4 @@ export class Client {
       }
     }
   }
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    const t = setTimeout(() => {
-      signal.removeEventListener('abort', onDone);
-      resolve();
-    }, ms);
-    const onDone = (): void => {
-      clearTimeout(t);
-      resolve();
-    };
-    signal.addEventListener('abort', onDone, { once: true });
-  });
 }

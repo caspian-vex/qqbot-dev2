@@ -60,6 +60,8 @@ function makeHarness(opts: {
   llm?: (msgs: LlmMessage[], tools?: ToolDef[]) => Promise<Result>;
   /** 联网搜索用的 fetch。不传就是真的全局 fetch——用例必须都传。 */
   searchFetch?: typeof fetch;
+  /** 取群名。不传就是稳定成功；群名缓存用例靠它模拟"第一次就失败"。 */
+  groupInfo?: (groupId: number) => Promise<string>;
 } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-engine-'));
   tmpDirs.push(dir);
@@ -84,7 +86,7 @@ function makeHarness(opts: {
       sent.push({ kind: 'private', target: id, segs });
       return 1;
     },
-    groupInfo: async () => '测试群',
+    groupInfo: async (id: number) => (opts.groupInfo ? opts.groupInfo(id) : '测试群'),
   };
 
   const llm = {
@@ -1136,6 +1138,56 @@ describe('电脑操作', () => {
       say(h, privateEv(OWNER, 1));
       await waitFor(() => h.sent.length === 1);
       assert.equal(seen[0]!.tools, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('群名缓存', () => {
+  it('取群名失败不会永久缓存空名，过一阵会重新取', async (t) => {
+    // 老实现把失败结果（空串）永久写进缓存：协议端启动慢一点，
+    // 这个群在整个进程生命周期里就再也没名字了，且没有任何痕迹。
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    // Date 被冻住了，waitFor 的"超时判断"会永远为假——回归时不是失败而是挂死。
+    // 所以这里按"轮询次数"等，与时钟无关。
+    const waitTicks = async (cond: () => boolean, tries = 300): Promise<void> => {
+      for (let i = 0; i < tries; i++) {
+        if (cond()) return;
+        await sleep(10);
+      }
+      throw new Error('等待超时');
+    };
+    let calls = 0;
+    const prompts: string[] = [];
+    const h = makeHarness({
+      groupInfo: async () => {
+        calls++;
+        if (calls === 1) throw new Error('协议端未就绪');
+        return '测试群';
+      },
+      llm: async (msgs) => {
+        prompts.push(contentText(msgs[0]!.content));
+        return {
+          content: '好的。',
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          firstTokenMs: 1,
+        };
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv({ message_id: 1 }));
+      await waitTicks(() => h.sent.length >= 1);
+      assert.equal(calls, 1);
+      assert.ok(!prompts[0]!.includes('当前群聊'), '第一次没取到，不该有群名');
+
+      // 越过失败缓存的重试间隔（60 秒）
+      t.mock.timers.tick(61_000);
+
+      h.engine.handleEvent(groupEv({ message_id: 2 }));
+      await waitTicks(() => h.sent.length >= 2);
+      assert.equal(calls, 2, '过了重试间隔要再问一次');
+      assert.ok(prompts[1]!.includes('当前群聊：测试群'), '第二次应带上群名');
     } finally {
       h.cleanup();
     }

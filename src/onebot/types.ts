@@ -104,9 +104,10 @@ export function segments(e: Event): Segment[] {
  * "[CQ:at,qq=123456]"，于是模型会认真回答这句"用户说的话"。
  */
 export function plainText(e: Event): string {
-  if (e.message === undefined || e.message === null) {
-    return (e.raw_message ?? '').trim();
-  }
+  // message 缺失时直接当"没有文本"，不再回退 raw_message：那段是 CQ 码原文，
+  // 一旦回退，模型就会拿到 "[CQ:at,qq=123456]" 这种字符串并认真作答。
+  // 与上面注释里的承诺保持一致。
+  if (e.message === undefined || e.message === null) return '';
   const segs = segments(e);
   let out = '';
   for (const s of segs) {

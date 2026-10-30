@@ -103,7 +103,44 @@ export class Digester {
       this.log.warn('检查待摘要条数失败', { session: sessionID, err: e });
       return;
     }
+    // 配额必须在这里就问一次。
+    //
+    // 原来只有 sweep() 查限额，而这条路是"每攒够 digest_force_msgs 条就压一次"——
+    // 一个话多的群一天能攒出几百条，于是它每几十条就压一次，
+    // 每会话日上限（默认 6）和进程级硬顶对它完全不生效，账单翻几倍。
+    if (!this.withinQuota(sessionID, s)) return;
     this.enqueue(sessionID, s);
+  }
+
+  /**
+   * 今天还能不能给这个会话压一次。
+   *
+   * 两道闸：进程级硬顶（不可配置，防的是「Σ各会话上限」被配置放大）
+   * 与每会话日上限。consider() 与 sweep() 都必须先问它。
+   *
+   * 硬顶把「排队中 + 在跑」也算进来：quotaUsed 只在成功后才 ++，
+   * 同一秒里涌进来的一批会话会全部通过检查，一轮就能冲破硬顶。
+   *
+   * digestNow() 刻意不问：面板上手动点的那一次是运维的逃生口，
+   * 用户明确要求了就不该被自动配额挡住。
+   */
+  private withinQuota(sessionID: string, s: Settings): boolean {
+    const now = nowSec();
+    const today = localDay(new Date(now * 1000));
+    if (this.quotaDay !== today) {
+      this.quotaDay = today;
+      this.quotaUsed = 0;
+    }
+    if (this.quotaUsed + this.pendingJobs() >= DIGEST_DAILY_HARD_CAP) return false;
+
+    try {
+      const cur = this.store.memory.cursor(sessionID);
+      const limit = Math.max(1, s.memory.digest_daily_limit);
+      if (cur.day_label === today && cur.digests_today >= limit) return false;
+    } catch {
+      // 读不到水位线就当没压过，交给 run() 里的条数判断兜底
+    }
+    return true;
   }
 
   /**
@@ -117,12 +154,6 @@ export class Digester {
     if (this.signal?.aborted) return;
 
     const now = nowSec();
-    const today = localDay(new Date(now * 1000));
-    if (this.quotaDay !== today) {
-      this.quotaDay = today;
-      this.quotaUsed = 0;
-    }
-    if (this.quotaUsed >= DIGEST_DAILY_HARD_CAP) return;
 
     const hours = s.memory.digest_interval_hours;
     // 0（或负数）表示不按时间触发，只靠攒条数。传 -1 让
@@ -143,17 +174,16 @@ export class Digester {
       return;
     }
 
-    const limit = Math.max(1, s.memory.digest_daily_limit);
     let picked = 0;
     for (const c of candidates) {
       if (picked >= DIGEST_SWEEP) break;
       // 会话还在聊就不压：中途压会把一段对话切成两半，概述和事实都不完整。
       if (idleSec > 0 && now - c.updated_at < idleSec) continue;
-      try {
-        const cur = this.store.memory.cursor(c.session_id);
-        if (cur.day_label === today && cur.digests_today >= limit) continue;
-      } catch {
-        // 读不到水位线就当没压过，交给 runOnce 里的条数判断兜底
+      // 与 consider() 同一道闸（硬顶 + 每会话日上限）
+      if (!this.withinQuota(c.session_id, s)) {
+        // 硬顶撞了就没必要再看后面的会话了，整轮到此为止
+        if (this.quotaUsed + this.pendingJobs() >= DIGEST_DAILY_HARD_CAP) break;
+        continue;
       }
       if (this.enqueue(c.session_id, s)) picked++;
     }
@@ -345,7 +375,10 @@ export class Digester {
 
     // 多批时要合并概述，否则一次摘要会留下两行"当天概述"。
     // 单批是常态（一次最多 60 条），走不到这里。
-    let summary = summaries.join('');
+    //
+    // 拼接必须带分隔：中文句子之间没有空格，直接 join('') 会让上一段的结尾
+    // 和下一段的开头粘成一句读不通的话（合并请求失败时就是这个兜底在用）。
+    let summary = summaries.join('\n');
     if (summaries.length > 1) {
       try {
         const res = await this.llm.chat(cfg, buildMergeMessages(summaries), this.signal);

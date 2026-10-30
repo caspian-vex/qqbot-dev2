@@ -46,21 +46,23 @@ export function split(text: string, opt: SplitOptions = defaultSplit()): string[
   }
   if (cur.trim() !== '') sentences.push(cur);
 
-  // 把句子合并成不超过 maxRunes 的段
+  // 把句子合并成不超过 maxRunes 的段。
+  //
+  // 长度必须按"拼好之后的整段"来算：句子是带原始空白的（上一段刻意保留了
+  // "Hello! How" 里的空格），拿 s.trim() 的长度累加而把未 trim 的 s 塞进
+  // 缓冲区，两者不同源，段长会随空白量线性漂出去。
   const segs: string[] = [];
   let buf = '';
-  let bufLen = 0;
   for (const s of sentences) {
-    const n = [...s.trim()].length;
-    if (bufLen > 0 && bufLen + n > maxRunes) {
+    const cand = buf + s;
+    if (buf !== '' && [...cand.trim()].length > maxRunes) {
       segs.push(buf.trim());
-      buf = '';
-      bufLen = 0;
+      buf = s;
+    } else {
+      buf = cand;
     }
-    buf += s;
-    bufLen += n;
   }
-  if (bufLen > 0) segs.push(buf.trim());
+  if (buf.trim() !== '') segs.push(buf.trim());
 
   if (segs.length === 0) return [];
 
@@ -94,19 +96,22 @@ export function truncate(s: string, max: number): string {
 export function stripMarkdown(s: string): string {
   if (s === '') return s;
 
+  // 成对/内联的记号可以整段删掉：它们不承载语义，只影响观感。
   const rules: [string, string][] = [
     ['**', ''],
     ['__', ''],
     ['```', ''],
     ['`', ''],
-    ['### ', ''],
-    ['## ', ''],
-    ['# ', ''],
-    ['- ', ''],
-    ['* ', ''],
   ];
   let out = s;
   for (const [from, to] of rules) out = out.split(from).join(to);
+
+  // 列表符号与标题井号只能删「行首」那一个。
+  //
+  // 原来把它们也丢进 split().join() 里做全文替换，'5 - 3 = 2' 会变成
+  // '53 = 2'，'2 * 3 = 6' 会变成 '23 = 6'，而这段清理对**每一条回复**生效
+  // （engine.reply），用户和模型都不会察觉内容被改了。
+  out = out.replace(/^[ \t]*(?:[-*]|#{1,6}) /gm, '');
 
   // 折叠多余空行
   while (out.includes('\n\n\n')) out = out.split('\n\n\n').join('\n\n');

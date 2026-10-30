@@ -20,6 +20,7 @@ import { hashPassword } from './panel/auth';
 import { PanelServer } from './panel/server';
 import { Box, generateToken } from './secret/box';
 import { Store } from './store';
+import { sleep } from './util/time';
 import { versionString } from './version';
 
 function logLevel(v: string): LogLevel {
@@ -86,6 +87,22 @@ function usage(w: NodeJS.WritableStream): void {
 
 // ---- run ----
 
+/**
+ * 装上"未处理 Promise 拒绝"的兜底。
+ *
+ * Node 22 默认把未处理拒绝升级为进程退出。这对"写错代码要立刻暴露"是对的，
+ * 但对一个 7×24 常驻的机器人是灾难：面板收到一条畸形请求、某个后台 tick
+ * 忘了 await，整台机器就进重启循环，而且日志里一个字都没有。
+ *
+ * 刻意**不**接管 uncaughtException：同步异常往往意味着状态已经半写
+ * （事务没提交、文件写了一半），继续跑比退出更危险，该崩就让它崩。
+ */
+function installCrashGuards(log: Logger): void {
+  process.on('unhandledRejection', (reason: unknown) => {
+    log.error('未处理的 Promise 拒绝', { err: reason });
+  });
+}
+
 /** 容器入口：装配全部组件并前台运行。 */
 async function cmdRun(argv: string[]): Promise<void> {
   const flags = parseFlags(argv);
@@ -94,6 +111,7 @@ async function cmdRun(argv: string[]): Promise<void> {
   const hub = new LogHub(500);
   const log = Logger.create({ level: logLevel(config.log.level), format: config.log.format, hub });
   if (warning) log.warn(warning);
+  installCrashGuards(log);
 
   const secrets = loadSecrets();
   const box = buildBox(secrets, log);
@@ -101,6 +119,7 @@ async function cmdRun(argv: string[]): Promise<void> {
   const dbPath = join(config.dataDir, 'qqbot.db');
   const store = new Store(dbPath);
   store.setBox(box);
+  store.setLog(log);
 
   // 图池目录：放图进去机器人就有图可发，删掉目录等于清空池子
   const imagesDir = join(config.dataDir, 'images');
@@ -153,6 +172,8 @@ async function cmdRun(argv: string[]): Promise<void> {
       qq,
       // 登录成功后自动补齐这条反向 WS，省掉「去网络页点一下」的手工步骤
       onebotPort: onebotPortOf(config.onebot.url),
+      // 补出来的监听要带同一个 token，否则等于开了个无凭据的 OneBot 控制面
+      onebotAccessToken: token,
       imagesDir,
       approvals,
     });
@@ -234,24 +255,6 @@ async function tickLoop(engine: Engine, signal: AbortSignal, log: Logger): Promi
     }
     await sleep(60_000, signal);
   }
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }
 
 /** 阻塞到收到 SIGINT/SIGTERM。 */
@@ -387,7 +390,9 @@ function cmdStatus(argv: string[]): void {
 
 /** 环境自检，输出可直接照着修的问题清单。 */
 function cmdDoctor(argv: string[]): void {
-  parseFlags(argv);
+  // 必须真的用上这个参数：`qqbot doctor --config /x` 的人想知道的就是那份
+  // 配置有没有问题；丢掉返回值会拿默认路径自检，给出一份"看着没问题"的答案。
+  const flags = parseFlags(argv);
   let problems = 0;
   const out = (s: string): void => {
     process.stdout.write(`${s}\n`);
@@ -411,7 +416,7 @@ function cmdDoctor(argv: string[]): void {
   out('配置');
   let cfg: Config | null = null;
   try {
-    cfg = loadConfig().config;
+    cfg = loadConfig(flags.config).config;
     ok('配置可解析');
   } catch (e) {
     fail((e as Error).message);

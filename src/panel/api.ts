@@ -3,7 +3,6 @@
 // 与 Go 版 internal/panel/api.go 一一对应：路由、状态码、中文错误文案
 // 全部逐字保留——前端会把 error 字段直接 toast 出来，改一个字就是改产品文案。
 import {
-  createReadStream,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -14,6 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { extname, join } from 'node:path';
+import { isIP } from 'node:net';
 import {
   IMAGE_MIME,
   UNTAGGED,
@@ -68,6 +68,7 @@ import {
   HttpError,
   isSecureRequest,
   parseCookies,
+  pipeFile,
   readBinary,
   readJSON,
   serializeCookie,
@@ -112,6 +113,8 @@ export interface ApiDeps {
   qq: QQLoginPort;
   /** 机器人要连的反向 WS 端口（默认 3001），登录后自动补齐用 */
   onebotPort?: number;
+  /** 自动补齐反向 WS 时写进监听条目的 token；空串表示"没配 token"。 */
+  onebotAccessToken?: string;
   /** 图池目录；未配置时图池接口返回空列表。 */
   imagesDir?: string;
   /**
@@ -127,8 +130,16 @@ export interface ApiDeps {
  * 兼容两种历史形状：新的 `websocketServers` 数组与老的 `websocketServer` 单对象。
  * 返回是否改动了配置——没改动就不要回写，否则每次登录都会让协议端重启一次 OneBot 服务。
  * 用户手写的 token / host 一律原样保留，这里只碰「这条监听开没开」。
+ *
+ * 新建的监听会带上 token：空 token 等于把 OneBot 控制面（伪造事件、直接调发送
+ * 接口）无凭据地暴露出去。host 保持 0.0.0.0 是必要的——协议端在另一个容器里，
+ * 绑回环就再也连不上了，隔离交给 compose 的 expose/ports 控制。
  */
-export function ensureWsServer(cfg: Record<string, unknown>, port: number): boolean {
+export function ensureWsServer(
+  cfg: Record<string, unknown>,
+  port: number,
+  token = '',
+): boolean {
   const isObj = (v: unknown): v is Record<string, unknown> =>
     v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -159,7 +170,7 @@ export function ensureWsServer(cfg: Record<string, unknown>, port: number): bool
       host: '0.0.0.0',
       port,
       messagePostFormat: 'array',
-      token: '',
+      token,
       debug: false,
       heartInterval: 30000,
       reportSelfMessage: false,
@@ -170,6 +181,12 @@ export function ensureWsServer(cfg: Record<string, unknown>, port: number): bool
   if (hit.enable !== true || hit.enabled !== true) {
     hit.enable = true;
     hit.enabled = true;
+    return true;
+  }
+  // 已有条目一律不动 token：用户可能手写了别的值，改它等于把已经连上的
+  // 协议端踢下线；而 token 为空的话，补一次就是我们能做的全部。
+  if (hit.token === '' && token !== '') {
+    hit.token = token;
     return true;
   }
   return false;
@@ -204,11 +221,78 @@ function maskKey(k: string): string {
   return `${k.slice(0, 4)}****${k.slice(k.length - 4)}`;
 }
 
-function validateSettings(v: Settings): void {
-  if (v.llm.base_url === '') throw new HttpError(400, '模型地址不能为空');
-  if (!/^https?:\/\//i.test(v.llm.base_url)) {
+/**
+ * 把 IPv4-mapped IPv6 还原成点分十进制。
+ *
+ * 必须自己算：WHATWG 的 URL 会把 `[::ffff:169.254.169.254]` 规范化成
+ * `[::ffff:a9fe:a9fe]`，直接匹配点分形式永远匹配不到——这正是绕过校验的入口。
+ */
+function ipv4FromMapped(h: string): string | null {
+  const m = /^::ffff:(.+)$/.exec(h);
+  if (m === null) return null;
+  const rest = m[1]!;
+  if (rest.includes('.')) return rest;
+  const parts = rest.split(':');
+  if (parts.length !== 2) return null;
+  const hi = Number.parseInt(parts[0]!, 16);
+  const lo = Number.parseInt(parts[1]!, 16);
+  if (!Number.isInteger(hi) || !Number.isInteger(lo)) return null;
+  return [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join('.');
+}
+
+/**
+ * 链路本地 / 云元数据地址判定。
+ *
+ * 这些地址上没有正当的模型端点，但正好是 SSRF 最想要的目标：
+ * 169.254.169.254 是各大云厂商的实例元数据服务，一次 GET 就能捞出临时凭证。
+ */
+function isLinkLocalHost(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === 'metadata.google.internal') return true;
+  if (h === '0.0.0.0' || h === '::') return true;
+  const ip = isIP(h);
+  if (ip === 4) return h.startsWith('169.254.');
+  if (ip === 6) {
+    if (/^fe[89ab][0-9a-f]:/.test(h)) return true; // fe80::/10
+    const v4 = ipv4FromMapped(h);
+    if (v4 !== null) return v4.startsWith('169.254.') || v4 === '0.0.0.0';
+  }
+  return false;
+}
+
+/**
+ * 模型地址的网络安全检查。
+ *
+ * 面板是管理员自己的，但 base_url 会**连同真实 API Key** 被拿去发请求：
+ * 会话一旦被盗（或碰上 CSRF），把地址改成 169.254.169.254 就等于让这台机器
+ * 带着钥匙去敲云厂商的元数据服务。所以链路本地地址一律硬拒。
+ *
+ * 回环与内网段刻意放行：本地跑 Ollama、Docker 里的 one-api、家里的中转
+ * 都是正常用法，拦掉它们会直接砸掉一整类部署。代价是"内网扫描"这一层
+ * 仍然存在——但那条链要先用管理员会话，收益远小于误伤。
+ */
+function checkModelURL(raw: string): void {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new HttpError(400, '模型地址不是合法的 URL');
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     throw new HttpError(400, '模型地址必须以 http(s):// 开头');
   }
+  const host = u.hostname.replace(/^\[/, '').replace(/\]$/, '');
+  if (host === '') throw new HttpError(400, '模型地址缺少主机名');
+  if (isLinkLocalHost(host)) {
+    throw new HttpError(400, '模型地址不能指向链路本地或云元数据地址');
+  }
+}
+
+function validateSettings(v: Settings): void {
+  if (v.llm.base_url === '') throw new HttpError(400, '模型地址不能为空');
+  // 解析 + 协议 + 目标地址三件事都在里面，顺序别调：先解析才知道协议，
+  // 而 "不是网址" 这类输入应该报"不是合法的 URL"，不是"必须以 http 开头"。
+  checkModelURL(v.llm.base_url);
   if (v.llm.model === '') throw new HttpError(400, '模型名称不能为空');
   if (v.llm.max_tokens <= 0 || v.llm.max_tokens > 8192) {
     throw new HttpError(400, '最大输出 token 应在 1-8192 之间');
@@ -467,6 +551,16 @@ export class Api {
     }
   }
 
+  /**
+   * 把其他设备的登录态全部吊销，只留当前这条。
+   *
+   * 用于"改密码""关两步验证"这类安全动作：会话有效 12 小时，不清掉的话
+   * 攻击者手里的 Cookie 在主人改完密码后照样能用满半天。
+   */
+  private revokeOtherSessions(ctx: ReqCtx): number {
+    return this.d.sessions.revokeAllExcept(parseCookies(ctx.req)[COOKIE_SESSION]);
+  }
+
   // ---- 鉴权 ----
 
   /** 登录。不走 wrap：此时还没有会话，也没法要求 CSRF。 */
@@ -557,7 +651,10 @@ export class Api {
       throw new HttpError(500, '保存失败');
     }
     this.store.audit.record('password.changed', sess.user, clientIP(ctx.req));
-    writeJSON(ctx.res, 200, { ok: true });
+    // 改完密码把别的设备踢掉：这是用户按下"改密码"时的真实意图
+    const killed = this.revokeOtherSessions(ctx);
+    if (killed > 0) this.d.log.info('改密码后已吊销其他会话', { count: killed });
+    writeJSON(ctx.res, 200, { ok: true, revoked: killed });
   }
 
   /**
@@ -675,7 +772,10 @@ export class Api {
       throw new HttpError(500, '保存失败');
     }
     this.store.audit.record('totp.disabled', sess.user, clientIP(ctx.req));
-    writeJSON(ctx.res, 200, { ok: true });
+    // 关掉二步验证意味着"我可能被绕过了，现在收回所有人的登录态"
+    const killed = this.revokeOtherSessions(ctx);
+    if (killed > 0) this.d.log.info('关闭两步验证后已吊销其他会话', { count: killed });
+    writeJSON(ctx.res, 200, { ok: true, revoked: killed });
   }
 
   // ---- 总览 ----
@@ -1538,7 +1638,7 @@ export class Api {
       ctx.res.end();
       return;
     }
-    createReadStream(path).pipe(ctx.res);
+    pipeFile(ctx.res, path);
   }
 
   // ---- 长期记忆 ----
@@ -1902,10 +2002,9 @@ export class Api {
       }
     }
     writeJSON(ctx.res, 200, { configured: true, ...st });
-
-    // 登录成功后才允许改 OB11Config，所以「补 3001」这件事必须挂在这里。
-    // 不 await：状态接口是前端 2 秒轮询的，不能让它等协议端重启。
-    if (st.login) this.maybeFixOneBotWs();
+    // 这里刻意不触发「补 3001」：GET 不该有副作用。前端轮询、浏览器预取、
+    // 爬虫扫到这一条都会经由它去改协议端配置，而接口语义上只是"读状态"。
+    // 补反向 WS 只由 tick() 驱动：页面关着也照样补得上，只是最多晚 20 秒。
   }
 
   /**
@@ -1946,9 +2045,14 @@ export class Api {
     void (async () => {
       try {
         const cfg = await this.d.qq.networkConfig();
-        if (ensureWsServer(cfg.config, port)) {
+        const token = this.d.onebotAccessToken ?? '';
+        if (ensureWsServer(cfg.config, port, token)) {
           await this.d.qq.setNetworkConfig(cfg.config, cfg.asString);
-          this.d.log.info('已自动开启协议端反向 WS', { port });
+          this.d.log.info('已自动开启协议端反向 WS', { port, token: token !== '' ? '已设置' : '未设置' });
+        }
+        if (token === '') {
+          // 只在自动化这一步提醒一次：没 token 的监听等于把控制面敞开
+          this.d.log.warn('反向 WS 未设置 access token，建议为协议端配置 token 后再暴露端口', { port });
         }
         s.done = true;
         s.failures = 0;

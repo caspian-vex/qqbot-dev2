@@ -176,6 +176,15 @@ export function loadConfig(path = configPath()): { config: Config; warning?: str
   // 归一化 + 校验
   if (cfg.dataDir === '') cfg.dataDir = join(cfg.root, 'data', 'qqbot');
   if (cfg.onebot.url.trim() === '') throw new Error('onebot.url 不能为空');
+  // 方案必须显式校验：把 ws:// 手滑写成 http:// 时，new WebSocket 会在 dial() 里
+  // 同步抛错，而 dial 的所有失败都被当成网络故障按 1s→30s 无限退避重连——
+  // 日志里只有一条条"拨号失败"，运维会一直以为是协议端没起来。
+  if (!/^wss?:\/\//i.test(cfg.onebot.url.trim())) {
+    throw new Error(
+      `onebot.url 必须以 ws:// 或 wss:// 开头（当前: ${cfg.onebot.url}）。` +
+        '它是机器人主动连接协议端的 WebSocket 地址，不是 http 地址。',
+    );
+  }
   cfg.panel.listen = listenFromEnv() ?? (cfg.panel.listen || DEFAULT_LISTEN);
 
   // 协议端 WebUI 地址同样允许环境变量覆盖。

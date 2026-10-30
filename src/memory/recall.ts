@@ -30,9 +30,13 @@ export function pickForPrompt(
   days: DaySummary[],
   cfg: { maxFacts: number; budget: number; minScore?: number },
 ): RecallPick {
-  const budget = Math.max(0, Math.floor(cfg.budget));
-  const maxFacts = Math.max(1, Math.floor(cfg.maxFacts));
-  const minScore = Math.max(1, Math.min(5, Math.floor(cfg.minScore ?? 1)));
+  // Math.max(0, NaN) 还是 NaN，一旦上游给了 NaN，后面的 ">" 比较会全部为假，
+  // 结果是概述与事实全量塞进 prompt（预算形同不存在）。这里统一收敛。
+  const num = (x: number, fallback: number): number =>
+    Number.isFinite(x) ? Math.floor(x) : fallback;
+  const budget = Math.max(0, num(cfg.budget, 0));
+  const maxFacts = Math.max(1, num(cfg.maxFacts, 1));
+  const minScore = Math.max(1, Math.min(5, num(cfg.minScore ?? 1, 1)));
 
   let remaining = Math.max(0, budget - BLOCK_OVERHEAD);
 

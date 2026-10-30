@@ -47,7 +47,10 @@ export class LogHub {
 
   /** 返回最近 n 条（时间正序）。 */
   recent(n: number): LogLine[] {
-    const take = n <= 0 || n > this.buf.length ? this.buf.length : n;
+    // NaN 必须单独兜：`slice(len - NaN)` 等于 `slice(0)`，会把整个缓冲区
+    // 当成"最近 n 条"返回；查询参数没传/传坏时就会走到这里。
+    const want = Number.isFinite(n) ? Math.floor(n) : this.buf.length;
+    const take = want <= 0 || want > this.buf.length ? this.buf.length : want;
     return this.buf.slice(this.buf.length - take);
   }
 

@@ -457,7 +457,17 @@
 
     bindActions(root, {
       logout: async () => {
-        try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) { /* 已经掉线也算登出 */ }
+        try {
+          await api('/api/auth/logout', { method: 'POST' });
+        } catch (e) {
+          // 401 说明会话早就没了，直接回登录页没问题。
+          // 其它失败（403 CSRF 过期、网络断）会话其实还在，假装登出会让人
+          // 以为已经退出而把设备留在登录态，所以如实提示一句。
+          if (e.status !== 401) {
+            toast('退出失败：' + e.message);
+            return;
+          }
+        }
         renderLogin();
       },
     });

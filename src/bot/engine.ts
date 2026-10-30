@@ -21,7 +21,7 @@ import type { MemoryOwner } from '../store';
 import { resolveSettings, type SessionOverrides } from '../store/overrides';
 import type { Settings } from '../store/types';
 import { sessionId } from '../store/types';
-import { isPeak, localDay, rfc3339, ZERO_TIME } from '../util/time';
+import { isPeak, localDay, rfc3339, sleep, ZERO_TIME } from '../util/time';
 import type { Event, Segment } from '../onebot/types';
 import { at, image, isGroup, isMessage, isPrivate, reply, text } from '../onebot/types';
 import { ApprovalQueue } from './computer-approval';
@@ -152,6 +152,11 @@ const ALARM_BATCH = 4;
 /** 闲置唤醒只看最近这么多天有过动静的会话。 */
 const IDLE_LOOKBACK_MS = 7 * 24 * 3600_000;
 
+/** 群名缓存时长：群偶尔改名，一小时后重新取一次就够了。 */
+const GROUP_NAME_TTL_MS = 60 * 60_000;
+/** 取不到群名时的重试间隔：多半是协议端临时没就绪，不该永久钉死成空。 */
+const GROUP_NAME_RETRY_MS = 60_000;
+
 interface Counters {
   received: number;
   replied: number;
@@ -209,7 +214,11 @@ export class Engine implements EnginePort {
   private sender: Sender | null = null;
 
   private readonly dedupe = new Dedupe(5 * 60_000);
-  private readonly queue = new TaskQueue(3, 3);
+  private readonly queue = new TaskQueue(3, 3, (key, err) => {
+    // 这条日志是"消息凭空消失"唯一的线索：queue.submit 会把异常吞掉
+    // 以保证同会话的后续消息还能被处理，没有它就只剩沉默。
+    this.log.error('会话任务异常', { session: key, err });
+  });
   private readonly cool = new Cooldown();
 
   // ---- 回声式跟进的状态 ----
@@ -253,7 +262,7 @@ export class Engine implements EnginePort {
 
   private selfId = 0;
   private botName = '';
-  private readonly groupNames = new Map<number, string>();
+  private readonly groupNames = new Map<number, { name: string; at: number }>();
 
   private readonly counters: Counters = {
     received: 0,
@@ -604,14 +613,27 @@ export class Engine implements EnginePort {
     // 后续每一轮的预算估算都偏小，白白裁掉真正有用的对话。
     // 用户消息带上说话人：群聊里几轮对话的 role 都是 user，摘要器要按人
     // 归因就得知道是谁说的。
-    this.ctx.record(sid, 'user', historyText, estimateTokens(historyText), {
-      id: ev.user_id ?? 0,
-      name: displayOf(ev),
-    });
-    this.ctx.record(sid, 'assistant', recordText, completionTokens);
+    //
+    // 落库失败不能把整条回复带走：SQLite 在 WAL 下写入繁忙、磁盘满、句柄失效
+    // 都可能同步抛错，而这里的异常会一路冒到 queue 的 catch——用户什么都收不到，
+    // 日志里也一个字没有。宁可"回了但历史少一条"，也不要"用户干等"。
+    try {
+      this.ctx.record(sid, 'user', historyText, estimateTokens(historyText), {
+        id: ev.user_id ?? 0,
+        name: displayOf(ev),
+      });
+      this.ctx.record(sid, 'assistant', recordText, completionTokens);
+    } catch (e) {
+      this.log.error('写入会话历史失败', { session: sid, err: e });
+    }
     // 只在「攒够条数」时排一次后台摘要，每天的常规调度在 tick 里。
     // 放在发送之前：发送失败（风控/超时）时这段对话仍在库里，该记的还得记。
-    this.digester.consider(sid, settings, { ownerName });
+    try {
+      this.digester.consider(sid, settings, { ownerName });
+    } catch (e) {
+      // 摘要排队失败只是"晚点再记"，不该连带回复一起失败
+      this.log.warn('排队摘要失败', { session: sid, err: e });
+    }
     try {
       this.store.usage.record(settings.llm.model, promptTokens, completionTokens, isPeak());
     } catch (e) {
@@ -779,6 +801,13 @@ export class Engine implements EnginePort {
       const args = c.function?.arguments ?? '';
 
       if (name === SEARCH_TOOL_NAME) {
+        // 与电脑、定时两路一致：模型可能凭空编一个工具名，或者历史里残留了
+        // 上一轮的调用。没有权限时不光不该执行——搜索走的是按次计费的
+        // Search API，编一个名字就能刷出一次真实账单。
+        if (!scope.search) {
+          say(id, name, '这个会话没有联网搜索权限。');
+          continue;
+        }
         if (budget.used.search >= budget.limit.search) {
           // 超预算也要回一条：漏掉任何一个 tool_call_id，下一次请求就是 400
           say(id, name, '本次的搜索次数已用完，请直接用现有信息回答。');
@@ -1203,11 +1232,26 @@ export class Engine implements EnginePort {
 
     const due = this.store.scheduled.due(sec, ALARM_BATCH);
     for (const row of due) {
+      // 先确认这个会话还有空位，再标 done。
+      //
+      // 原来是无条件 markDone 之后才 submit，队列满时只打一条 warn：
+      // 库里这条已经是 done，due() 再也不会捞到它，也没有任何补偿路径——
+      // 用户设的"八点叫我"就这么没了，而面板上显示"已发送"。
+      // 反过来"先 submit 再 markDone"也不行：tick 每 60 秒一轮，任务排队
+      // 超过一轮时行还是 pending，下一轮会重复捞到、重复发送。
+      if (!this.queue.accepts(row.session_id)) {
+        this.log.warn('会话排队已满，定时消息留到下一轮', { session: row.session_id, id: row.id });
+        continue;
+      }
       this.store.scheduled.markDone(row.id, sec);
-      // 进会话队列：与正常回复串行，历史顺序才不会错乱
-      const accepted = this.queue.submit(row.session_id, () => this.runAlarm(row, now));
-      if (!accepted) {
-        this.log.warn('会话排队已满，定时消息被丢弃', { session: row.session_id, id: row.id });
+      // 进会话队列：与正常回复串行，历史顺序才不会错乱。
+      // accepts() 与 submit() 之间是同步的，中间没有人能插队，所以这里必定成功；
+      // 真返回 false 说明上面的判断和提交逻辑被改得不一致了，留一条 error 别静默。
+      if (!this.queue.submit(row.session_id, () => this.runAlarm(row, now))) {
+        this.log.error('定时消息没能进队列（已标 done，这条会丢）', {
+          session: row.session_id,
+          id: row.id,
+        });
       }
     }
   }
@@ -1665,13 +1709,21 @@ export class Engine implements EnginePort {
   /**
    * 懒加载群名，带进程内缓存。
    *
-   * 群名只用于给模型一点上下文，取不到也不影响主链路，
-   * 所以失败时缓存空串，避免每条消息都去问一次。
+   * 群名只用于给模型一点上下文，取不到也不影响主链路。
+   * 但缓存必须带时限：原来"取不到就缓存空串"是永久的——协议端刚启动还没就绪、
+   * 或者那一次请求超时，这个群在整个进程生命周期里就再也没名字了，
+   * 模型永远拿不到群名，而面板和日志上一点痕迹都没有。
+   * 成功的结果也不能永不过期：群改名之后机器人一直叫旧名字。
    */
   private async groupName(groupId: number): Promise<string> {
     if (groupId === 0) return '';
+    const now = Date.now();
     const cached = this.groupNames.get(groupId);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      // 取不到的重试间隔短一些：那多半是临时故障
+      const ttl = cached.name === '' ? GROUP_NAME_RETRY_MS : GROUP_NAME_TTL_MS;
+      if (now - cached.at < ttl) return cached.name;
+    }
 
     const sender = this.sender;
     if (!sender) return '';
@@ -1682,7 +1734,15 @@ export class Engine implements EnginePort {
     } catch {
       name = '';
     }
-    this.groupNames.set(groupId, name);
+    this.groupNames.set(groupId, { name, at: Date.now() });
+
+    // 惰性清理：条目数一般等于群数，但换过群、加过大量临时群之后会攒住旧条目
+    if (this.groupNames.size > 1000) {
+      const cutoff = Date.now() - GROUP_NAME_TTL_MS;
+      for (const [id, v] of this.groupNames) {
+        if (v.at < cutoff) this.groupNames.delete(id);
+      }
+    }
     return name;
   }
 }
@@ -1767,24 +1827,6 @@ function toolsUnsupported(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   if (!/HTTP 4\d\d/.test(msg)) return false;
   return /tool|function/i.test(msg);
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (signal?.aborted) {
-      resolve();
-      return;
-    }
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }
 
 /** 供面板使用的只读视图：把引擎的 status 需求与客户端对齐。 */

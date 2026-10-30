@@ -459,6 +459,12 @@ data/qqbot/images/
 | `GHCR_USER` | `caspian-vex` | 令牌所属账号 |
 | `REPO_RAW` | 本仓库 main 的 raw 地址 | 本次安装下载 `compose.yaml` / `qqbot` 命令的源；不持久化（fork 后 `qqbot upgrade` 的自更新仍走上游默认地址） |
 
+另外还有一个**运行时**变量，写在 `etc/env` 里、由程序自己读：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `QQBOT_TRUST_FORWARDED` | 空（不采信） | 设成 `1` 表示"面板前面有可信反代"。只有开了它，登录限流才会按 `X-Forwarded-For` 的**最后一跳**（或 `CF-Connecting-IP`）分桶。默认不采信是因为 compose 把端口直接映射到宿主，转发头可以由客户端随便写——采信它等于每个请求换一个限流桶，登录爆破就不限次了。放在 nginx / Cloudflare 后面时记得在反代上覆盖（而不是追加）这个头 |
+
 ## 手动部署
 
 `install.sh` 干的事就是「准备 `etc/env` + `qqbot.toml` + 起 compose」。要手工来：

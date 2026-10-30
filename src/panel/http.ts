@@ -7,6 +7,7 @@
 // 用现成框架（express 之类）反而要花更多代码把这些行为改回去。
 import { createReadStream, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { isIP } from 'node:net';
 import { join, normalize, resolve, sep } from 'node:path';
 import { rfc3339 } from '../util/time';
 
@@ -20,6 +21,27 @@ export interface ReqCtx {
 }
 
 export type Handler = (ctx: ReqCtx) => void | Promise<void>;
+
+/**
+ * 把一个文件流式写给客户端。
+ *
+ * 为什么不能直接 `createReadStream(p).pipe(res)`：pipe 只接管数据流向，不给
+ * **源流**装 error 监听。stat 通过之后、open 之前文件被删（图池并发删除）、
+ * 权限被改（EACCES）、inode 不可读，ReadStream 都会 emit 'error'；EventEmitter
+ * 在无监听者时直接抛出，整个进程退出。这条路径上任何一个错误都只该断掉这条
+ * 连接，不该带走机器人。
+ */
+export function pipeFile(res: ServerResponse, path: string): void {
+  const stream = createReadStream(path);
+  stream.on('error', () => {
+    res.destroy();
+  });
+  // 客户端中途断开（刷新、关标签）时把读句柄回收，否则 fd 要等 GC 才释放
+  res.on('close', () => {
+    stream.destroy();
+  });
+  stream.pipe(res);
+}
 
 // ---- 响应 ----
 
@@ -291,24 +313,44 @@ function isPrivatePeer(addr: string): boolean {
 /**
  * 取真实客户端 IP。
  *
- * 容器部署下 req.socket.remoteAddress 是 docker 网桥地址，
- * 直接拿它做登录限流等于全局限流，所以反代场景要取它写入的头部。
- * 但头部是客户端可伪造的，因此只在对端确实是本机/内网时才采信
- * （见 isPrivatePeer）：面板直接暴露在公网时，用 socket 地址。
+ * 容器部署下 req.socket.remoteAddress 是 docker 网桥地址，拿它做登录限流
+ * 等于全局限流，所以反代场景要从转发头里取。
+ *
+ * 但转发头是客户端可写的，默认一律不采信：`deploy/compose.yaml` 是
+ * `0.0.0.0:5666` 端口直连，docker-proxy 只做 TCP 转发、不会重写头部，
+ * 客户端的 X-Forwarded-For 会原样送到这里。也就是说"对端是私网"这件事
+ * 完全不能证明"前面有个可信代理"——它是网桥地址，永远成立。
+ * 后果是每个请求换一个头就能拿到新的限流桶，登录爆破不限次。
+ *
+ * 因此改为显式开启 `QQBOT_TRUST_FORWARDED=1` 才采信（部署在 nginx /
+ * Cloudflare 后面时由部署方声明）。开启后取 **最后一跳**：nginx 的
+ * `$proxy_add_x_forwarded_for` 是 append 语义，最右边那一项才是紧邻我们的
+ * 代理写入的；左边的全由客户端自己填。取第一项正是原来那个漏洞。
+ * 每一项都用 net.isIP 校验，非法值直接丢弃——顺手挡住把换行塞进审计日志。
+ *
+ * 默认关闭的代价是"所有登录共用一个限流桶"（对端恒为网关地址）。
+ * 单管理员面板只有一个用户，这个粒度够用，而且是不可绕过的。
  */
 export function clientIP(req: IncomingMessage): string {
   const addr = req.socket.remoteAddress ?? '';
   // IPv4 走 ::ffff:1.2.3.4 这种形式时剥掉前缀
   const direct = addr.startsWith('::ffff:') ? addr.slice(7) : addr;
   if (!isPrivatePeer(direct)) return direct;
+  if (process.env['QQBOT_TRUST_FORWARDED'] !== '1') return direct;
 
   const cf = req.headers['cf-connecting-ip'];
-  if (typeof cf === 'string' && cf !== '') return cf;
+  if (typeof cf === 'string' && isIP(cf) !== 0) return cf;
 
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff !== '') {
-    const idx = xff.indexOf(',');
-    return (idx > 0 ? xff.slice(0, idx) : xff).trim();
+    const hops = xff
+      .split(',')
+      .map((h) => h.trim())
+      .filter((h) => h !== '');
+    // 只看最后一跳。往回找"第一个合法 IP"等于把选择权还给客户端：
+    // 攻击者写 "1.1.1.1, 垃圾" 就能拿到 1.1.1.1 这个桶。
+    const last = hops[hops.length - 1];
+    if (last !== undefined && isIP(last) !== 0) return last;
   }
 
   return direct;
@@ -432,7 +474,7 @@ export function makeStaticHandler(webDir: string): Handler {
       ctx.res.end();
       return;
     }
-    createReadStream(indexPath).pipe(ctx.res);
+    pipeFile(ctx.res, indexPath);
   };
 
   return (ctx) => {
@@ -470,6 +512,6 @@ export function makeStaticHandler(webDir: string): Handler {
       ctx.res.end();
       return;
     }
-    createReadStream(full).pipe(ctx.res);
+    pipeFile(ctx.res, full);
   };
 }

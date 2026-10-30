@@ -26,15 +26,22 @@ export type BoolFlag = (typeof BOOL_FLAGS)[number];
 /**
  * 极简参数解析。
  *
- * 同时认 `--config x` 与 `-config x`：Go 的 flag 包用单横线，
- * 而用户手敲的时候习惯双横线。两种都接受能省掉一次报错。
+ * 同时认 `--config x`、`-config x` 与 `--config=x`：Go 的 flag 包用单横线，
+ * 用户手敲习惯双横线，而 systemd/脚本里又常见等号写法。三种都接受能省掉一次报错。
  */
 export function parseFlags(argv: string[]): Flags {
   const out: Flags = {};
   for (let i = 0; i < argv.length; i++) {
     const raw = argv[i] ?? '';
     if (!raw.startsWith('-')) continue;
-    const name = flagName(raw);
+
+    // 先拆等号再认名字：不拆的话 flagName('--config=/x') 得到 'config=/x'，
+    // 匹配不上任何分支，等号写法就静默失效了。
+    const eq = raw.indexOf('=');
+    const head = eq > 0 ? raw.slice(0, eq) : raw;
+    const inline = eq > 0 ? raw.slice(eq + 1) : undefined;
+    const name = flagName(head);
+
     if (name === 'help' || name === 'h') {
       out.help = true;
       continue;
@@ -46,11 +53,22 @@ export function parseFlags(argv: string[]): Flags {
       out[bool] = true;
       continue;
     }
-    const val = argv[i + 1];
+
+    // 只给已知的带值开关取值。不认识的开关**绝不能**顺手吃掉下一个 token：
+    // `qqbot run --verbose --config /opt/qqbot/etc/qqbot.toml` 会把 --config
+    // 当成 --verbose 的值，于是 config 为 undefined、静默回退到默认路径——
+    // 机器起来后连的是另一份配置，排查起来毫无线索。
+    if (name !== 'config' && name !== 'db') continue;
+
+    const next = argv[i + 1];
+    // 下一个 token 长得像开关就认为这个开关没给值（`--config --db /x` 是写错了，
+    // 但不能因为写错一处把后面的 --db 也一起吞掉）。真要传以横线开头的路径，
+    // 用 --config=./-weird-name 这种等号写法。
+    const val = inline ?? (next !== undefined && !next.startsWith('-') ? next : undefined);
     if (val === undefined) continue;
-    i++;
+    if (inline === undefined) i++;
     if (name === 'config') out.config = val;
-    else if (name === 'db') out.db = val;
+    else out.db = val;
   }
   return out;
 }

@@ -63,6 +63,25 @@ export class SessionStore {
   }
 
   /**
+   * 吊销除指定令牌以外的全部会话，返回吊销条数。
+   *
+   * 改密码、关两步验证之后必须调它：这两种动作的语义就是「把别人赶出去」，
+   * 而会话是 12 小时的，不主动清掉的话，一个已经拿到 Cookie 的攻击者
+   * 在主人改完密码后还能继续用满 12 小时——改密码就成了纯自我安慰。
+   * 保留当前会话，否则用户刚改完就被自己的操作踢下线。
+   */
+  revokeAllExcept(token: string | undefined): number {
+    const keep = token === undefined || token === '' ? '' : tokenDigest(token);
+    let n = 0;
+    for (const k of [...this.sessions.keys()]) {
+      if (k === keep) continue;
+      this.sessions.delete(k);
+      n++;
+    }
+    return n;
+  }
+
+  /**
    * 改名时同步已有会话。
    *
    * 会话里的 user 是登录那一刻的快照：不同步的话，改完用户名后

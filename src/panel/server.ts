@@ -34,6 +34,8 @@ export interface PanelOptions {
   qq?: QQLoginPort;
   /** 机器人要连的反向 WS 端口；登录成功后自动补齐这条监听。 */
   onebotPort?: number;
+  /** 自动补齐反向 WS 时写进监听条目的 token（空串 = 不设 token）。 */
+  onebotAccessToken?: string;
   /** 图池目录（数据目录下的 images/）；不传时图池页显示为空。 */
   imagesDir?: string;
   /**
@@ -70,6 +72,7 @@ export class PanelServer {
       startedAt: this.startedAt,
       qq: opt.qq ?? nullQQLogin(),
       onebotPort: opt.onebotPort,
+      onebotAccessToken: opt.onebotAccessToken,
       imagesDir: opt.imagesDir,
       computer: opt.approvals,
     });
@@ -88,7 +91,10 @@ export class PanelServer {
 
     // 鉴权
     r.add('POST', '/api/auth/login', (ctx) => a.login(ctx));
-    r.add('POST', '/api/auth/logout', this.wrap((c, s) => a.logout(c, s), false));
+    // 登出是状态变更（销毁会话），同样要双提交校验。前端对非 GET 请求统一带
+    // X-CSRF-Token，改成 true 不影响交互；少了它，任何能发跨站 POST 的页面
+    // 都能把管理员踹下线（现在靠 SameSite=Strict 兜着，但那不该是唯一防线）。
+    r.add('POST', '/api/auth/logout', this.wrap((c, s) => a.logout(c, s), true));
     r.add('GET', '/api/auth/status', this.wrap((c, s) => a.authStatus(c, s), false));
     r.add('POST', '/api/auth/password', this.wrap((c, s) => a.changePassword(c, s), true));
     r.add('POST', '/api/auth/username', this.wrap((c, s) => a.changeUsername(c, s), true));
@@ -205,7 +211,22 @@ export class PanelServer {
 
   handler(): (req: ReqCtx['req'], res: ReqCtx['res']) => void {
     return (req, res) => {
-      void this.dispatch(req, res);
+      // 这道 catch 是最后一道网，不是 dispatch 内部 try 的替代：dispatch 里
+      // 仍有可能在 try 之外抛（例如安全头 setHeader 阶段，或未来新加的准备工作）。
+      // 少了它，async 函数的拒绝就没人接管，Node 22 默认把未处理拒绝升级为
+      // 进程退出——一条畸形请求就能让机器人在重启循环里出不来。
+      void this.dispatch(req, res).catch((e: unknown) => {
+        this.log.error('面板请求未捕获异常', { err: e });
+        if (res.headersSent) {
+          res.destroy();
+          return;
+        }
+        try {
+          writeErr(res, 500, '服务器内部错误');
+        } catch {
+          res.destroy();
+        }
+      });
     };
   }
 
@@ -220,7 +241,16 @@ export class PanelServer {
         "script-src 'self'; connect-src 'self'; frame-ancestors 'self'",
     );
 
-    const url = new URL(req.url ?? '/', 'http://panel.local');
+    // new URL 必须在 try 里：Node 的解析器对 "//[" 这类伪 request-target 会抛
+    // ERR_INVALID_URL，而这一行原本在下面 try 之外。Node 的 llhttp 接受这种请求行，
+    // 于是"未登录 + 一条畸形请求"就能把进程打掉。
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://panel.local');
+    } catch {
+      writeErr(res, 400, '请求地址不合法');
+      return;
+    }
     let path: string;
     try {
       path = decodeURIComponent(url.pathname);
@@ -302,13 +332,23 @@ export class PanelServer {
     // 后台补一次反向 WS：扫码后用户往往直接关掉面板，
     // 只靠前端轮询的话机器人会一直连不上（见 Api.tick 的说明）
     this.wsTimer = setInterval(() => {
-      void this.api.tick();
+      void this.tick();
     }, 20_000);
     this.wsTimer.unref();
 
     const addr = server.address() as AddressInfo | null;
     this.log.info('面板已启动', { listen });
     return addr?.port ?? port;
+  }
+
+  /**
+   * 后台心跳的一轮（每 20 秒由定时器调用）。
+   *
+   * 单独暴露成方法而不是留在闭包里，是为了让"补反向 WS"这条副作用有
+   * 唯一且可测的入口——它已经不能挂在 GET /api/qq/status 上了。
+   */
+  async tick(): Promise<void> {
+    await this.api.tick();
   }
 
   /** 优雅退出：先停止接受新连接，再等已有请求（含 SSE）自然结束。 */

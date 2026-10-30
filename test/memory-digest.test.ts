@@ -12,6 +12,7 @@ import type { LlmClient, Message as LlmMessage, Result } from '../src/llm/client
 import { Logger } from '../src/log/logger';
 import { Store } from '../src/store';
 import { defaultSettings, type Settings } from '../src/store/types';
+import { localDay } from '../src/util/time';
 
 const dirs: string[] = [];
 after(() => {
@@ -247,4 +248,82 @@ describe('调度', () => {
       h.cleanup();
     }
   });
+
+  // consider() 是「攒够条数立刻压」那条路，原来完全不看配额：
+  // 话多的群每几十条就压一次，每会话日上限形同虚设。
+  it('攒够条数也要先过日上限，超额不再排队', async () => {
+    const h = make({
+      messages: 10,
+      patch: (v) => {
+        v.memory.digest_force_msgs = 10;
+        v.memory.digest_daily_limit = 6;
+      },
+    });
+    try {
+      seedCursor(h.store, 'group:30000', 6);
+      h.digester.consider('group:30000', h.settings);
+      assert.equal(h.digester.pendingJobs(), 0, '日上限已满就不该再排队');
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(h.calls.length, 0, '一次模型请求都不该发');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('配额没用满时照常排队', async () => {
+    const h = make({
+      messages: 10,
+      patch: (v) => {
+        v.memory.digest_force_msgs = 10;
+        v.memory.digest_daily_limit = 6;
+      },
+    });
+    try {
+      seedCursor(h.store, 'group:30000', 5);
+      h.digester.consider('group:30000', h.settings);
+      assert.equal(h.digester.pendingJobs(), 1);
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(h.calls.length, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('水位线的日期不是今天时，昨天的计数不算数', async () => {
+    const h = make({
+      messages: 10,
+      patch: (v) => {
+        v.memory.digest_force_msgs = 10;
+        v.memory.digest_daily_limit = 6;
+      },
+    });
+    try {
+      // 昨天压满 6 次，今天应该重新有额度
+      seedCursor(h.store, 'group:30000', 6, '2000-01-01');
+      h.digester.consider('group:30000', h.settings);
+      assert.equal(h.digester.pendingJobs(), 1);
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      h.cleanup();
+    }
+  });
 });
+
+/** 直接写一条水位线，模拟「今天已经压过 n 次」。 */
+function seedCursor(
+  store: Store,
+  sessionID: string,
+  digestsToday: number,
+  day: string = localDay(new Date()),
+): void {
+  store.db.run(
+    `INSERT INTO memory_cursors
+       (session_id, owner_name, last_msg_id, last_digest_at, digests_today, day_label, failures, updated_at)
+     VALUES (?, '', 0, 0, ?, ?, 0, 0)
+     ON CONFLICT(session_id) DO UPDATE SET
+       digests_today = excluded.digests_today, day_label = excluded.day_label`,
+    sessionID,
+    digestsToday,
+    day,
+  );
+}

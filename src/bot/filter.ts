@@ -45,7 +45,11 @@ export function decide(
   if (s.blacklist_users.includes(userId)) return denied('用户在黑名单');
 
   if (isPrivate(ev)) {
-    if (!cool.allow(`u:${userId}`, DIRECT_COOLDOWN_MS)) return denied('私聊冷却中');
+    // 私聊用独立的冷却键。和群里共用 u:<qq> 的话，用户刚在群里 @ 过一次、
+    // 紧接着私聊一句，私聊那条会被判成"冷却中"直接丢掉——不回复，正文也
+    // 不进历史，模型后面完全不知道他说过这句。群内跨群共用 u:<qq> 是有意的：
+    // 同一个人在多个群连着刷屏，本来就该一起限。
+    if (!cool.allow(`p:${userId}`, DIRECT_COOLDOWN_MS)) return denied('私聊冷却中');
     return { respond: true, reason: '私聊', text: plainText(ev), direct: true };
   }
 

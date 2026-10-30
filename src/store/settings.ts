@@ -11,15 +11,35 @@ import { nowSec } from '../util/time';
 
 /** 加密字段的存储前缀，用于区分明文与密文，便于平滑升级。 */
 const ENC_PREFIX = 'enc:';
+/**
+ * 明文转义前缀。
+ *
+ * 只在「没有主密钥」时用得上：那种情况下字段只能存明文，而明文本身完全可能
+ * 以 `enc:` 开头（用户粘的 Key 什么样都有可能）。不转义的话，下次读到它会被
+ * 当成密文去解，解不开——一个合法的 Key 就这么废了。
+ */
+const RAW_PREFIX = 'raw:';
+
+/** 只用到 warn/error 的最小日志接口，避免为一行日志把 Logger 拖成构造参数。 */
+export interface SettingsLogger {
+  warn(msg: string, attrs?: Record<string, unknown>): void;
+  error(msg: string, attrs?: Record<string, unknown>): void;
+}
 
 export class SettingsRepo {
   private cache: Settings | null = null;
   private box: Box | null = null;
+  private log: SettingsLogger | null = null;
 
   constructor(private readonly db: Db) {}
 
   setBox(box: Box): void {
     this.box = box;
+  }
+
+  /** 接上日志：读配置的降级路径必须留下痕迹，否则「设置莫名其妙被重置」永远查不到。 */
+  setLog(log: SettingsLogger): void {
+    this.log = log;
   }
 
   /** 返回设置快照（敏感字段已解密）。 */
@@ -45,13 +65,53 @@ export class SettingsRepo {
     return this.saveLocked(next);
   }
 
+  /**
+   * 读一行 JSON 并归一化。
+   *
+   * 这个方法**永不抛异常**。它跑在登录之前（认证要读 admin_user / password_hash），
+   * 一抛就是面板 500；而修面板又必须先登录，于是整个实例锁死，只能删库重来。
+   * 任何读不懂的数据都降级成默认值，并把原始行原样留在库里等人工处理。
+   */
   private load(): Settings {
-    const row = this.db.get<{ json: string }>('SELECT json FROM settings WHERE id = 1');
-    if (!row) return defaultSettings();
+    let text: string;
+    try {
+      const row = this.db.get<{ json: string }>('SELECT json FROM settings WHERE id = 1');
+      if (!row) return defaultSettings();
+      text = row.json;
+    } catch (e) {
+      this.log?.error('读取设置失败（数据库不可用），本次按默认值运行', { err: e });
+      return defaultSettings();
+    }
 
-    const parsed = JSON.parse(row.json) as Settings;
-    this.decryptSensitive(parsed);
-    return normalizeSettings(parsed);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      // 磁盘写一半、手工编辑、旧版本写废都会走到这里。原数据不动，
+      // 用户下次在面板上保存才会覆盖它——在那之前至少还能登录进去修。
+      this.log?.error('设置 JSON 已损坏，本次按默认值运行（原数据仍保留在库里）', {
+        err: e,
+        bytes: text.length,
+      });
+      return defaultSettings();
+    }
+
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      this.log?.error('设置不是对象，本次按默认值运行', { kind: Array.isArray(parsed) ? 'array' : typeof parsed });
+      return defaultSettings();
+    }
+
+    // 先归一化再解密：归一化保证 llm / panel 这些块一定存在且字段类型正确，
+    // 解密才敢直接点 v.llm.api_key。顺序反过来的话，缺一个块就又是一次崩溃。
+    let v: Settings;
+    try {
+      v = normalizeSettings(parsed as Settings);
+    } catch (e) {
+      this.log?.error('设置结构无法修复，本次按默认值运行', { err: e });
+      return defaultSettings();
+    }
+    this.decryptSensitive(v);
+    return v;
   }
 
   private saveLocked(v: Settings): Settings {
@@ -69,31 +129,51 @@ export class SettingsRepo {
   }
 
   private encryptSensitive(v: Settings): Settings {
-    if (!this.box) return v;
-    if (v.llm.api_key !== '' && !v.llm.api_key.startsWith(ENC_PREFIX)) {
-      v.llm.api_key = ENC_PREFIX + this.box.encrypt(v.llm.api_key);
-    }
-    if (v.panel.totp_secret !== '' && !v.panel.totp_secret.startsWith(ENC_PREFIX)) {
-      v.panel.totp_secret = ENC_PREFIX + this.box.encrypt(v.panel.totp_secret);
-    }
+    v.llm.api_key = this.encodeSecret(v.llm.api_key);
+    v.panel.totp_secret = this.encodeSecret(v.panel.totp_secret);
     return v;
   }
 
-  private decryptSensitive(v: Settings): void {
-    if (!this.box) return;
-    if (v.llm.api_key.startsWith(ENC_PREFIX)) {
-      try {
-        v.llm.api_key = this.box.decrypt(v.llm.api_key.slice(ENC_PREFIX.length));
-      } catch (e) {
-        throw new Error(`解密 LLM API Key 失败: ${(e as Error).message}`);
-      }
+  private encodeSecret(plain: string): string {
+    if (plain === '') return '';
+    if (!this.box) {
+      return plain.startsWith(ENC_PREFIX) || plain.startsWith(RAW_PREFIX)
+        ? RAW_PREFIX + plain
+        : plain;
     }
-    if (v.panel.totp_secret.startsWith(ENC_PREFIX)) {
-      try {
-        v.panel.totp_secret = this.box.decrypt(v.panel.totp_secret.slice(ENC_PREFIX.length));
-      } catch (e) {
-        throw new Error(`解密 TOTP 密钥失败: ${(e as Error).message}`);
-      }
+    // 这里刻意**不**判「是不是已经以 enc: 开头」。
+    //
+    // 那个判断的本意是防重复加密，实际效果是：以 enc: 开头的明文 Key 永远不加密，
+    // 而读的时候按前缀一律去解密——存进去的那一刻就注定了下次启动解不开，
+    // 而且整个面板会跟着 500。写入路径拿到的一律是明文（缓存与 get() 都解密过），
+    // 无条件加密才是唯一自洽的做法。
+    return ENC_PREFIX + this.box.encrypt(plain);
+  }
+
+  private decryptSensitive(v: Settings): void {
+    v.llm.api_key = this.decodeSecret('LLM API Key', v.llm.api_key);
+    v.panel.totp_secret = this.decodeSecret('TOTP 密钥', v.panel.totp_secret);
+  }
+
+  private decodeSecret(label: string, raw: string): string {
+    if (raw.startsWith(RAW_PREFIX)) return raw.slice(RAW_PREFIX.length);
+    if (!raw.startsWith(ENC_PREFIX)) return raw;
+
+    const body = raw.slice(ENC_PREFIX.length);
+    if (!this.box) {
+      // 有密文却没有主密钥：说明数据目录换了、密钥文件丢了。
+      // 原样返回会让上层拿密文当明文用（拿去请求模型、拿去验 TOTP），
+      // 表现成「Key 明明填过却一直 401」。当空值处理，至少错误是诚实的。
+      this.log?.error(`${label} 是密文，但当前没有主密钥，已按空值处理`, {});
+      return '';
+    }
+    try {
+      return this.box.decrypt(body);
+    } catch (e) {
+      // 主密钥换了或密文被截断。抛出去会锁死面板（见 load 的说明），
+      // 这里降级成空值：用户还能登进去重新填一次。
+      this.log?.error(`${label} 解密失败，已按空值处理（请在面板重新填写）`, { err: e });
+      return '';
     }
   }
 }

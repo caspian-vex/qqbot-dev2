@@ -52,3 +52,28 @@ test('--help / -h 只置 help，不当成带值参数', () => {
   assert.equal(f.help, true);
   assert.equal(f.db, '/tmp/h.db');
 });
+
+test('不认识的开关不会吃掉后面的参数', () => {
+  // --verbose 没人认，但它绝不能把 --config 当成自己的值：那会让 config
+  // 变成 undefined、静默回退到默认路径，机器起来连的是另一份配置。
+  const f = parseFlags(['--verbose', '--config', '/opt/qqbot/etc/qqbot.toml']);
+  assert.equal(f.config, '/opt/qqbot/etc/qqbot.toml');
+});
+
+test('--k=v 写法等价于 --k v', () => {
+  const f = parseFlags(['--config=/opt/x.toml', '--db=/opt/x.db']);
+  assert.equal(f.config, '/opt/x.toml');
+  assert.equal(f.db, '/opt/x.db');
+
+  // 等号写法也不会把后面的参数再吃一遍
+  const g = parseFlags(['--config=/opt/y.toml', '--keep-totp']);
+  assert.equal(g.config, '/opt/y.toml');
+  assert.equal(g.keepTOTP, true);
+});
+
+test('带值开关缺值时不会吞掉下一个开关', () => {
+  // 这是写错的命令行，但错误的代价不该是"后面的 --db 也丢了"
+  const f = parseFlags(['--config', '--db', '/tmp/x.db']);
+  assert.equal(f.config, undefined);
+  assert.equal(f.db, '/tmp/x.db');
+});

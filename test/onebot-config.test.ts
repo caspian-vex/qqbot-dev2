@@ -58,4 +58,33 @@ describe('ensureWsServer', () => {
     // 已经开着就不要再改
     assert.equal(ensureWsServer(cfg, 3001), false);
   });
+
+  it('新建的监听带上面板传进来的 access token', () => {
+    const cfg: Record<string, unknown> = {};
+    assert.equal(ensureWsServer(cfg, 3001, 'secret-token'), true);
+    const list = cfg.websocketServers as Array<Record<string, unknown>>;
+    // 空 token 等于把 OneBot 控制面（伪造事件、直接调发送接口）敞开
+    assert.equal(list[0]!.token, 'secret-token');
+    // host 必须保持 0.0.0.0：协议端在另一个容器里，绑回环就连不上
+    assert.equal(list[0]!.host, '0.0.0.0');
+  });
+
+  it('已有条目里用户写过的 token 永远不被覆盖', () => {
+    const cfg = {
+      websocketServers: [
+        { port: 3001, enable: true, enabled: true, token: 'user-wrote-this' },
+      ],
+    };
+    assert.equal(ensureWsServer(cfg, 3001, 'our-token'), false);
+    assert.equal(cfg.websocketServers[0]!.token, 'user-wrote-this');
+  });
+
+  it('已有条目 token 为空时补上我们的 token（否则这条监听仍是裸的）', () => {
+    const cfg = { websocketServers: [{ port: 3001, enable: true, enabled: true, token: '' }] };
+    assert.equal(ensureWsServer(cfg, 3001, 'our-token'), true);
+    assert.equal(cfg.websocketServers[0]!.token, 'our-token');
+
+    // 补过之后就是幂等的，不再回写配置（回写会让协议端重启一次）
+    assert.equal(ensureWsServer(cfg, 3001, 'our-token'), false);
+  });
 });

@@ -4,6 +4,7 @@ import { ImageTagRepo } from './image-tags';
 import { MemoryRepo } from './memory';
 import { ScheduledRepo } from './scheduled';
 import { SettingsRepo } from './settings';
+import type { SettingsLogger } from './settings';
 import { PersonaRepo } from './persona';
 import { SessionRepo } from './session';
 import { SessionSettingsRepo } from './session-settings';
@@ -41,6 +42,11 @@ export class Store {
   /** 注入加解密器；之后读写的敏感字段自动走 AES-256-GCM。 */
   setBox(box: Box): void {
     this.settings.setBox(box);
+  }
+
+  /** 接上日志：设置读取的降级路径（损坏、解密失败）必须留下痕迹。 */
+  setLog(log: SettingsLogger): void {
+    this.settings.setLog(log);
   }
 
   close(): void {

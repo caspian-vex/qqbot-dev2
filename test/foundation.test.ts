@@ -12,6 +12,8 @@ import { Box, generateKey, generateToken, safeEqual } from '../src/secret/box';
 import { Store } from '../src/store/index';
 import { loadSecrets } from '../src/config';
 import { defaultSettings, normalizeSettings, parseSessionId, type Settings } from '../src/store/types';
+import { LogHub } from '../src/log/hub';
+import { Logger } from '../src/log/logger';
 
 function tempDb(): { store: Store; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-test-'));
@@ -126,9 +128,76 @@ test('设置默认值与持久化，敏感字段加密落库', () => {
   store.close();
   const reopened = new Store(join(dir, 'qqbot.db'));
   reopened.setBox(Box.fromHex(generateKey()));
-  // 换了密钥，解密必须失败——这里用同一个密钥再验一次
+  // 换了密钥：解密必然失败，但绝不能把面板打死。
+  // 这条路径跑在登录之前，一抛就是 500，而修面板又必须先登录——
+  // 所以降级成空 Key（日志留痕），用户还能登进去重填一次。
+  assert.equal(reopened.settings.get().llm.api_key, '');
   reopened.close();
 
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('设置 JSON 损坏时不抛异常，降级成默认值且保留原始数据', () => {
+  const { store, dir } = tempDb();
+  // 模拟"磁盘写一半"：截断的 JSON
+  store.db.run(`INSERT INTO settings (id, json, updated_at) VALUES (1, ?, 0)`, '{"llm":{"api_');
+  store.close();
+
+  const reopened = new Store(join(dir, 'qqbot.db'));
+  const s = reopened.settings.get();
+  assert.equal(s.llm.base_url, 'https://api.deepseek.com', '应落到出厂默认值');
+  assert.equal(s.panel.admin_user, 'admin');
+
+  // 原始行不能被自动覆盖：用户还得靠它找回配置
+  const row = reopened.db.get<{ json: string }>('SELECT json FROM settings WHERE id = 1');
+  assert.equal(row?.json, '{"llm":{"api_');
+
+  reopened.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('设置缺块/字段类型错乱时能自动补齐，不抛异常', () => {
+  const { store, dir } = tempDb();
+  // 只留一个 bot 块，且 llm 整个缺失、panel 的 admin_user 变成 null
+  store.db.run(
+    `INSERT INTO settings (id, json, updated_at) VALUES (1, ?, 0)`,
+    JSON.stringify({ bot: { wake_words: ['小助手'] }, panel: { admin_user: null } }),
+  );
+  store.close();
+
+  const reopened = new Store(join(dir, 'qqbot.db'));
+  const s = reopened.settings.get();
+  assert.deepEqual(s.bot.wake_words, ['小助手'], '已有的值要保住');
+  assert.equal(s.llm.model, 'deepseek-flash', '缺的块补默认值');
+  assert.equal(s.panel.admin_user, 'admin', 'null 字段补默认值');
+  assert.equal(s.memory.enabled, false);
+  reopened.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('以 enc: 开头的明文 Key 也能正确存取（不会再被当成密文解）', () => {
+  const { store, dir } = tempDb();
+  const key = generateKey();
+  store.setBox(Box.fromHex(key));
+  const weird = 'enc:this-is-a-real-plaintext-key';
+  store.settings.update((v) => {
+    v.llm.api_key = weird;
+  });
+  // 缓存里必须是原文
+  assert.equal(store.settings.get().llm.api_key, weird);
+
+  // 落库的是"再加密一次"的密文，不是原样明文
+  const row = store.db.get<{ json: string }>('SELECT json FROM settings WHERE id = 1');
+  assert.ok(row);
+  assert.equal(row.json.includes(weird), false);
+
+  // 用同一把主密钥重开：必须解回原文。
+  // 老实现里这个值永远不加密、读时又一律去解密，重开即崩。
+  store.close();
+  const reopened = new Store(join(dir, 'qqbot.db'));
+  reopened.setBox(Box.fromHex(key));
+  assert.equal(reopened.settings.get().llm.api_key, weird);
+  reopened.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -394,4 +463,23 @@ test('联网搜索：上一版留下的第三方搜索源字段会被清掉', ()
   normalizeSettings(v);
   const keys = Object.keys(v.search).sort();
   assert.deepEqual(keys, ['enabled', 'max_calls', 'max_results', 'timeout_sec']);
+});
+
+test('日志保留错误的堆栈与 cause 链', () => {
+  // 只记 e.message 的话，Node 的网络错误基本等于没写日志：
+  // message 往往只有一句 "fetch failed"，真正的原因在 cause 里。
+  const hub = new LogHub(10);
+  const log = Logger.create({ level: 'error', format: 'json', hub });
+  const err = new Error('fetch failed', {
+    cause: new Error('connect ECONNREFUSED 127.0.0.1:7897'),
+  });
+  // 用 debug 级别：hub 不受 level 限制，但 stdout 会被过滤，测试输出干净
+  log.debug('调用模型失败', { err });
+
+  const line = hub.recent(1)[0];
+  assert.ok(line, '应该记到 hub');
+  const text = line.attrs?.['err'] ?? '';
+  assert.match(text, /Error: fetch failed/, '要带错误类型');
+  assert.match(text, /ECONNREFUSED/, '要带 cause');
+  assert.match(text, /at /, '要带堆栈位置');
 });

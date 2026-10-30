@@ -76,6 +76,15 @@ describe('回复分段', () => {
     assert.deepEqual(out, ['一。二。', '三。四。']);
   });
 
+  it('累积长度按拼好的整段算，空白多时也不会超限', () => {
+    // 句子保留了原文空白（"Hello! How" 里的空格），若按 trim 后的长度累加、
+    // 却把未 trim 的原文塞进去，段长会随空白量漂出去。
+    const out = split('aaa。   bbb。   ccc。', { maxSegments: 9, maxRunes: 10 });
+    for (const s of out) {
+      assert.ok([...s].length <= 10, `段超限: ${JSON.stringify(s)}`);
+    }
+  });
+
   it('超出段数上限时合并到最后一段并补省略号', () => {
     const text = '这是第一句话。这是第二句话。这是第三句话。这是第四句话。';
     const out = split(text, { maxSegments: 2, maxRunes: 8 });
@@ -96,6 +105,17 @@ describe('回复分段', () => {
   it('清理 Markdown 记号并折叠空行', () => {
     assert.equal(stripMarkdown('**加粗** 和 `代码`'), '加粗 和 代码');
     assert.equal(stripMarkdown('# 标题\n\n\n\n正文'), '标题\n\n正文');
+    assert.equal(stripMarkdown('- 第一项\n- 第二项'), '第一项\n第二项');
+    assert.equal(stripMarkdown('### 小标题'), '小标题');
+  });
+
+  it('清理 Markdown 不会改坏算式与正文里的减号/星号', () => {
+    // 这两条规则原本是全文替换，'5 - 3 = 2' 会变成 '53 = 2'；
+    // 而这段清理对每一条回复都生效，用户和模型都不会察觉内容被改了。
+    assert.equal(stripMarkdown('5 - 3 = 2'), '5 - 3 = 2');
+    assert.equal(stripMarkdown('2 * 3 = 6'), '2 * 3 = 6');
+    assert.equal(stripMarkdown('C# 语言'), 'C# 语言');
+    assert.equal(stripMarkdown('docker run - d'), 'docker run - d');
   });
 });
 
@@ -149,6 +169,33 @@ describe('触发判断', () => {
     assert.equal(d.reason, '被@');
     assert.equal(d.text, '今天几号');
     assert.equal(d.direct, true);
+  });
+
+  it('私聊与群里的冷却互不影响', () => {
+    // 同一个 Cooldown 里两个键：私聊 p:<qq>、群内 u:<qq>。
+    // 共用一个键的话，用户刚在群里 @ 过一次、紧接着私聊一句，
+    // 私聊那条会被判"冷却中"直接丢掉——不回复，正文也不进历史。
+    const cool = new Cooldown();
+    const s = botSettings({ wake_words: [] });
+
+    const priv = decide(ev({ message_type: 'private', group_id: 0 }), s, 10000, cool);
+    assert.equal(priv.respond, true);
+    assert.equal(priv.reason, '私聊');
+
+    const inGroup = decide(
+      ev({ message: [{ type: 'at', data: { qq: '10000' } }, { type: 'text', data: { text: 'hi' } }] }),
+      s,
+      10000,
+      cool,
+    );
+    assert.equal(inGroup.respond, true, '群里的 @ 不该被私聊的冷却压掉');
+    assert.equal(inGroup.reason, '被@');
+
+    // 反方向同理：紧接着再私聊一句仍然可以（私聊自己的冷却早就过了吗？没过，
+    // 所以这里再立刻私聊应当仍被私聊冷却挡住——冷却本身还在工作）
+    const priv2 = decide(ev({ message_type: 'private', group_id: 0 }), s, 10000, cool);
+    assert.equal(priv2.respond, false);
+    assert.equal(priv2.reason, '私聊冷却中');
   });
 
   it('@ 别人不触发', () => {
@@ -314,6 +361,34 @@ describe('任务队列', () => {
     assert.equal(q.concurrency, 1);
     q.setConcurrency(Number.NaN);
     assert.equal(q.concurrency, 1);
+  });
+
+  it('accepts() 与 submit() 判定一致（定时消息靠它先问空位）', () => {
+    const q = new TaskQueue(4, 1);
+    assert.equal(q.accepts('s'), true);
+    q.submit('s', () => undefined);
+    assert.equal(q.accepts('s'), false, '排满后不能再塞');
+    assert.equal(q.accepts('other'), true, '别的会话不受影响');
+  });
+
+  it('任务抛错时回调 onError，而不是静默消失', async () => {
+    const seen: [string, unknown][] = [];
+    const q = new TaskQueue(1, 3, (key, err) => seen.push([key, err]));
+    q.submit('s', () => {
+      throw new Error('db is locked');
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]![0], 's');
+    assert.equal((seen[0]![1] as Error).message, 'db is locked');
+
+    // 前一个任务失败不能把整条链断掉
+    let ran = false;
+    q.submit('s', () => {
+      ran = true;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(ran, true);
   });
 });
 
@@ -685,6 +760,47 @@ describe('模型客户端对接真实 HTTP', () => {
       await assert.rejects(
         () => c.chatStream(cfg(f.base), [{ role: 'user', content: 'hi' }], () => undefined),
         /模型返回空结果/,
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('网关不认 thinking 字段时自动降级重发，之后不再重复探测', async () => {
+    const f = await fake((n) =>
+      n === 1
+        ? {
+            status: 400,
+            body: JSON.stringify({ error: { message: "Unrecognized request argument: thinking" } }),
+          }
+        : { status: 200, body: JSON.stringify({ choices: [{ message: { content: '好' } }] }) },
+    );
+    try {
+      const c = new LlmClient();
+      const r = await c.chat(cfg(f.base), [{ role: 'user', content: 'hi' }]);
+      assert.equal(r.content, '好');
+      assert.deepEqual(f.requests[0]!.body.thinking, { type: 'disabled' }, '第一次按默认带');
+      assert.equal('thinking' in f.requests[1]!.body, false, '被拒后不再带');
+
+      // 第二个请求不该再撞一次 400
+      await c.chat(cfg(f.base), [{ role: 'user', content: 'hi' }]);
+      assert.equal(f.requests.length, 3);
+      assert.equal('thinking' in f.requests[2]!.body, false);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('200 但响应体里带 error 时，报出真实原因而不是"空结果"', async () => {
+    const f = await fake(() => ({
+      status: 200,
+      body: JSON.stringify({ error: { message: '余额不足', type: 'insufficient_quota' } }),
+    }));
+    try {
+      const c = new LlmClient();
+      await assert.rejects(
+        () => c.chat(cfg(f.base), [{ role: 'user', content: 'hi' }]),
+        /模型返回错误: 余额不足/,
       );
     } finally {
       await f.close();

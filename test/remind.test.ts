@@ -50,6 +50,38 @@ describe('时间换算', () => {
     assert.equal(new Date(r.dueAt).getDate(), 30);
   });
 
+  it('刚刚到点（过去几秒）仍按今天算，不会被推到明天', () => {
+    // 30 秒宽限是给"模型算出 8:00，而现在是 8:00:05"留的。判据写反的话
+    // 未来 30 秒内的时刻也会被推走：12:59:40 说"13:00 提醒我"，等 20 秒
+    // 的事变成等一天，而且日志里没有任何异常。
+    const now1 = new Date(2026, 9, 29, 13, 0, 0, 0);
+    now1.setSeconds(5);
+    const r = parseDueAt('13:00', Number.NaN, now1);
+    assert.ok(!('error' in r));
+    if ('error' in r) return;
+    assert.equal(new Date(r.dueAt).getDate(), 29);
+    // 已经过去了：立即到期，由下一次 tick 发出去
+    assert.ok(r.dueAt <= now1.getTime());
+  });
+
+  it('快到整点（未来 20 秒）仍按今天算', () => {
+    const now2 = new Date(2026, 9, 29, 12, 59, 40, 0);
+    const r = parseDueAt('13:00', Number.NaN, now2);
+    assert.ok(!('error' in r));
+    if ('error' in r) return;
+    const d = new Date(r.dueAt);
+    assert.equal(d.getDate(), 29);
+    assert.equal(d.getHours(), 13);
+  });
+
+  it('过去超过 30 秒才按明天算', () => {
+    const now3 = new Date(2026, 9, 29, 13, 0, 5, 0);
+    const r = parseDueAt('12:59', Number.NaN, now3);
+    assert.ok(!('error' in r));
+    if ('error' in r) return;
+    assert.equal(new Date(r.dueAt).getDate(), 30);
+  });
+
   it('相对分钟直接加，不经过日期推算', () => {
     const r = parseDueAt('', 90, now());
     assert.ok(!('error' in r));

@@ -83,3 +83,31 @@ export function isPeak(now: Date = new Date()): boolean {
   const h = now.getHours();
   return (h >= 9 && h < 12) || (h >= 14 && h < 18);
 }
+
+/**
+ * 可被 abort 打断的 sleep，放在这里是因为它有好几个调用方。
+ *
+ * 关键在于**正常超时也要摘监听器**。`{ once: true }` 只在事件真的触发时
+ * 才移除监听，而传进来的 signal 往往是进程级的（main 的 ac.signal 活到退出），
+ * 于是每条消息的分段间隔、每次未登录时的 5 秒轮询都会往它上面挂一个
+ * 永不释放的闭包：跑一天就是上万个，同时触发 Node 的 MaxListeners 告警。
+ */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted === true) {
+      resolve();
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(t);
+      resolve();
+    };
+    const done = (): void => {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    const t = setTimeout(done, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}

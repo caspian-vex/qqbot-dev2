@@ -5,7 +5,9 @@
 // 一个必须讲清楚的细节：DeepSeek 的思考模式默认是开启的。
 // 机器人场景必须显式关闭——否则每条消息都要先跑一段思维链，
 // 首字延迟从 1 秒级涨到 5 秒级，token 也翻几倍。
-// 所以请求体里永远带 thinking.type，而不是"需要时才加"。
+// 所以请求体默认带 thinking.type；但它是 DeepSeek 扩展而不是 OpenAI 标准，
+// 严格校验的网关会直接 400，那种情况下自动降级成不带（见 once）。
+import { sleep } from '../util/time';
 
 /** 一张图的内容块：OpenAI 兼容的 image_url，url 用 `data:` 形式内联。 */
 export type ImagePart = { type: 'image_url'; image_url: { url: string } };
@@ -129,7 +131,8 @@ interface ChatRequest {
   stream: boolean;
   temperature?: number;
   max_tokens?: number;
-  thinking: { type: 'enabled' | 'disabled' };
+  /** 严格校验的网关（OpenAI 本体、部分 vLLM/中转）见到不认识的字段直接 400，所以可省。 */
+  thinking?: { type: 'enabled' | 'disabled' };
   stream_options?: { include_usage: boolean };
   tools?: ToolDef[];
   tool_choice?: 'auto';
@@ -163,14 +166,19 @@ function buildRequest(
   msgs: Message[],
   stream: boolean,
   tools?: ToolDef[],
+  sendThinking = true,
 ): ChatRequest {
   const req: ChatRequest = {
     model: cfg.model,
     messages: msgs,
     stream,
     max_tokens: cfg.maxTokens,
-    thinking: { type: cfg.thinking ? 'enabled' : 'disabled' },
   };
+  // 默认带 thinking.type（DeepSeek 的思考模式默认开启，必须显式关掉，
+  // 否则每条消息都要先跑思维链，首字延迟从 1 秒级涨到 5 秒级）。
+  // 但这个字段是 DeepSeek 扩展，不是 OpenAI 标准：严格校验的网关会直接 400。
+  // 所以第一次被拒之后由调用方把它关掉（见 once 里的降级）。
+  if (sendThinking) req.thinking = { type: cfg.thinking ? 'enabled' : 'disabled' };
   if (!cfg.thinking) {
     // 非思考模式下 temperature 才生效；思考模式会忽略它
     req.temperature = cfg.temperature;
@@ -199,6 +207,14 @@ export function endpoint(baseURL: string): string {
 }
 
 export class LlmClient {
+  /**
+   * 端点是否接受 `thinking` 字段。
+   *
+   * 一旦被 400 明确拒绝过就置 false，之后所有请求都不再带——否则每条消息
+   * 都要先撞一次 400 再重试，等于把首字延迟翻倍。进程内只探测一次。
+   */
+  private sendThinking = true;
+
   /**
    * 发起一次非流式对话，返回完整文本。
    *
@@ -286,7 +302,7 @@ export class LlmClient {
       resp = await fetch(endpoint(cfg.baseURL), {
         method: 'POST',
         headers,
-        body: JSON.stringify(buildRequest(cfg, msgs, stream, tools)),
+        body: JSON.stringify(buildRequest(cfg, msgs, stream, tools, this.sendThinking)),
         signal: combined,
       });
     } catch (e) {
@@ -295,6 +311,12 @@ export class LlmClient {
 
     if (resp.status !== 200) {
       const raw = (await resp.text().catch(() => '')).slice(0, 4096);
+      // 400 且错误体点名 thinking：说明这个端点不认这个扩展字段。
+      // 关掉它重发一次（只会发生一次：sendThinking 已是 false 就不会再进这里）。
+      if (resp.status === 400 && this.sendThinking && /thinking/i.test(raw)) {
+        this.sendThinking = false;
+        return this.once(cfg, msgs, stream, onDelta, timeoutMs, signal, tools);
+      }
       let msg = raw.trim();
       try {
         const parsed = JSON.parse(raw) as ChatResponse;
@@ -313,6 +335,15 @@ export class LlmClient {
         out = (await resp.json()) as ChatResponse;
       } catch (e) {
         throw new RetryableError(`解析响应失败: ${(e as Error).message}`);
+      }
+      // 有的网关/中转把错误塞进 200 的响应体里（额度用完、上游 5xx、内容审核
+      // 都见过）。不先看这个字段的话，下面只会报"模型返回空结果"，
+      // 用户拿着这句话完全查不到原因。
+      if (out.error !== undefined && out.error !== null) {
+        const detail = out.error.message?.trim() ?? '';
+        throw new Error(
+          detail === '' ? `模型返回错误（${out.error.type ?? '未知类型'}）` : `模型返回错误: ${detail}`,
+        );
       }
       const content = out.choices?.[0]?.message?.content ?? '';
       if (out.choices === undefined || out.choices.length === 0) {
@@ -424,18 +455,4 @@ function isCJK(r: number): boolean {
     (r >= 0x3040 && r <= 0x30ff) || // 日文假名
     (r >= 0xac00 && r <= 0xd7af) // 韩文
   );
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }

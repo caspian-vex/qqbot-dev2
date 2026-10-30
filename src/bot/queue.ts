@@ -59,6 +59,14 @@ export class TaskQueue {
   constructor(
     private maxConcurrent = 3,
     private readonly maxDepth = 3,
+    /**
+     * 任务抛错时的回调。
+     *
+     * 不给的话链只能 `.catch(() => undefined)`——那是必要的（一个任务失败
+     * 不能让整条链断掉），但静默到连日志都没有就过头了：数据库写失败时
+     * 用户看到的是"机器人不理我"，面板统计里这条消息不存在，日志一片空白。
+     */
+    private readonly onError?: (key: string, err: unknown) => void,
   ) {}
 
   /**
@@ -82,6 +90,17 @@ export class TaskQueue {
    * 排队越久回复越滞后，用户早就聊到别的话题了，
    * 迟到的回复比不回复更糟。
    */
+  /**
+   * 这个会话还能不能再排一个任务。
+   *
+   * 给"到点必须发"的调用方（定时消息）在不丢弃任务的前提下先问一句：
+   * 先 submit 再改状态会在排队超过一个 tick 时重复发送，先改状态再 submit
+   * 又会在队列满时永久丢失，只有"先确认有空位"两头都能保住。
+   */
+  accepts(key: string): boolean {
+    return (this.depth.get(key) ?? 0) < this.maxDepth;
+  }
+
   submit(key: string, fn: () => Promise<void> | void): boolean {
     const cur = this.depth.get(key) ?? 0;
     if (cur >= this.maxDepth) return false;
@@ -89,8 +108,13 @@ export class TaskQueue {
 
     const prev = this.chains.get(key) ?? Promise.resolve();
     // catch 吞掉异常：一个任务失败不能让整条链断掉，
-    // 否则这个会话后面的消息永远不会被处理
-    const next = prev.then(() => this.run(key, fn)).catch(() => undefined);
+    // 否则这个会话后面的消息永远不会被处理。但要留一条日志，
+    // 否则"消息静默消失"这种故障永远查不到原因。
+    const next = prev
+      .then(() => this.run(key, fn))
+      .catch((e: unknown) => {
+        this.onError?.(key, e);
+      });
     this.chains.set(key, next);
 
     void next.finally(() => {

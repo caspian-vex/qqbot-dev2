@@ -10,14 +10,17 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import net from 'node:net';
+import { PassThrough } from 'node:stream';
 import { after, describe, it } from 'node:test';
 import { LogHub } from '../src/log/hub';
 import { Logger } from '../src/log/logger';
 import { hashPassword, newTOTPSecret, totpCode, verifyPassword, verifyTOTP } from '../src/panel/auth';
 import { ApprovalQueue } from '../src/bot/computer-approval';
 import { normalizeUsername } from '../src/panel/api';
-import { assignOnto, clientIP, encodeJSON, type ReqCtx } from '../src/panel/http';
+import { assignOnto, clientIP, encodeJSON, pipeFile, type ReqCtx } from '../src/panel/http';
 import { PanelServer, splitHostPort as splitHostPortForTest } from '../src/panel/server';
+import type { QQLoginPort } from '../src/panel/ports';
 import { Store } from '../src/store';
 
 const PASSWORD = 'correct-horse-battery';
@@ -39,7 +42,16 @@ interface Harness {
 }
 
 /** 起一个用完即弃的面板实例。每个用例独立实例，避免登录限流互相干扰。 */
-async function harness(opts: { password?: string; totp?: boolean; approvals?: ApprovalQueue } = {}): Promise<Harness> {
+async function harness(
+  opts: {
+    password?: string;
+    totp?: boolean;
+    approvals?: ApprovalQueue;
+    qq?: QQLoginPort;
+    onebotPort?: number;
+    onebotAccessToken?: string;
+  } = {},
+): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'qqbot-panel-'));
   tmpDirs.push(dir);
 
@@ -60,6 +72,9 @@ async function harness(opts: { password?: string; totp?: boolean; approvals?: Ap
     hub: new LogHub(50),
     webDir: join(process.cwd(), 'web', 'dist'),
     approvals: opts.approvals,
+    qq: opts.qq,
+    onebotPort: opts.onebotPort,
+    onebotAccessToken: opts.onebotAccessToken,
   });
   const port = await panel.listen('127.0.0.1:0');
 
@@ -160,16 +175,52 @@ describe('客户端 IP 解析', () => {
   const req = (remoteAddress: string, headers: Record<string, string>): ReqCtx['req'] =>
     ({ socket: { remoteAddress }, headers }) as unknown as ReqCtx['req'];
 
+  const TRUST = 'QQBOT_TRUST_FORWARDED';
+  /** 临时打开"信任转发头"，跑完恢复原值。 */
+  function trusting(fn: () => void): void {
+    const old = process.env[TRUST];
+    process.env[TRUST] = '1';
+    try {
+      fn();
+    } finally {
+      if (old === undefined) delete process.env[TRUST];
+      else process.env[TRUST] = old;
+    }
+  }
+
   it('公网直连不采信转发头（否则换个头就是一次新的登录尝试）', () => {
     assert.equal(clientIP(req('203.0.113.9', { 'x-forwarded-for': '1.1.1.1' })), '203.0.113.9');
     assert.equal(clientIP(req('::ffff:203.0.113.9', { 'cf-connecting-ip': '1.1.1.1' })), '203.0.113.9');
   });
 
-  it('对端是本机/内网（反代、容器网关）时才采信转发头', () => {
-    assert.equal(clientIP(req('172.18.0.1', { 'x-forwarded-for': '1.1.1.1, 2.2.2.2' })), '1.1.1.1');
-    assert.equal(clientIP(req('::ffff:172.18.0.1', { 'x-forwarded-for': '1.1.1.1' })), '1.1.1.1');
-    assert.equal(clientIP(req('::1', { 'cf-connecting-ip': '3.3.3.3' })), '3.3.3.3');
-    assert.equal(clientIP(req('192.168.1.5', { 'x-forwarded-for': '4.4.4.4' })), '4.4.4.4');
+  it('默认不采信转发头：docker-proxy 会把客户端写的头原样透传', () => {
+    // 这是关键回归：对端是网桥地址不能证明"前面有可信代理"。
+    // 采信了的话，每个请求换一个 XFF 就是一次新的登录尝试，限流形同虚设。
+    assert.equal(
+      clientIP(req('172.18.0.1', { 'x-forwarded-for': '1.1.1.1', 'cf-connecting-ip': '1.1.1.1' })),
+      '172.18.0.1',
+    );
+  });
+
+  it('显式开启信任后取转发头最后一跳（最右边才是紧邻的代理写的）', () => {
+    trusting(() => {
+      assert.equal(clientIP(req('172.18.0.1', { 'x-forwarded-for': '1.1.1.1, 2.2.2.2' })), '2.2.2.2');
+      assert.equal(clientIP(req('::ffff:172.18.0.1', { 'x-forwarded-for': '1.1.1.1' })), '1.1.1.1');
+      assert.equal(clientIP(req('::1', { 'cf-connecting-ip': '3.3.3.3' })), '3.3.3.3');
+      assert.equal(clientIP(req('192.168.1.5', { 'x-forwarded-for': '4.4.4.4' })), '4.4.4.4');
+    });
+  });
+
+  it('转发头里的非 IP 值被忽略（挡住往审计日志里塞换行）', () => {
+    trusting(() => {
+      // 最后一跳不是合法 IP 就整个不信，不给"往回找第一个合法值"的机会——
+      // 那等于把桶的选择权还给客户端
+      assert.equal(clientIP(req('172.18.0.1', { 'x-forwarded-for': '1.1.1.1, evil\n2.2.2.2' })), '172.18.0.1');
+      assert.equal(clientIP(req('172.18.0.1', { 'x-forwarded-for': 'not-an-ip' })), '172.18.0.1');
+      assert.equal(clientIP(req('172.18.0.1', { 'cf-connecting-ip': 'x\ny' })), '172.18.0.1');
+      // 尾部空项（部分代理会留一个逗号）不算非法
+      assert.equal(clientIP(req('172.18.0.1', { 'x-forwarded-for': '1.1.1.1, ' })), '1.1.1.1');
+    });
   });
 
   it('没有转发头时用 socket 地址，IPv4 映射形式会被剥前缀', () => {
@@ -411,12 +462,29 @@ describe('鉴权与 CSRF', () => {
       const c = await authed(h);
       const out = await fetch(`${h.base}/api/auth/logout`, {
         method: 'POST',
-        headers: { Cookie: c.header },
+        headers: { Cookie: c.header, 'X-CSRF-Token': c.csrf },
       });
       assert.equal(out.status, 200);
 
       const after = await fetch(`${h.base}/api/settings`, { headers: { Cookie: c.header } });
       assert.equal(after.status, 401);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('登出也要求 CSRF 令牌（否则任何跨站 POST 都能把人踹下线）', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const out = await fetch(`${h.base}/api/auth/logout`, {
+        method: 'POST',
+        headers: { Cookie: c.header },
+      });
+      assert.equal(out.status, 403);
+      // 会话没被销毁
+      const still = await fetch(`${h.base}/api/settings`, { headers: { Cookie: c.header } });
+      assert.equal(still.status, 200);
     } finally {
       await h.stop();
     }
@@ -518,6 +586,16 @@ describe('设置接口', () => {
       const cases: [unknown, string][] = [
         [{ llm: { base_url: '' } }, '模型地址不能为空'],
         [{ llm: { base_url: 'ftp://x' } }, '模型地址必须以 http(s):// 开头'],
+        [{ llm: { base_url: '不是网址' } }, '模型地址不是合法的 URL'],
+        // SSRF：地址会带着真实 API Key 一起被请求，链路本地/元数据地址一律拒
+        [
+          { llm: { base_url: 'http://169.254.169.254/latest/meta-data/' } },
+          '模型地址不能指向链路本地或云元数据地址',
+        ],
+        [
+          { llm: { base_url: 'http://[::ffff:169.254.169.254]/' } },
+          '模型地址不能指向链路本地或云元数据地址',
+        ],
         [{ llm: { model: '' } }, '模型名称不能为空'],
         [{ llm: { max_tokens: 99999 } }, '最大输出 token 应在 1-8192 之间'],
         [{ llm: { timeout_sec: 0 } }, '超时时间应在 1-300 秒之间'],
@@ -626,6 +704,57 @@ describe('路由语义（对齐 Go ServeMux）', () => {
     } finally {
       await h.stop();
     }
+  });
+});
+
+describe('请求入口健壮性', () => {
+  it('畸形的请求行不会让进程退出，服务仍可用', async () => {
+    const h = await harness();
+    try {
+      // Node 的 llhttp 接受 "//[" 这种 request-target，但 new URL 解析会抛
+      // ERR_INVALID_URL。这条路径在鉴权之前，任何人一条请求就能触发。
+      const raw = await new Promise<string>((resolve, reject) => {
+        const sock = net.connect(Number(new URL(h.base).port), '127.0.0.1', () => {
+          sock.write('GET //[ HTTP/1.1\r\nHost: x\r\n\r\n');
+        });
+        let buf = '';
+        sock.setEncoding('utf8');
+        sock.on('data', (d: string) => {
+          buf += d;
+        });
+        sock.on('error', reject);
+        sock.on('close', () => resolve(buf));
+        setTimeout(() => sock.destroy(), 2000);
+      });
+      assert.match(raw, /HTTP\/1\.1 400/, '畸形地址应当被当成 400 处理，而不是抛异常');
+
+      // 进程还活着：后面的正常请求照旧能通
+      const res = await fetch(`${h.base}/healthz`);
+      assert.equal(res.status, 200);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('静态文件在 stat 之后消失只断连接，不抛未捕获异常', async () => {
+    const h = await harness();
+    try {
+      const res = await fetch(`${h.base}/app.js`);
+      assert.equal(res.status, 200);
+      await res.text();
+    } finally {
+      await h.stop();
+    }
+    // pipeFile 对不存在的路径：只触发 error → destroy，不冒泡成未捕获异常
+    const fake = new PassThrough();
+    let destroyed = false;
+    fake.destroy = (() => {
+      destroyed = true;
+      return fake;
+    }) as typeof fake.destroy;
+    pipeFile(fake as unknown as Parameters<typeof pipeFile>[0], join(tmpdir(), 'qqbot-does-not-exist-12345.bin'));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(destroyed, true, '读流报错时应断掉这条连接');
   });
 });
 
@@ -974,6 +1103,31 @@ describe('密码与 TOTP 管理接口', () => {
     }
   });
 
+  it('改密会踢掉其他设备，只留当前会话', async () => {
+    const h = await harness();
+    try {
+      // 两台"设备"各自登录
+      const a = await authed(h);
+      const b = await authed(h);
+
+      const res = await fetch(`${h.base}/api/auth/password`, {
+        method: 'POST',
+        headers: { Cookie: a.header, 'Content-Type': 'application/json', 'X-CSRF-Token': a.csrf },
+        body: JSON.stringify({ old: PASSWORD, new: 'a-very-long-password' }),
+      });
+      assert.equal(res.status, 200);
+      const out = (await res.json()) as { revoked: number };
+      assert.equal(out.revoked, 1, '应吊销另一条会话');
+
+      // 当前设备还能用，另一台立刻 401——会话有效期 12 小时，
+      // 不主动清掉的话攻击者改完密码还能继续用半天
+      assert.equal((await fetch(`${h.base}/api/settings`, { headers: { Cookie: a.header } })).status, 200);
+      assert.equal((await fetch(`${h.base}/api/settings`, { headers: { Cookie: b.header } })).status, 401);
+    } finally {
+      await h.stop();
+    }
+  });
+
   it('TOTP setup → enable → 登录需要验证码 → disable', async () => {
     const h = await harness();
     try {
@@ -1183,6 +1337,78 @@ describe('协议端原生界面已移除', () => {
       assert.match(res.headers.get('content-type') ?? '', /text\/html/);
       const body = await res.text();
       assert.ok(!body.includes('"code"'), '不应透出协议端的 JSON 响应');
+    } finally {
+      await h.stop();
+    }
+  });
+});
+
+describe('自动补反向 WS 的触发时机', () => {
+  /**
+   * 造一个"已登录"的协议端桩，记录它被写了几次网络配置。
+   *
+   * 这条契约值得钉死的原因是 GET 语义：状态接口被前端轮询、被浏览器预取、
+   * 被爬虫扫到都会执行，一旦它顺手改协议端配置，等于任何一次页面加载
+   * 都在重启 OneBot 服务。
+   */
+  function qqStub(): { port: QQLoginPort; writes: string[] } {
+    const writes: string[] = [];
+    const port: QQLoginPort = {
+      configured: true,
+      status: () =>
+        Promise.resolve({
+          login: true,
+          offline: false,
+          uin: '10001',
+          nick: 'bot',
+          phase: '',
+          error: '',
+        }),
+      qrcode: () =>
+        Promise.resolve({ image: '', content: '', logined: true, stale: false }),
+      loginInfo: () => Promise.resolve({ uin: '10001', nick: 'bot' }),
+      quickLoginList: () => Promise.resolve([]),
+      quickLogin: () => Promise.resolve(),
+      logout: () => Promise.resolve(),
+      networkConfig: () => Promise.resolve({ config: { network: {} }, asString: false }),
+      setNetworkConfig: (cfg) => {
+        writes.push(JSON.stringify(cfg));
+        return Promise.resolve();
+      },
+    };
+    return { port, writes };
+  }
+
+  it('GET /api/qq/status 只读状态，不写协议端配置', async () => {
+    const stub = qqStub();
+    const h = await harness({ qq: stub.port, onebotPort: 3001 });
+    try {
+      const c = await authed(h);
+      for (let i = 0; i < 3; i++) {
+        const res = await fetch(`${h.base}/api/qq/status`, { headers: { Cookie: c.header } });
+        assert.equal(res.status, 200);
+      }
+      // 补 WS 是异步的，等一拍再断言"确实一次都没写"
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stub.writes.length, 0);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('后台 tick 仍会把反向 WS 补上，并带上 access token', async () => {
+    const stub = qqStub();
+    const h = await harness({
+      qq: stub.port,
+      onebotPort: 3001,
+      onebotAccessToken: 'panel-token',
+    });
+    try {
+      await h.panel.tick();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stub.writes.length, 1);
+      assert.match(stub.writes[0]!, /panel-token/);
+      assert.match(stub.writes[0]!, /"port":3001/);
     } finally {
       await h.stop();
     }

@@ -28,6 +28,31 @@ function quoteIfNeeded(v: string): string {
   return /[\s"'=]/.test(v) || v === '' ? JSON.stringify(v) : v;
 }
 
+/**
+ * 把错误展开成一行可读文本：消息 + 位置 + 原因链。
+ *
+ * 原来只取 e.message。对 Node 的网络错误来说，message 往往只有一句
+ * "fetch failed"，真正的原因（ECONNREFUSED / 证书过期 / DNS 失败）在 cause 里，
+ * 出错位置在 stack 里——少这两样，日志基本等于没写。
+ * stack 截断到 500 字：完整堆栈会让一条日志占满整屏，也撑爆面板 hub。
+ */
+function describeError(e: Error): string {
+  const base = typeof e.stack === 'string' && e.stack !== '' ? e.stack : e.message;
+  let out = base.length > 500 ? `${base.slice(0, 500)}…` : base;
+
+  let cause: unknown = (e as { cause?: unknown }).cause;
+  for (let depth = 0; cause !== undefined && cause !== null && depth < 3; depth++) {
+    if (cause instanceof Error) {
+      out += ` <- ${cause.message === '' ? cause.name : cause.message}`;
+      cause = (cause as { cause?: unknown }).cause;
+    } else {
+      out += ` <- ${String(cause)}`;
+      break;
+    }
+  }
+  return out;
+}
+
 export class Logger {
   private constructor(
     private readonly level: LogLevel,
@@ -65,7 +90,7 @@ export class Logger {
     if (attrs) {
       for (const [k, v] of Object.entries(attrs)) {
         if (v === undefined || v === null) continue;
-        flat[k] = v instanceof Error ? v.message : String(v);
+        flat[k] = v instanceof Error ? describeError(v) : String(v);
       }
     }
 
