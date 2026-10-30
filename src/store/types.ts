@@ -104,6 +104,50 @@ export interface ContextSettings {
 }
 
 /**
+ * 长期记忆配置。
+ *
+ * 机制是「按天压缩」：把一段对话交给模型压成「概述 + 若干条事实」，
+ * 下次对话时把最近的概述与高分事实塞回 system prompt。
+ *
+ * 为什么要有 recall_budget 这道硬闸：注入的东西没有上限，第 30 天就会
+ * 变成 30 份存档一起塞进去，既烧钱又稀释注意力。这里按 token 逐条累加，
+ * 超了就停——与 context.token_budget 同一个思路。
+ *
+ * 出厂关闭：记忆会在后台静默产生模型调用，而且群里摘的是别人的话。
+ * 这种「升级之后开始记住大家说过什么」的行为，不该由一次升级替用户决定。
+ */
+export interface MemorySettings {
+  /** 是否启用。关掉后既不召回也不摘要。 */
+  enabled: boolean;
+  /** 注入最近几条概述。 */
+  recall_days: number;
+  /** 注入几条事实。 */
+  recall_facts: number;
+  /** 记忆块占用的 token 上限（与上下文预算共用）。 */
+  recall_budget: number;
+  /** 低于这个分数的事实不注入。1-5。 */
+  min_score: number;
+  /**
+   * 每隔多少小时压一次。0 表示不按时间触发，只靠攒条数。
+   *
+   * 为什么不是"每天零点"：容器可能整夜没起来、也可能在零点前后重启，
+   * 固定时刻最容易漏掉一整天。按"距上次多久"判断，错过一次下一轮 tick
+   * 就会补上。
+   */
+  digest_interval_hours: number;
+  /** 单会话水位线之后攒够多少条就提前压一次（防大群一天爆量）。0 表示关闭。 */
+  digest_force_msgs: number;
+  /** 会话至少安静这么多分钟才压，避免在对话中途插队。 */
+  digest_idle_min: number;
+  /** 每个会话每天最多压几次，防异常流量。 */
+  digest_daily_limit: number;
+  /** 摘要用的模型。留空表示与对话同一个。 */
+  digest_model: string;
+  /** 原始消息保留天数。0 表示永久保留（默认）——摘要写歪了还能回查原文。 */
+  retain_days: number;
+}
+
+/**
  * 图片识别配置。
  *
  * 用户发图时把图下载下来随消息一起交给模型（OpenAI 兼容的 image_url 块）。
@@ -192,6 +236,7 @@ export interface Settings {
   search: SearchSettings;
   computer: ComputerSettings;
   context: ContextSettings;
+  memory: MemorySettings;
   panel: PanelSettings;
 }
 
@@ -272,6 +317,29 @@ export function defaultComputer(): ComputerSettings {
   };
 }
 
+/**
+ * 长期记忆的出厂默认值。
+ *
+ * 关着，但除开关外都是「开了就能用」的参数：一天压一次、注入 2 条概述
+ * 与 5 条事实、240 token 上限。这些值按"一个有几个常聊对象的私人号"调，
+ * 与项目里其他功能一样——先保守，用户真觉得记性差再去调。
+ */
+export function defaultMemory(): MemorySettings {
+  return {
+    enabled: false,
+    recall_days: 2,
+    recall_facts: 5,
+    recall_budget: 240,
+    min_score: 4,
+    digest_interval_hours: 24,
+    digest_force_msgs: 120,
+    digest_idle_min: 10,
+    digest_daily_limit: 6,
+    digest_model: '',
+    retain_days: 0,
+  };
+}
+
 /** 出厂默认值。刻意保守：被动接话概率低、上下文预算小、思考模式关闭。 */
 export function defaultSettings(): Settings {
   return {
@@ -305,6 +373,7 @@ export function defaultSettings(): Settings {
       max_turns: 10,
       token_budget: 3000,
     },
+    memory: defaultMemory(),
     panel: {
       admin_user: 'admin',
       password_hash: '',
@@ -404,6 +473,32 @@ export function normalizeSettings(v: Settings): Settings {
     if (!Array.isArray(c.allow_users)) c.allow_users = [];
     if (!Array.isArray(c.allow_groups)) c.allow_groups = [];
   }
+  // 旧库没有 memory 块：整块补默认值（关着的）。升级不该悄悄开始记东西。
+  if (v.memory === undefined || v.memory === null || typeof v.memory !== 'object') {
+    v.memory = defaultMemory();
+  } else {
+    // 字段级兜底在这里是必须的，不是洁癖：digest_interval_hours 为 undefined 时
+    // `undefined <= now` 是 false，摘要永远不触发，而面板与日志里看不出任何异常，
+    // 表现成"开了记忆但从来不记"。
+    const dm = defaultMemory();
+    const m = v.memory;
+    if (typeof m.enabled !== 'boolean') m.enabled = dm.enabled;
+    if (typeof m.digest_model !== 'string') m.digest_model = dm.digest_model;
+    const nums: [keyof MemorySettings, number][] = [
+      ['recall_days', dm.recall_days],
+      ['recall_facts', dm.recall_facts],
+      ['recall_budget', dm.recall_budget],
+      ['min_score', dm.min_score],
+      ['digest_interval_hours', dm.digest_interval_hours],
+      ['digest_force_msgs', dm.digest_force_msgs],
+      ['digest_idle_min', dm.digest_idle_min],
+      ['digest_daily_limit', dm.digest_daily_limit],
+      ['retain_days', dm.retain_days],
+    ];
+    for (const [k, fallback] of nums) {
+      if (!Number.isFinite(m[k])) (m[k] as number) = fallback;
+    }
+  }
   return v;
 }
 
@@ -427,6 +522,7 @@ export function cloneSettings(v: Settings): Settings {
       allow_groups: [...v.computer.allow_groups],
     },
     context: { ...v.context },
+    memory: { ...v.memory },
     panel: { ...v.panel },
   };
 }
@@ -452,6 +548,15 @@ export interface Message {
   content: string;
   tokens: number;
   created_at: Date;
+  /**
+   * 说话人的 QQ 号，0 表示不知道（机器人自己、跟进、旧版本写下的消息）。
+   *
+   * 群聊里所有 user 消息的 role 都是 'user'，只靠 role 无法区分三个人。
+   * 摘要要产出「关于某个人的事实」就必须知道是谁说的，所以从 v8 起落库。
+   */
+  speaker_id: number;
+  /** 说话人的显示名（群名片/昵称），只用于摘要 prompt 里的人类可读标注。 */
+  speaker_name: string;
 }
 
 /** 会话列表的一项。 */

@@ -61,6 +61,19 @@ export interface EnginePort {
   stats(): EngineStats;
   /** 去重表当前条目数（诊断用，用来判断是否在泄漏内存）。 */
   dedupeSize(): number;
+  /**
+   * 立即整理某个会话的记忆（面板上的「立即整理」）。
+   *
+   * 可选：不是所有实现都需要它（测试里的空引擎、以及将来可能的其他宿主）。
+   * 缺省时面板对这一项返回 501，而不是假装成功——用户点了一次什么都没发生，
+   * 比明确说"这个宿主不支持"更让人迷惑。
+   */
+  digestMemory?(sessionID: string): Promise<{
+    ok: boolean;
+    added: number;
+    summary: string;
+    reason?: string;
+  }>;
 }
 
 /**

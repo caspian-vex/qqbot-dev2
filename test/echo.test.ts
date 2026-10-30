@@ -461,3 +461,68 @@ describe('回声式跟进链路', () => {
     }
   });
 });
+
+describe('跟进也带记忆', () => {
+  /** 第二跳（跟进）那次请求的全文；找不到说明没发出。 */
+  const followPrompt = (h: Harness): string => {
+    const p = h.prompts.find((x) => x.includes('内部指令'));
+    assert.ok(p, '应该发出一次跟进请求');
+    return p;
+  };
+
+  it('私聊跟进带上对方的事实', async () => {
+    const h = makeHarness();
+    try {
+      h.store.settings.update((v) => {
+        v.memory.enabled = true;
+      });
+      h.store.memory.add({ scope: 'user', owner_id: '20000', content: '他养了一只叫团子的猫', score: 5 });
+
+      h.engine.handleEvent(ev());
+      await waitFor(() => h.sent.length >= 2);
+
+      // 跟进时对方还没说话，但私聊的 target 就是那个人的 QQ 号，
+      // 所以"他是谁"这件事照样拿得到——这正是 echo 与正常回复唯一的差别所在。
+      assert.match(followPrompt(h), /他养了一只叫团子的猫/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('群聊跟进只带本群的记忆，不把某个人的私事说给全群', async () => {
+    const h = makeHarness();
+    try {
+      h.store.settings.update((v) => {
+        v.memory.enabled = true;
+      });
+      h.store.memory.add({ scope: 'user', owner_id: '20000', content: '他的手机号是 13800001111', score: 5 });
+      h.store.memory.add({ scope: 'session', owner_id: 'group:30000', content: '这个群约好周五开黑', score: 5 });
+
+      h.engine.handleEvent(ev({ message_type: 'group', group_id: 30000 }));
+      await waitFor(() => h.sent.length >= 2);
+
+      const p = followPrompt(h);
+      assert.match(p, /这个群约好周五开黑/);
+      // 跟进是对着整段沉默说的，没有说话人。硬凑一个 id 就会把
+      // "群里某个人"的偏好当成全群的事实说出去——这条是红线。
+      assert.doesNotMatch(p, /13800001111/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('记忆关着时，跟进的 system 里一个记忆段都不留', async () => {
+    const h = makeHarness();
+    try {
+      h.store.memory.add({ scope: 'user', owner_id: '20000', content: '关掉开关也该有的一条', score: 5 });
+
+      h.engine.handleEvent(ev());
+      await waitFor(() => h.sent.length >= 2);
+
+      assert.doesNotMatch(followPrompt(h), /关掉开关也该有的一条/);
+      assert.doesNotMatch(followPrompt(h), /关于对方的长期记忆/);
+    } finally {
+      h.cleanup();
+    }
+  });
+});

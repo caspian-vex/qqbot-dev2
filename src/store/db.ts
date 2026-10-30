@@ -176,6 +176,78 @@ const MIGRATIONS: string[] = [
   CREATE INDEX ix_sched_due ON scheduled_messages(status, due_at);
   CREATE INDEX ix_sched_session ON scheduled_messages(session_id, status);
   `,
+  // v8：长期记忆。
+  //
+  // 三张表分工：
+  //   memory_days   —— 每次摘要的产物，回答"这段时间聊了什么"
+  //   memories      —— 从摘要里提炼的稳定事实，回答"这个人/这个群是什么样"
+  //   memory_cursors—— 水位线，回答"已经压到哪一条了"
+  //
+  // 为什么 memory_days 的主键是 (session_id, period_start, period_end)
+  // 而不是 (session_id, day)：繁忙的群一天可能触发两次摘要（攒够条数提前压），
+  // 按日历天做主键的话第二次就得覆盖第一次——要么丢掉后半天的内容，
+  // 要么额外花一次模型调用做合并。按"摘要记录"存，一天两次就是两行，
+  // 召回按 period_end 倒序取最近 N 条，语义自然退化成"最近 N 次摘要"。
+  //
+  // 为什么都不挂外键：与 v3/v4/v6/v7 同一条教训——记忆的宿主
+  // （安静的群、只在别处说过话的人）可能还没有 sessions 行；
+  // 而删掉一个群不该顺手删掉"这个人是谁"——那是用户维度的资产。
+  //
+  // owner_id 用 TEXT：会话 id（"group:123"）与 QQ 号要共用同一套索引与
+  // 同一段查询代码，统一成一种类型最省事，也避开 QQ 号在 JS number 上的边界。
+  //
+  // memories 上的唯一索引既是去重，也是"旧事重提"的落点：同一件事再说一遍
+  // 不新增行，而是顶高 score、刷新 updated_at，让它重新排到召回前面。
+  //
+  // messages 补 speaker 两列：群里三个人的 user 消息原本混在一起，
+  // 摘要无法按人归因。没有这两列，用户维度的事实只能在私聊里学到，
+  // 群聊里的"记住这个人"永远为空。老消息留 0/''，摘要时按"某人"处理。
+  `
+  CREATE TABLE memory_days (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT    NOT NULL,
+    day          TEXT    NOT NULL,
+    period_start INTEGER NOT NULL,
+    period_end   INTEGER NOT NULL,
+    msg_count    INTEGER NOT NULL DEFAULT 0,
+    content      TEXT    NOT NULL,
+    tokens       INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL
+  );
+  CREATE INDEX ix_mdays_recall ON memory_days(session_id, period_end DESC);
+  CREATE UNIQUE INDEX ux_mdays_period ON memory_days(session_id, period_start, period_end);
+
+  CREATE TABLE memories (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope      TEXT    NOT NULL CHECK (scope IN ('session', 'user')),
+    owner_id   TEXT    NOT NULL,
+    owner_name TEXT    NOT NULL DEFAULT '',
+    kind       TEXT    NOT NULL DEFAULT 'fact',
+    content    TEXT    NOT NULL,
+    score      INTEGER NOT NULL DEFAULT 3,
+    source     TEXT    NOT NULL DEFAULT 'digest',
+    hits       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE UNIQUE INDEX ux_mem_content ON memories(scope, owner_id, content);
+  CREATE INDEX ix_mem_recall ON memories(scope, owner_id, score DESC, updated_at DESC);
+
+  CREATE TABLE memory_cursors (
+    session_id     TEXT    PRIMARY KEY,
+    owner_name     TEXT    NOT NULL DEFAULT '',
+    last_msg_id    INTEGER NOT NULL DEFAULT 0,
+    last_digest_at INTEGER NOT NULL DEFAULT 0,
+    digests_today  INTEGER NOT NULL DEFAULT 0,
+    day_label      TEXT    NOT NULL DEFAULT '',
+    failures       INTEGER NOT NULL DEFAULT 0,
+    updated_at     INTEGER NOT NULL
+  );
+
+  ALTER TABLE messages ADD COLUMN speaker_id   INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE messages ADD COLUMN speaker_name TEXT    NOT NULL DEFAULT '';
+  `,
 ];
 
 export class Db {

@@ -32,10 +32,14 @@ export function emptyVars(): Vars {
 /**
  * 拼装最终的系统提示词。
  *
- * 结构：用户人格 → 上下文变量 → 格式约束。
+ * 结构：用户人格 → 上下文变量 → [记忆等附加资料] → 格式约束。
  * 变量放在中间而不是塞进用户人格里，是为了让用户改人格时不用关心变量语法。
+ *
+ * extra 必须在 FORMAT_RULES 之前：格式约束是"怎么说话"，应该最后被读到；
+ * 记忆是"以前发生过什么"，是资料不是规则。塞在规则后面，模型容易把
+ * 记忆里的句子当成新的指令来执行（"以后叫我哥"会被当成指令而不是事实）。
  */
-export function build(systemPrompt: string, v: Vars): string {
+export function build(systemPrompt: string, v: Vars, extra = ''): string {
   let out = `${systemPrompt.trim()}\n\n`;
 
   const lines: string[] = [];
@@ -46,6 +50,10 @@ export function build(systemPrompt: string, v: Vars): string {
 
   if (lines.length > 0) {
     out += `上下文：\n${lines.join('\n')}\n\n`;
+  }
+
+  if (extra !== '') {
+    out += `${extra}\n\n`;
   }
 
   return out + FORMAT_RULES;

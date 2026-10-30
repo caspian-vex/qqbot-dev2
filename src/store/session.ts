@@ -10,6 +10,8 @@ interface MessageRow {
   content: string;
   tokens: number;
   created_at: number;
+  speaker_id: number;
+  speaker_name: string;
 }
 
 interface SessionRow {
@@ -46,15 +48,30 @@ export class SessionRepo {
     );
   }
 
-  append(sessionID: string, role: string, content: string, tokens: number): void {
+  /**
+   * 追加一条消息。
+   *
+   * speaker 只在用户消息上有意义：群聊里 role 全是 'user'，摘要器要按人
+   * 归因就必须知道是谁说的。机器人自己的消息、跟进、闹钟都不传，
+   * 落库成 0/''（摘要时按"我"处理）。
+   */
+  append(
+    sessionID: string,
+    role: string,
+    content: string,
+    tokens: number,
+    speaker?: { id: number; name: string },
+  ): void {
     this.db.run(
-      `INSERT INTO messages (session_id, role, content, tokens, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (session_id, role, content, tokens, created_at, speaker_id, speaker_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       sessionID,
       role,
       content,
       tokens,
       nowSec(),
+      speaker?.id ?? 0,
+      speaker?.name ?? '',
     );
   }
 
@@ -62,7 +79,7 @@ export class SessionRepo {
   recent(sessionID: string, limit: number): Message[] {
     if (limit <= 0) return [];
     const rows = this.db.all<MessageRow>(
-      `SELECT id, session_id, role, content, tokens, created_at
+      `SELECT id, session_id, role, content, tokens, created_at, speaker_id, speaker_name
          FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?`,
       sessionID,
       limit,
@@ -76,6 +93,8 @@ export class SessionRepo {
         content: r.content,
         tokens: Number(r.tokens),
         created_at: new Date(Number(r.created_at) * 1000),
+        speaker_id: Number(r.speaker_id),
+        speaker_name: r.speaker_name,
       }))
       .reverse();
   }
@@ -102,6 +121,10 @@ export class SessionRepo {
    * 设置必须一起删。否则同一个人/群再开口时会建一条新会话，几个月前
    * 那套覆盖会悄悄复活——而用户以为自己早清干净了，只会觉得"这机器人
    * 怎么突然不听全局设置了"。
+   *
+   * 记忆分两种处理：会话维度的（这个群聊过什么、群内的约定）一起清掉，
+   * 用户维度的（某人是谁）留着——那是挂在 QQ 号上的资产，删掉一个群
+   * 不该让机器人在私聊里也不认识这个人了。面板要清用户维度有单独的入口。
    */
   delete(sessionID: string): void {
     this.db.tx(() => {
@@ -111,6 +134,9 @@ export class SessionRepo {
       // 已经排上的主动消息也必须一起删：会话都没了，几天后它还冒出来
       // 说一句"记得交房租"，用户只会觉得见鬼了。
       this.db.run(`DELETE FROM scheduled_messages WHERE session_id = ?`, sessionID);
+      this.db.run(`DELETE FROM memory_days WHERE session_id = ?`, sessionID);
+      this.db.run(`DELETE FROM memory_cursors WHERE session_id = ?`, sessionID);
+      this.db.run(`DELETE FROM memories WHERE scope = 'session' AND owner_id = ?`, sessionID);
     });
   }
 

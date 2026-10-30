@@ -1,6 +1,7 @@
 // 持久化层入口：把各仓储组合成一个 Store。
 import { Db } from './db';
 import { ImageTagRepo } from './image-tags';
+import { MemoryRepo } from './memory';
 import { ScheduledRepo } from './scheduled';
 import { SettingsRepo } from './settings';
 import { PersonaRepo } from './persona';
@@ -21,6 +22,8 @@ export class Store {
   readonly imageTags: ImageTagRepo;
   /** 预排的主动消息（"闹钟"）。落库而不是放内存，见 scheduled.ts 顶部说明。 */
   readonly scheduled: ScheduledRepo;
+  /** 长期记忆：日摘要、事实、摘要水位线。 */
+  readonly memory: MemoryRepo;
 
   constructor(readonly path: string) {
     this.db = new Db(path);
@@ -32,6 +35,7 @@ export class Store {
     this.audit = new AuditRepo(this.db);
     this.imageTags = new ImageTagRepo(this.db);
     this.scheduled = new ScheduledRepo(this.db);
+    this.memory = new MemoryRepo(this.db);
   }
 
   /** 注入加解密器；之后读写的敏感字段自动走 AES-256-GCM。 */
@@ -64,6 +68,8 @@ export {
   isEmptyOverrides,
   type SessionOverrides,
   type SessionBotOverride,
+  type SessionComputerOverride,
+  type SessionMemoryOverride,
   type OverridableGroup,
 } from './overrides';
 export { UsageRepo, AuditRepo } from './usage';
@@ -77,3 +83,21 @@ export {
   type ScheduledStatus,
 } from './scheduled';
 export { ImageTagRepo, type ImageTag } from './image-tags';
+export {
+  MemoryRepo,
+  MAX_CONTENT as MAX_MEMORY_CONTENT,
+  MAX_PER_OWNER as MAX_MEMORIES_PER_OWNER,
+  MEMORY_KINDS,
+  MEMORY_SCOPES,
+  normalizeContent as normalizeMemoryContent,
+  type CursorRow,
+  type DaySummary,
+  type DigestCandidate,
+  type Memory,
+  type MemoryKind,
+  type MemoryOwner,
+  type MemoryScope,
+  type MemorySource,
+  type NewDaySummary,
+  type NewMemory,
+} from './memory';

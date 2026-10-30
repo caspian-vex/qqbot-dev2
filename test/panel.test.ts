@@ -1450,6 +1450,7 @@ describe('会话级设置（按对话对象覆盖）', () => {
         'computer',
         'context',
         'images',
+        'memory',
         'proactive',
         'search',
         'vision',
@@ -1480,6 +1481,31 @@ describe('会话级设置（按对话对象覆盖）', () => {
       assert.equal((await getCfg(h, c, 'group:123')).overrides.bot!.passive_rate, 0.05);
       // 没覆盖的会话跟着全局走
       assert.equal((await getCfg(h, c, 'group:456')).global.bot!.passive_rate, 0.9);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('记忆参数可以按会话覆盖，越界与未知字段都 400', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      // 只传一个字段：服务端补成全量，引擎才不会读到 undefined
+      assert.equal(
+        (await putCfg(h, c, { id: 'group:123', overrides: { memory: { recall_days: 5 } } })).status,
+        200,
+      );
+      const got = await getCfg(h, c, 'group:123');
+      assert.equal(got.overrides.memory!.recall_days, 5);
+      assert.equal(Object.keys(got.overrides.memory!).length, 11, '组内字段必须是全量');
+
+      // 越界走的是合并后的 validateSettings，与全局页同一份文案
+      const bad = await putCfg(h, c, { id: 'group:123', overrides: { memory: { recall_days: 99 } } });
+      assert.equal(bad.status, 400);
+
+      // 白名单外的字段必须报错，不能静默丢弃——静默丢弃在界面上就是"存了但没生效"
+      const unknown = await putCfg(h, c, { id: 'group:123', overrides: { memory: { api_key: 'x' } } });
+      assert.equal(unknown.status, 400);
     } finally {
       await h.stop();
     }
@@ -1793,6 +1819,161 @@ describe('主动发言的设置', () => {
         assert.equal(res.status, 400, JSON.stringify(payload));
         assert.deepEqual(await res.json(), { error: msg });
       }
+    } finally {
+      await h.stop();
+    }
+  });
+});
+
+describe('记忆接口', () => {
+  const json = (c: { header: string; csrf: string }): Record<string, string> => ({
+    Cookie: c.header,
+    'Content-Type': 'application/json',
+    'X-CSRF-Token': c.csrf,
+  });
+
+  it('未登录读不到，登录后一次带回列表、归属与开关状态', async () => {
+    const h = await harness();
+    try {
+      h.store.memory.add({ scope: 'user', owner_id: '20001', owner_name: '阿伟', content: '在杭州做后端', score: 5 });
+
+      const anon = await fetch(`${h.base}/api/memories`);
+      assert.equal(anon.status, 401);
+
+      const c = await authed(h);
+      const d = (await (
+        await fetch(`${h.base}/api/memories`, { headers: { Cookie: c.header } })
+      ).json()) as {
+        tab: string;
+        total: number;
+        items: { content: string; scope: string }[];
+        owners: { owner_id: string }[];
+        status: { enabled: boolean; facts: number; days: number };
+      };
+      assert.equal(d.tab, 'fact');
+      assert.equal(d.total, 1);
+      assert.equal(d.items[0]!.content, '在杭州做后端');
+      assert.equal(d.owners[0]!.owner_id, '20001');
+      // status 要给前端判断"关着但存着东西"，否则用户看到列表会以为在生效
+      assert.equal(d.status.enabled, false);
+      assert.equal(d.status.facts, 1);
+      assert.equal(d.status.days, 0);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('新增、改、删走完一圈', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+
+      const add = await fetch(`${h.base}/api/memories`, {
+        method: 'POST',
+        headers: json(c),
+        body: JSON.stringify({ scope: 'session', owner_id: 'group:1', content: '群里管机器人叫小度', score: 4 }),
+      });
+      assert.equal(add.status, 200);
+
+      const listed = (await (
+        await fetch(`${h.base}/api/memories?scope=session`, { headers: { Cookie: c.header } })
+      ).json()) as { items: { id: number; content: string }[] };
+      const id = listed.items[0]!.id;
+
+      const upd = await fetch(`${h.base}/api/memories`, {
+        method: 'PUT',
+        headers: json(c),
+        body: JSON.stringify({ id, content: '群里都叫它小度' }),
+      });
+      assert.equal(upd.status, 200);
+      assert.equal(h.store.memory.get(id)?.content, '群里都叫它小度');
+
+      const del = await fetch(`${h.base}/api/memories?id=${id}`, { method: 'DELETE', headers: json(c) });
+      assert.equal(del.status, 200);
+      assert.equal(h.store.memory.get(id), null);
+
+      const again = await fetch(`${h.base}/api/memories?id=${id}`, { method: 'DELETE', headers: json(c) });
+      assert.equal(again.status, 404, '删不存在的一条要如实说，不能假装成功');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('用户维度的归属必须是 QQ 号，会话维度必须是 group:/private:', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const cases: [unknown, string][] = [
+        [{ scope: 'user', owner_id: '阿伟', content: '随便一条' }, '用户记忆的归属要填 QQ 号'],
+        [{ scope: 'session', owner_id: '123456', content: '随便一条' }, '会话记忆的归属要形如 group:123 或 private:456'],
+        [{ scope: 'user', owner_id: '20001', content: '短' }, '记忆内容应在 2-200 字之间'],
+      ];
+      for (const [payload, msg] of cases) {
+        const res = await fetch(`${h.base}/api/memories`, {
+          method: 'POST',
+          headers: json(c),
+          body: JSON.stringify(payload),
+        });
+        assert.equal(res.status, 400, JSON.stringify(payload));
+        assert.deepEqual(await res.json(), { error: msg });
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('清空把事实与概述一起删干净', async () => {
+    const h = await harness();
+    try {
+      h.store.memory.add({ scope: 'user', owner_id: '20001', content: '一条事实', score: 4 });
+      h.store.memory.saveDay({
+        session_id: 'group:1', day: '2026-10-30',
+        period_start: 1, period_end: 2, msg_count: 2, content: '一段概述', tokens: 3,
+      });
+
+      const c = await authed(h);
+      const res = await fetch(`${h.base}/api/memories/clear`, {
+        method: 'POST',
+        headers: json(c),
+        body: JSON.stringify({}),
+      });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ok: true, deleted: 1, days: 1 });
+      assert.equal(h.store.memory.list({ limit: 10 }).total, 0);
+      assert.equal(h.store.memory.listDays({ limit: 10 }).total, 0);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('开着记忆却没配模型 Key，保存设置就该 400', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await fetch(`${h.base}/api/settings`, {
+        method: 'PUT',
+        headers: json(c),
+        body: JSON.stringify({ memory: { enabled: true } }),
+      });
+      assert.equal(res.status, 400);
+      assert.deepEqual(await res.json(), {
+        error: '开启长期记忆需要先填写模型 API Key（整理与对话共用同一把）',
+      });
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('没有引擎能力时「立即整理」返回 501，而不是假装成功', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const res = await fetch(`${h.base}/api/memories/digest`, {
+        method: 'POST',
+        headers: json(c),
+        body: JSON.stringify({ session_id: 'group:1' }),
+      });
+      assert.equal(res.status, 501);
     } finally {
       await h.stop();
     }

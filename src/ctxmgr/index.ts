@@ -80,9 +80,20 @@ export class Manager {
     return msgs;
   }
 
-  /** 把一轮对话写入历史。 */
-  record(sessionID: string, role: string, content: string, tokens: number): void {
-    this.store.sessions.append(sessionID, role, content, tokens);
+  /**
+   * 把一轮对话写入历史。
+   *
+   * speaker 只对用户消息有意义：群聊里几轮对话的 role 都是 'user'，
+   * 摘要器要产出"关于某个人的事实"就必须知道是谁说的。
+   */
+  record(
+    sessionID: string,
+    role: string,
+    content: string,
+    tokens: number,
+    speaker?: { id: number; name: string },
+  ): void {
+    this.store.sessions.append(sessionID, role, content, tokens, speaker);
   }
 
   /** 清空某会话的上下文。 */

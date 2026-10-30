@@ -13,9 +13,11 @@ import {
   type ToolDef,
 } from '../llm/client';
 import type { Logger } from '../log/logger';
+import { Digester, pickForPrompt, recallBlock, type DigestOutcome } from '../memory';
 import type { BotStatus, EnginePort, EngineStats } from '../panel/ports';
 import { build as buildSystem, emptyVars, expand } from '../persona';
 import type { Store } from '../store';
+import type { MemoryOwner } from '../store';
 import { resolveSettings, type SessionOverrides } from '../store/overrides';
 import type { Settings } from '../store/types';
 import { sessionId } from '../store/types';
@@ -202,6 +204,8 @@ export class Engine implements EnginePort {
   private readonly imagesDir: string;
   private readonly dataDir: string;
   private readonly approvals: ApprovalQueue;
+  /** 长期记忆的摘要器。后台跑，从不阻塞回复。 */
+  private readonly digester: Digester;
   private sender: Sender | null = null;
 
   private readonly dedupe = new Dedupe(5 * 60_000);
@@ -244,6 +248,8 @@ export class Engine implements EnginePort {
   private readonly lastActivity = new Map<string, number>();
   /** tick 重入保护：上一轮还在等模型时，下一分钟的 tick 不该叠上来。 */
   private ticking = false;
+  /** 上次清理过期聊天记录的时刻（毫秒）。0 表示本次进程还没清过。 */
+  private prunedAt = 0;
 
   private selfId = 0;
   private botName = '';
@@ -266,6 +272,14 @@ export class Engine implements EnginePort {
     this.imagesDir = opt.imagesDir ?? '';
     this.dataDir = opt.dataDir ?? process.cwd();
     this.approvals = opt.approvals ?? new ApprovalQueue(this.log);
+    this.digester = new Digester({
+      store: this.store,
+      // 复用同一个 LlmClient：摘要与对话共用一把 Key、一套重试与超时逻辑，
+      // 再建一个客户端只会多出一处"超时不一样"的差异。
+      llm: this.llm,
+      log: this.log,
+      ...(opt.signal !== undefined ? { signal: opt.signal } : {}),
+    });
     // 退出时拆掉所有未执行的跟进，别让进程死前还发一条消息
     opt.signal?.addEventListener('abort', () => this.cancelAllEchoes(), { once: true });
   }
@@ -459,7 +473,13 @@ export class Engine implements EnginePort {
       nickname: displayOf(ev),
       groupName: await this.groupName(ev.group_id ?? 0),
     };
-    let system = buildSystem(expand(personaPrompt, vars), vars);
+    const ownerName = targetNameOf(ev, vars.groupName);
+    // 记忆块插在人格与格式约束之间：它是资料，不是规则（见 persona.build）。
+    let system = buildSystem(
+      expand(personaPrompt, vars),
+      vars,
+      this.memoryBlock(sid, ev.user_id ?? 0, settings),
+    );
 
     // 图池开着且池里有图时，把「标签 + 备注 + 示例文件」告诉模型，
     // 让它自己决定配不配图、配哪一类。池子为空就不注入：
@@ -502,7 +522,7 @@ export class Engine implements EnginePort {
     try {
       // 名字只用于面板显示，拿不到就回空串（touch 不会因此擦掉旧值）。
       // 群名在算 vars 时已经拉过一次，这里直接用缓存里的结果，不多发请求。
-      this.store.sessions.touch(sid, kindOf(ev), targetOf(ev), targetNameOf(ev, vars.groupName));
+      this.store.sessions.touch(sid, kindOf(ev), targetOf(ev), ownerName);
     } catch {
       // 会话表写入失败不该挡住回复
     }
@@ -582,8 +602,16 @@ export class Engine implements EnginePort {
 
     // 历史只记文字 + 图张数：旧图不会重发，把它们的 token 记进历史会让
     // 后续每一轮的预算估算都偏小，白白裁掉真正有用的对话。
-    this.ctx.record(sid, 'user', historyText, estimateTokens(historyText));
+    // 用户消息带上说话人：群聊里几轮对话的 role 都是 user，摘要器要按人
+    // 归因就得知道是谁说的。
+    this.ctx.record(sid, 'user', historyText, estimateTokens(historyText), {
+      id: ev.user_id ?? 0,
+      name: displayOf(ev),
+    });
     this.ctx.record(sid, 'assistant', recordText, completionTokens);
+    // 只在「攒够条数」时排一次后台摘要，每天的常规调度在 tick 里。
+    // 放在发送之前：发送失败（风控/超时）时这段对话仍在库里，该记的还得记。
+    this.digester.consider(sid, settings, { ownerName });
     try {
       this.store.usage.record(settings.llm.model, promptTokens, completionTokens, isPeak());
     } catch (e) {
@@ -1003,7 +1031,11 @@ export class Engine implements EnginePort {
         groupName: entry.kind === 'group' ? await this.groupName(entry.target) : '',
         nickname: '',
       };
-      const system = buildSystem(expand(personaPrompt, vars), vars);
+      const system = buildSystem(
+        expand(personaPrompt, vars),
+        vars,
+        this.memoryBlockForTalk(sid, entry.kind, entry.target, settings),
+      );
       // 指令以 user 角色进请求但从不落库；真正发出的内容事后补记为 assistant。
       // 把上一条原文一起交给它：跟进时上下文里没有新输入，不给它看自己刚说过什么，
       // 它唯一能做的就是把那句换个说法再问一遍。
@@ -1136,6 +1168,11 @@ export class Engine implements EnginePort {
     try {
       await this.fireAlarms(now);
       this.maybeIdle(now);
+      // 记忆整理放在最后，且内部从不 await：闹钟与闲置唤醒是"到点就该发"的事，
+      // 不能被一次两秒起步的摘要请求拖住。
+      this.digester.sweep(this.store.settings.get());
+      // 顺序不能反：先让安静的会话被摘要掉，再按保留期删原文。
+      this.maintain();
     } catch (e) {
       // 调度是后台动作：一轮失败不该让进程退出，下一分钟再来
       this.log.warn('调度轮询失败', { err: e });
@@ -1393,7 +1430,11 @@ export class Engine implements EnginePort {
       groupName: kind === 'group' ? await this.groupName(target) : '',
       nickname: '',
     };
-    const system = buildSystem(expand(personaPrompt, vars), vars);
+    const system = buildSystem(
+      expand(personaPrompt, vars),
+      vars,
+      this.memoryBlockForTalk(sid, kind, target, settings),
+    );
     const msgs = this.ctx.build(sid, settings.context, system, instruction);
     const cfg: LlmConfig = {
       baseURL: settings.llm.base_url,
@@ -1525,6 +1566,100 @@ export class Engine implements EnginePort {
       this.log.warn('读取图池标签备注失败', { err: e });
     }
     return listPool(this.imagesDir, notes);
+  }
+
+  /**
+   * 组装要注入 system 的记忆块。
+   *
+   * 三条通路共用：正常回复、回声跟进、主动开口。后两条走
+   * memoryBlockForTalk，区别只在"有没有说话人"。
+   *
+   * 三道阀，缺一条都可能把主链路搞坏：
+   *   1. 开关关着直接返回空串——关了就不该悄悄产生任何查询。
+   *   2. 上下文预算太小时整块跳过：recall_budget 是 240 时，token_budget=200
+   *      的用户会为了记忆把上一句对话挤出去，那比"没记性"更糟。
+   *   3. 任何异常都吞掉并返回空串：记忆读不出来只是这次没记性，
+   *      不能让整个群突然哑掉。
+   */
+  private memoryBlock(sid: string, userID: number, s: Settings): string {
+    if (!s.memory.enabled) return '';
+    if (s.context.token_budget < s.memory.recall_budget * 2 + 512) return '';
+    try {
+      const owners: MemoryOwner[] = [{ scope: 'session', owner_id: sid }];
+      // 群聊要同时知道"这个群"和"说话这个人"；私聊两者都在这里。
+      if (userID > 0) owners.push({ scope: 'user', owner_id: String(userID) });
+
+      const facts = this.store.memory.recall(owners, {
+        // 多取几倍交给裁剪：去重与预算会再筛一遍，取少了会浪费预算。
+        limit: Math.max(1, s.memory.recall_facts) * 3,
+        minScore: s.memory.min_score,
+      });
+      const days = this.store.memory.recentDays(sid, Math.max(1, s.memory.recall_days));
+
+      const picked = pickForPrompt(facts, days, {
+        maxFacts: s.memory.recall_facts,
+        budget: s.memory.recall_budget,
+        minScore: s.memory.min_score,
+      });
+      if (picked.facts.length === 0 && picked.days.length === 0) return '';
+
+      try {
+        this.store.memory.touchUsed(picked.facts.map((m) => m.id));
+      } catch {
+        // 命中计数只是统计，失败不影响本次回复
+      }
+      return recallBlock(picked);
+    } catch (e) {
+      this.log.warn('读取记忆失败，本条不注入', { session: sid, err: e });
+      return '';
+    }
+  }
+
+  /**
+   * 无事件发言（回声跟进、主动开口）用的记忆块。
+   *
+   * 与正常回复的唯一差别是**没有说话人**：跟进时对方还没开口，主动开口
+   * 是对着一段沉默说的。所以群聊只注入会话级记忆，私聊才顺带取对方的事实
+   * ——私聊的 target 就是那个人的 QQ 号，owner_id 正好对得上。
+   *
+   * 不复用 ev.user_id 那条路是刻意的：这两条通路根本没有事件，
+   * 硬凑一个 id 会把"群里某个人"的偏好当成全群的事实说出去。
+   */
+  private memoryBlockForTalk(sid: string, kind: string, target: number, s: Settings): string {
+    return this.memoryBlock(sid, kind === 'private' ? target : 0, s);
+  }
+
+  /** 立即整理某个会话的记忆（面板上的「立即整理」）。 */
+  async digestMemory(sessionID: string): Promise<DigestOutcome> {
+    return this.digester.digestNow(sessionID, this.resolveFor(sessionID));
+  }
+
+  /**
+   * 按保留期清理原始聊天记录。
+   *
+   * `SessionRepo.prune()` 早就写好了却从没人调用——加了记忆之后这件事不能再拖：
+   * `messages` 表同时是摘要的数据源，只增不减会让每一批摘取的扫描越来越慢。
+   *
+   * 默认 retain_days=0（永不删除），所以升级本身不会删掉任何人的聊天记录；
+   * 填了天数才生效。一小时最多跑一次，别让一条 DELETE 每分钟扫一遍全表。
+   */
+  private maintain(): void {
+    let days = 0;
+    try {
+      days = this.store.settings.get().memory.retain_days;
+    } catch {
+      return;
+    }
+    if (!(days > 0)) return;
+    const now = Date.now();
+    if (now - this.prunedAt < 3600_000) return;
+    this.prunedAt = now;
+    try {
+      const rows = this.store.sessions.prune(days * 86400);
+      if (rows > 0) this.log.info('清理过期聊天记录', { rows, days });
+    } catch (e) {
+      this.log.warn('清理过期聊天记录失败', { err: e });
+    }
   }
 
   /**

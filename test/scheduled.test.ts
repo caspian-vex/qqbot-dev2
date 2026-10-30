@@ -34,10 +34,10 @@ function addIn(store: Store, inSec: number, body = '该交房租了', sid = 'pri
 }
 
 describe('调度表迁移', () => {
-  it('新库直接到 v7，表可用', () => {
+  it('新库直接到 v8，表可用', () => {
     const { store } = open();
     try {
-      assert.equal(store.db.userVersion(), 7);
+      assert.equal(store.db.userVersion(), 8);
       assert.equal(store.scheduled.countPending(), 0);
     } finally {
       store.close();
@@ -55,7 +55,7 @@ describe('调度表迁移', () => {
     const again = new Store(join(dir, 'qqbot.db'));
     try {
       assert.equal(again.settings.get().llm.model, 'custom-model');
-      assert.equal(again.db.userVersion(), 7);
+      assert.equal(again.db.userVersion(), 8);
     } finally {
       again.close();
     }

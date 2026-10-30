@@ -129,6 +129,15 @@ export class PanelServer {
     r.add('DELETE', '/api/images', this.wrap((c, s) => a.deleteImage(c, s), true));
     r.add('GET', '/api/images/raw', this.wrap((c) => a.imageRaw(c), false));
 
+    // 长期记忆：事实与日摘要的查看/编辑/删除，以及手动触发一次整理
+    r.add('GET', '/api/memories', this.wrap((c) => a.listMemories(c), false));
+    r.add('POST', '/api/memories', this.wrap((c, s) => a.saveMemory(c, s), true));
+    r.add('PUT', '/api/memories', this.wrap((c, s) => a.updateMemory(c, s), true));
+    r.add('DELETE', '/api/memories', this.wrap((c, s) => a.deleteMemory(c, s), true));
+    r.add('POST', '/api/memories/clear', this.wrap((c, s) => a.clearMemories(c, s), true));
+    r.add('POST', '/api/memories/digest', this.wrap((c, s) => a.digestMemory(c, s), true));
+    r.add('DELETE', '/api/memories/day', this.wrap((c, s) => a.deleteDaySummary(c, s), true));
+
     // 扫码登录 QQ（Go 版没有的新增能力）
     r.add('GET', '/api/qq/status', this.wrap((c) => a.qqStatus(c), false));
     r.add('POST', '/api/qq/qrcode', this.wrap((c) => a.qqQrcode(c), true));

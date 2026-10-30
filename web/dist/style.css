@@ -1137,3 +1137,10 @@ code {
 .login-card .theme-pick { margin: 16px 0 0; }
 /* 登录页没有侧栏，版本号跟切换器一起居中收在页脚 */
 .login-card .ver-line { justify-content: center; margin-top: 10px; }
+
+/* ---- 记忆 ----
+   概述可能有几百字：允许换行并限制列宽，否则一张表会把整页撑出横向滚动条；
+   行内操作按钮（.btn.sm）本来就是紧凑高度，这里只兜住对齐。 */
+#mem-body td { vertical-align: top; }
+#mem-body .mem-text { max-width: 520px; word-break: break-word; line-height: 1.55; }
+#mem-body td .row { gap: 6px; flex-wrap: nowrap; justify-content: flex-end; }

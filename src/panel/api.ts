@@ -29,6 +29,7 @@ import {
 import type { LogHub } from '../log/hub';
 import type { Logger } from '../log/logger';
 import type { Store } from '../store';
+import type { MemoryKind, MemoryScope } from '../store';
 // 注意别名：SessionInfo 在本文件里已经指「面板登录会话」（./session-store），
 // 而 store/types 里同名的是「聊天会话列表项」，两者毫无关系。
 import {
@@ -333,6 +334,47 @@ function validateSettings(v: Settings): void {
   ) {
     throw new HttpError(400, '开启前至少要填主人 QQ 或一个白名单好友/群');
   }
+
+  // ---- 长期记忆 ----
+  if (v.memory.recall_days < 1 || v.memory.recall_days > 14) {
+    throw new HttpError(400, '注入的概述条数应在 1-14 之间');
+  }
+  if (v.memory.recall_facts < 1 || v.memory.recall_facts > 20) {
+    throw new HttpError(400, '注入的事实条数应在 1-20 之间');
+  }
+  // 下限给到 100：小于这个数连两条概述都放不下，记忆等于没开；
+  // 上限 2000 是因为它和聊天历史共用 token 预算，再高就是把上下文挤空。
+  if (v.memory.recall_budget < 100 || v.memory.recall_budget > 2000) {
+    throw new HttpError(400, '记忆 token 预算应在 100-2000 之间');
+  }
+  if (v.memory.min_score < 1 || v.memory.min_score > 5) {
+    throw new HttpError(400, '记忆最低分应在 1-5 之间');
+  }
+  if (v.memory.digest_interval_hours < 0 || v.memory.digest_interval_hours > 168) {
+    throw new HttpError(400, '整理间隔应在 0-168 小时之间（0 表示不按时间整理）');
+  }
+  if (v.memory.digest_force_msgs < 0 || v.memory.digest_force_msgs > 2000) {
+    throw new HttpError(400, '攒够条数就整理应在 0-2000 之间（0 表示关闭）');
+  }
+  if (v.memory.digest_idle_min < 0 || v.memory.digest_idle_min > 1440) {
+    throw new HttpError(400, '会话安静时长应在 0-1440 分钟之间');
+  }
+  if (v.memory.digest_daily_limit < 0 || v.memory.digest_daily_limit > 24) {
+    throw new HttpError(400, '每会话每日整理次数应在 0-24 之间');
+  }
+  if (v.memory.retain_days < 0 || v.memory.retain_days > 3650) {
+    throw new HttpError(400, '原始记录保留天数应在 0-3650 之间（0 表示永久）');
+  }
+  // 模型名会原样进请求体。只挡长度：合法名字的字符集各家不同，
+  // 白名单挡掉的第一个就会是某个新供应商的模型——那种"保存不了"最难解释。
+  if (v.memory.digest_model.length > 64) {
+    throw new HttpError(400, '整理用的模型名不能超过 64 个字符');
+  }
+  // 摘要与对话共用一把 Key。开着记忆却没配 Key，每次整理都会走一趟注定 401
+  // 的请求、然后在冷却里躺六小时——用户只会觉得"开了但什么也没记住"。
+  if (v.memory.enabled && v.llm.api_key === '') {
+    throw new HttpError(400, '开启长期记忆需要先填写模型 API Key（整理与对话共用同一把）');
+  }
 }
 
 /** 单个 QQ 号：正整数。与 isQQList 的元素判据同一条。 */
@@ -343,6 +385,11 @@ function isQQ(n: unknown): boolean {
 /** 群号/QQ 号列表：必须都是正整数。 */
 function isQQList(v: unknown[]): boolean {
   return v.every((n) => typeof n === 'number' && Number.isSafeInteger(n) && n > 0);
+}
+
+/** 记忆种类白名单。未知值一律降级成 'fact'，而不是报错。 */
+function isMemoryKind(v: string): v is MemoryKind {
+  return v === 'profile' || v === 'preference' || v === 'fact' || v === 'event';
 }
 
 /**
@@ -725,6 +772,7 @@ export class Api {
           allow_users: [...inp.computer.allow_users],
           allow_groups: [...inp.computer.allow_groups],
         };
+        v.memory = { ...inp.memory };
         // 面板凭据只能走专门的接口改，这里不覆盖
         v.panel = { ...cur.panel };
       });
@@ -1491,6 +1539,252 @@ export class Api {
       return;
     }
     createReadStream(path).pipe(ctx.res);
+  }
+
+  // ---- 长期记忆 ----
+
+  /**
+   * 记忆列表。tab=fact 走事实表，tab=day 走日摘要表。
+   *
+   * 一次把 owners 与 status 带上：归属下拉不必再发一次请求，
+   * 而 status 让页面能在功能关闭时直接说「已关闭，这 N 条不会被使用」——
+   * 否则用户看到一列表会以为它正在生效。
+   */
+  listMemories(ctx: ReqCtx): void {
+    const tab = (ctx.query.get('tab') ?? 'fact').trim();
+    const q = (ctx.query.get('q') ?? '').trim();
+    const owner = (ctx.query.get('owner') ?? '').trim();
+    const scopeRaw = (ctx.query.get('scope') ?? '').trim();
+    let limit = atoi(ctx.query.get('limit'));
+    if (limit <= 0 || limit > 500) limit = 100;
+    const offset = Math.max(0, atoi(ctx.query.get('offset')));
+
+    let owners;
+    let status;
+    try {
+      owners = this.store.memory.owners();
+      status = {
+        enabled: this.store.settings.get().memory.enabled,
+        facts: this.store.memory.list({ limit: 1 }).total,
+        days: this.store.memory.listDays({ limit: 1 }).total,
+      };
+    } catch (e) {
+      this.d.log.error('读取记忆概况失败', { err: e });
+      throw new HttpError(500, '读取记忆失败');
+    }
+
+    try {
+      if (tab === 'day') {
+        const r = this.store.memory.listDays({
+          ...(owner !== '' ? { session_id: owner } : {}),
+          ...(q !== '' ? { q } : {}),
+          limit,
+          offset,
+        });
+        writeJSON(ctx.res, 200, { tab: 'day', items: r.items, total: r.total, owners, status });
+        return;
+      }
+      const scope: MemoryScope | undefined =
+        scopeRaw === 'user' || scopeRaw === 'session' ? scopeRaw : undefined;
+      const r = this.store.memory.list({
+        ...(scope !== undefined ? { scope } : {}),
+        ...(owner !== '' ? { owner_id: owner } : {}),
+        ...(q !== '' ? { q } : {}),
+        limit,
+        offset,
+      });
+      writeJSON(ctx.res, 200, { tab: 'fact', items: r.items, total: r.total, owners, status });
+    } catch (e) {
+      this.d.log.error('读取记忆列表失败', { err: e });
+      throw new HttpError(500, '读取记忆失败');
+    }
+  }
+
+  /** 手工新增一条记忆。面板上改过的（source=manual）不会被自动清理。 */
+  async saveMemory(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 8 * 1024)) as Record<string, unknown>;
+    const m = this.readMemoryInput(req);
+    try {
+      this.store.memory.add({
+        scope: m.scope,
+        owner_id: m.owner_id,
+        owner_name: this.memoryOwnerName(m.scope, m.owner_id, req),
+        kind: m.kind,
+        content: m.content,
+        score: m.score,
+        source: 'manual',
+      });
+    } catch (e) {
+      this.d.log.error('保存记忆失败', { err: e });
+      throw new HttpError(500, '保存失败');
+    }
+    this.store.audit.record('memory.saved', `${m.scope}:${m.owner_id}`, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  async updateMemory(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 8 * 1024)) as Record<string, unknown>;
+    const id = Number(req['id'] ?? 0);
+    if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, '记忆 ID 不合法');
+
+    const patch: { kind?: MemoryKind; content?: string; score?: number } = {};
+    if (typeof req['content'] === 'string') {
+      const c = req['content'].trim();
+      const len = [...c].length;
+      if (len < 2 || len > 200) throw new HttpError(400, '记忆内容应在 2-200 字之间');
+      patch.content = c;
+    }
+    if (typeof req['kind'] === 'string' && isMemoryKind(req['kind'])) patch.kind = req['kind'];
+    if (req['score'] !== undefined) patch.score = Number(req['score']);
+
+    let ok;
+    try {
+      ok = this.store.memory.update(id, patch);
+    } catch (e) {
+      this.d.log.error('修改记忆失败', { err: e, id });
+      throw new HttpError(500, '保存失败');
+    }
+    if (!ok) throw new HttpError(404, '记忆不存在或内容不合法');
+    this.store.audit.record('memory.updated', String(id), clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  deleteMemory(ctx: ReqCtx, _sess: SessionInfo): void {
+    const id = atoi(ctx.query.get('id'));
+    if (id <= 0) throw new HttpError(400, '记忆 ID 不合法');
+    let ok;
+    try {
+      ok = this.store.memory.remove(id);
+    } catch (e) {
+      this.d.log.error('删除记忆失败', { err: e, id });
+      throw new HttpError(500, '删除失败');
+    }
+    if (!ok) throw new HttpError(404, '记忆不存在');
+    this.store.audit.record('memory.deleted', String(id), clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  deleteDaySummary(ctx: ReqCtx, _sess: SessionInfo): void {
+    const id = atoi(ctx.query.get('id'));
+    if (id <= 0) throw new HttpError(400, '概述 ID 不合法');
+    let ok;
+    try {
+      ok = this.store.memory.removeDay(id);
+    } catch (e) {
+      this.d.log.error('删除概述失败', { err: e, id });
+      throw new HttpError(500, '删除失败');
+    }
+    if (!ok) throw new HttpError(404, '概述不存在');
+    this.store.audit.record('memory.day-deleted', String(id), clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  /**
+   * 清空记忆。
+   *
+   * 顺序刻意是「先删事实再删概述」不重要，重要的是**不带参数时全删**：
+   * 用户点"清空"时的预期就是"一条都不剩"。留着概述却删掉事实，
+   * 只会在下次对话里出现"我记得最近聊过……"却说不出所以然。
+   */
+  async clearMemories(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 4 * 1024)) as Record<string, unknown>;
+    const scopeRaw = typeof req['scope'] === 'string' ? req['scope'] : '';
+    const owner = typeof req['owner_id'] === 'string' ? req['owner_id'].trim() : '';
+    const scope: MemoryScope | undefined =
+      scopeRaw === 'user' || scopeRaw === 'session' ? scopeRaw : undefined;
+
+    let deleted = 0;
+    let days = 0;
+    try {
+      deleted = this.store.memory.clear({
+        ...(scope !== undefined ? { scope } : {}),
+        ...(owner !== '' ? { owner_id: owner } : {}),
+      });
+      // 只有"全清"才连概述一起删：限定归属/范围时，概述是按会话存的，
+      // 无法对应到单个用户，全删会把别的会话的概述也带走。
+      if (scope === undefined && owner === '') {
+        days = this.store.db.run(`DELETE FROM memory_days`);
+      }
+    } catch (e) {
+      this.d.log.error('清空记忆失败', { err: e });
+      throw new HttpError(500, '清空失败');
+    }
+    this.store.audit.record('memory.cleared', `${deleted} 条 / ${days} 段概述`, clientIP(ctx.req));
+    writeJSON(ctx.res, 200, { ok: true, deleted, days });
+  }
+
+  /**
+   * 立即整理一个会话。
+   *
+   * 这是唯一能在装完当下验证功能是否真的跑通的入口——否则每次验证
+   * 都要等下一次 tick 到间隔。
+   */
+  async digestMemory(ctx: ReqCtx, _sess: SessionInfo): Promise<void> {
+    const req = (await body(ctx, 4 * 1024)) as Record<string, unknown>;
+    const id = typeof req['session_id'] === 'string' ? req['session_id'].trim() : '';
+    if (id === '') throw new HttpError(400, '会话 ID 不能为空');
+    if (parseSessionId(id) === null) throw new HttpError(400, '会话 ID 格式不对');
+
+    const engine = this.d.engine;
+    if (typeof engine.digestMemory !== 'function') {
+      throw new HttpError(501, '当前宿主不支持立即整理');
+    }
+    let out;
+    try {
+      out = await engine.digestMemory(id);
+    } catch (e) {
+      this.d.log.error('整理记忆失败', { err: e, id });
+      throw new HttpError(500, `整理失败：${(e as Error).message}`);
+    }
+    this.store.audit.record(
+      'memory.digested',
+      `${id} ${out.ok ? 'ok' : out.reason ?? 'fail'} +${out.added}`,
+      clientIP(ctx.req),
+    );
+    writeJSON(ctx.res, 200, out);
+  }
+
+  /** 校验并规范化面板提交的一条记忆。 */
+  private readMemoryInput(req: Record<string, unknown>): {
+    scope: MemoryScope;
+    owner_id: string;
+    kind: MemoryKind;
+    content: string;
+    score: number;
+  } {
+    const scope: MemoryScope = req['scope'] === 'user' ? 'user' : 'session';
+    const owner = typeof req['owner_id'] === 'string' ? req['owner_id'].trim() : '';
+    if (owner === '') throw new HttpError(400, '归属不能为空');
+    if (scope === 'user') {
+      // 用户维度只能是 QQ 号：写成 "阿伟" 之后召回永远匹配不上，
+      // 而面板上一切正常。
+      if (!/^\d{5,12}$/.test(owner)) throw new HttpError(400, '用户记忆的归属要填 QQ 号');
+    } else if (parseSessionId(owner) === null) {
+      throw new HttpError(400, '会话记忆的归属要形如 group:123 或 private:456');
+    }
+
+    const content = typeof req['content'] === 'string' ? req['content'].trim() : '';
+    const len = [...content].length;
+    if (len < 2 || len > 200) throw new HttpError(400, '记忆内容应在 2-200 字之间');
+
+    const scoreRaw = Number(req['score'] ?? 3);
+    const score = Number.isFinite(scoreRaw) ? Math.min(5, Math.max(1, Math.round(scoreRaw))) : 3;
+
+    const kind = typeof req['kind'] === 'string' && isMemoryKind(req['kind']) ? req['kind'] : 'fact';
+    return { scope, owner_id: owner, kind, content, score };
+  }
+
+  /** 尽力给出归属的显示名：拿不到就空串，面板退化成显示 ID。 */
+  private memoryOwnerName(scope: MemoryScope, ownerID: string, req: Record<string, unknown>): string {
+    const given = typeof req['owner_name'] === 'string' ? req['owner_name'].trim() : '';
+    if (given !== '') return given.slice(0, 60);
+    try {
+      if (scope === 'session') return this.store.memory.sessionName(ownerID);
+      return this.store.memory.owners().find((o) => o.scope === 'user' && o.owner_id === ownerID)
+        ?.owner_name ?? '';
+    } catch {
+      return '';
+    }
   }
 
   // ---- 群与好友 ----

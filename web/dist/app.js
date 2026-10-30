@@ -146,6 +146,7 @@
     // 两个同名入口会让用户以为点哪个都一样，实际一个是全局、一个是单个会话。
     settings: { title: '全局设置', icon: '⚙', view: viewSettings },
     pool:     { title: '图池', icon: '❏', view: viewPool },
+    memories: { title: '记忆', icon: '❖', view: viewMemories },
     personas: { title: '人格', icon: '✦', view: viewPersonas },
     sessions: { title: '会话', icon: '☰', view: viewSessions },
     // 会话设置要从列表带 id 进来，nav:false 让侧栏不出现这个入口——
@@ -652,7 +653,7 @@
       if (!$('#set-body')) return; // 用户已经切走
       const imgDir = pool.dir || '';
       const l = s.llm, b = s.bot, c = s.context, p = s.proactive || {}, img = s.images || {},
-            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {};
+            vis = s.vision || {}, sr = s.search || {}, cm = s.computer || {}, mem = s.memory || {};
       $('#set-body').innerHTML = `
         <div class="card">
           <div class="card-head">
@@ -972,6 +973,72 @@
               <div class="note">历史按此预算从新到旧裁剪，超出的整轮丢弃，保证问答成对。</div>
             </div>
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>长期记忆 <span class="hint">把聊过的内容压成概述与事实，下次对话自动带上</span></h3>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="f-mem" ${mem.enabled ? 'checked' : ''}>
+            <span>启用长期记忆
+              <span class="note">关着的时候既不整理也不召回，一条都不会往提示词里塞。
+              开启后机器人会记住"这人是谁、聊过什么"——群里摘的是别人的话，所以出厂是关的。
+              整理走的是同一把模型 Key，一天一次，一个常聊对象大约每月一块钱。</span>
+            </span>
+          </label>
+          <div class="grid c3">
+            <div class="field">
+              <label>带几条概述</label>
+              <input type="number" id="f-mem-days" min="1" max="14" value="${mem.recall_days ?? 2}">
+              <div class="note">最近几段概述会进提示词。太多会挤掉真正的上下文。</div>
+            </div>
+            <div class="field">
+              <label>带几条事实</label>
+              <input type="number" id="f-mem-facts" min="1" max="20" value="${mem.recall_facts ?? 5}">
+              <div class="note">按重要度从高到低取。</div>
+            </div>
+            <div class="field">
+              <label>记忆 token 预算</label>
+              <input type="number" id="f-mem-budget" min="100" max="2000" value="${mem.recall_budget ?? 240}">
+              <div class="note">与上面的上下文预算共用，超了就先丢概述、再丢事实。</div>
+            </div>
+            <div class="field">
+              <label>重要度门槛</label>
+              <input type="number" id="f-mem-score" min="1" max="5" value="${mem.min_score ?? 4}">
+              <div class="note">低于这个分数的只存不用。5 分是身份与禁忌。</div>
+            </div>
+            <div class="field">
+              <label>整理间隔（小时）</label>
+              <input type="number" id="f-mem-hours" min="0" max="168" value="${mem.digest_interval_hours ?? 24}">
+              <div class="note">0 表示不按时间整理，只靠下面的条数触发。</div>
+            </div>
+            <div class="field">
+              <label>攒够多少条提前整理</label>
+              <input type="number" id="f-mem-force" min="0" max="2000" value="${mem.digest_force_msgs ?? 120}">
+              <div class="note">繁忙的群一天就能攒几百条。0 表示关闭。别设太小，每一批都是一次模型调用。</div>
+            </div>
+            <div class="field">
+              <label>会话安静多久才整理（分钟）</label>
+              <input type="number" id="f-mem-idle" min="0" max="1440" value="${mem.digest_idle_min ?? 10}">
+              <div class="note">聊到一半去压会把一段对话切成两半。</div>
+            </div>
+            <div class="field">
+              <label>每会话每日上限</label>
+              <input type="number" id="f-mem-limit" min="0" max="24" value="${mem.digest_daily_limit ?? 6}">
+              <div class="note">防异常流量。进程另有一道不可配置的硬顶。</div>
+            </div>
+            <div class="field">
+              <label>整理用的模型</label>
+              <input type="text" id="f-mem-model" value="${esc(mem.digest_model || '')}" placeholder="留空 = 与对话同一个">
+              <div class="note">可以填一个更便宜的模型，只用于整理。</div>
+            </div>
+            <div class="field">
+              <label>原始记录保留（天）</label>
+              <input type="number" id="f-mem-retain" min="0" max="3650" value="${mem.retain_days ?? 0}">
+              <div class="note">0 表示永久保留。概述写歪了还能回查原文；填了会按天清库。</div>
+            </div>
+          </div>
         </div>`;
 
       // 九张卡铺下来两千来像素，保存按钮跟着卡尾走等于「改完还得滚到底」。
@@ -1069,6 +1136,19 @@
                   allow_users: parseNumList($('#f-cmp-users').value),
                   allow_groups: parseNumList($('#f-cmp-groups').value),
                 },
+                memory: {
+                  enabled: $('#f-mem').checked,
+                  recall_days: Number($('#f-mem-days').value),
+                  recall_facts: Number($('#f-mem-facts').value),
+                  recall_budget: Number($('#f-mem-budget').value),
+                  min_score: Number($('#f-mem-score').value),
+                  digest_interval_hours: Number($('#f-mem-hours').value),
+                  digest_force_msgs: Number($('#f-mem-force').value),
+                  digest_idle_min: Number($('#f-mem-idle').value),
+                  digest_daily_limit: Number($('#f-mem-limit').value),
+                  digest_model: $('#f-mem-model').value.trim(),
+                  retain_days: Number($('#f-mem-retain').value),
+                },
               },
             });
             ok('设置已保存');
@@ -1153,7 +1233,7 @@
 
   // 与服务端 OVERRIDABLE_GROUPS 一一对应，顺序即卡片顺序。
   // 模型与面板凭据不在这里：它们是部署级的，按会话复制会变成 N 份密文。
-  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'computer', 'context'];
+  const OVR_GROUPS = ['bot', 'proactive', 'images', 'vision', 'search', 'computer', 'context', 'memory'];
   const OVR_META = {
     bot: { title: '触发规则', hint: '唤醒词、接话概率、冷却、分段' },
     proactive: { title: '主动发言', hint: '回复后隔一会儿补一句' },
@@ -1162,6 +1242,7 @@
     search: { title: '联网搜索', hint: '拿不准时自己去查' },
     computer: { title: '电脑操作', hint: '执行命令、读写文件（要批准）' },
     context: { title: '上下文', hint: '带几轮历史、多少预算' },
+    memory: { title: '长期记忆', hint: '这个对象记什么、记多细' },
   };
 
   const ovrNum = (id, label, val, min, max, note, step) => `
@@ -1231,6 +1312,35 @@
         ${ovrNum('f-idle-limit', '本会话每日主动上限', v.proactive_daily_limit, 0, 20, '含到点提醒；0 表示完全不主动。')}
         ${ovrNum('f-quiet-s', '免打扰开始（小时）', v.quiet_start_hour, 0, 24, '两个数相同表示不启用；0 至 24 表示全天不主动。')}
         ${ovrNum('f-quiet-e', '免打扰结束（小时）', v.quiet_end_hour, 0, 24, '支持跨零点，例如 23 至 8。')}
+      </div>`;
+  }
+
+  /**
+   * 长期记忆的会话覆盖。
+   *
+   * 字段与全局卡片一一对应：这里能做的是"换个量级"，不是"换一套规则"
+   * ——范围校验仍然只有 validateSettings 那一份，所以两边的 min/max
+   * 必须写成同一个数，否则会出现"界面能填、保存报 400"。
+   */
+  function ovrMemoryBody(v) {
+    return `
+      ${ovrCheck('f-ovmem', '这个会话启用长期记忆', v.enabled,
+        '关掉后既不整理也不召回，已有记忆还在，重新打开就继续用。')}
+      <div class="grid c3">
+        ${ovrNum('f-ovmem-days', '带几条概述', v.recall_days, 1, 14, '最近几段概述进提示词。')}
+        ${ovrNum('f-ovmem-facts', '带几条事实', v.recall_facts, 1, 20, '按重要度从高到低取。')}
+        ${ovrNum('f-ovmem-budget', '记忆 token 预算', v.recall_budget, 100, 2000, '与上下文预算共用，超了先丢概述。')}
+        ${ovrNum('f-ovmem-score', '重要度门槛', v.min_score, 1, 5, '低于此分的只存不用。')}
+        ${ovrNum('f-ovmem-hours', '整理间隔（小时）', v.digest_interval_hours, 0, 168, '0 表示只靠条数触发。')}
+        ${ovrNum('f-ovmem-force', '攒够多少条提前整理', v.digest_force_msgs, 0, 2000, '0 表示关闭。每批都是一次模型调用。')}
+        ${ovrNum('f-ovmem-idle', '安静多久才整理（分钟）', v.digest_idle_min, 0, 1440, '聊到一半去压会把对话切成两半。')}
+        ${ovrNum('f-ovmem-limit', '每日整理上限', v.digest_daily_limit, 0, 24, '防异常流量。')}
+        ${ovrNum('f-ovmem-retain', '原始记录保留（天）', v.retain_days, 0, 3650, '0 表示永久保留。')}
+      </div>
+      <div class="field">
+        <label>整理用的模型</label>
+        <input type="text" id="f-ovmem-model" value="${esc(v.digest_model || '')}" placeholder="留空 = 与对话同一个">
+        <div class="note">热闹的大群可以在这里换一个更便宜的模型，只影响整理。</div>
       </div>`;
   }
 
@@ -1309,6 +1419,21 @@
         max_calls: num('#f-search-calls'),
       };
     }
+    if (g === 'memory') {
+      return {
+        enabled: $('#f-ovmem').checked,
+        recall_days: num('#f-ovmem-days'),
+        recall_facts: num('#f-ovmem-facts'),
+        recall_budget: num('#f-ovmem-budget'),
+        min_score: num('#f-ovmem-score'),
+        digest_interval_hours: num('#f-ovmem-hours'),
+        digest_force_msgs: num('#f-ovmem-force'),
+        digest_idle_min: num('#f-ovmem-idle'),
+        digest_daily_limit: num('#f-ovmem-limit'),
+        digest_model: $('#f-ovmem-model').value.trim(),
+        retain_days: num('#f-ovmem-retain'),
+      };
+    }
     return { max_turns: num('#f-turns'), token_budget: num('#f-budget') };
   }
 
@@ -1356,6 +1481,7 @@
       const srVal = st.search.val;
       const cmpVal = st.computer.val;
       const ctxVal = st.context.val;
+      const memVal = st.memory.val;
 
       // 人格不是"覆盖"，天然就是按会话的，所以它没有「本会话单独设置」开关
       // ——打开这个页面的前提就是"只改这一个对象"，再套一层开关没有意义。
@@ -1420,7 +1546,8 @@
           <div class="grid c2">
             ${ovrNum('f-turns', '保留轮数', ctxVal.max_turns, 0, 50, '一轮 = 用户一句 + 助手一句。0 表示不带历史。')}
             ${ovrNum('f-budget', 'token 预算', ctxVal.token_budget, 200, 100000, '历史按此预算从新到旧裁剪，超出的整轮丢弃。')}
-          </div>`, st);
+          </div>`, st) +
+        ovrCard('memory', ovrMemoryBody(memVal), st);
 
       // 按钮等数据到位才出现：加载中就能点的"保存"，点下去只会报 id 未定义。
       const acts = $('#ss-acts');
@@ -1797,6 +1924,295 @@
     });
 
     reload().catch(errInto('#pool-body'));
+  }
+
+  /* ================= 记忆 ================= */
+
+  // 「按天压缩」的结果分两块：概述回答"最近聊过什么"，事实回答"这人是谁"。
+  // 分开看是因为它们的编辑心智不同——概述是一段时间的记录、基本只删不改，
+  // 事实是一条条可纠正的断言（记错了要能改）。
+  function viewMemories(el) {
+    el.innerHTML = `<div class="page-head">
+        <div><h2>记忆</h2>
+          <div class="desc">每天把对话压成概述与事实，聊天时按重要度带进提示词。改动下一条消息就生效</div></div>
+        <div class="row">
+          <input type="text" id="mem-digest" placeholder="group:123" style="width:150px">
+          <button class="btn ghost" data-act="digest">立即整理</button>
+        </div>
+      </div>
+
+      <div id="mem-banner"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>手动记一条 <span class="hint">不会被自动清理，可以随时改</span></h3>
+          <div class="card-actions">
+            <button class="btn ghost" id="mem-cancel" data-act="cancel" style="display:none">取消编辑</button>
+            <button class="btn" id="mem-add" data-act="add">添加</button>
+          </div>
+        </div>
+        <div class="grid c4">
+          <div class="field">
+            <label>归属</label>
+            <select id="mem-scope">
+              <option value="user">某个人（QQ 号）</option>
+              <option value="session">某个会话</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>对象</label>
+            <input type="text" id="mem-owner" placeholder="10001 或 group:123456">
+            <div class="note">个人填 QQ 号；会话填 group: / private: 加号码。</div>
+          </div>
+          <div class="field">
+            <label>种类</label>
+            <select id="mem-kind">
+              <option value="profile">身份</option>
+              <option value="preference">偏好</option>
+              <option value="fact">事实</option>
+              <option value="event">事件</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>重要度 1-5</label>
+            <input type="number" id="mem-score" min="1" max="5" value="4">
+            <div class="note">低于「重要度门槛」的只存不用。</div>
+          </div>
+        </div>
+        <div class="field">
+          <label>内容 <span class="hint">第三人称，越短越容易被带到</span></label>
+          <input type="text" id="mem-content" maxlength="200" placeholder="例如：在杭州做后端，讨厌被叫全名">
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>已记住 <span class="hint" id="mem-count">—</span></h3>
+          <div class="card-actions">
+            <select id="mem-tab">
+              <option value="fact">事实</option>
+              <option value="day">每日概述</option>
+            </select>
+            <button class="btn ghost" data-act="reload">刷新</button>
+            <button class="btn danger" data-act="clear">清空全部</button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="grow"><input type="text" id="mem-q" placeholder="搜索内容…"></div>
+        </div>
+        <div id="mem-body"><div class="empty">加载中…</div></div>
+      </div>`;
+
+    let tab = 'fact';
+    let editing = 0;
+
+    const when = (v) => String(v || '').slice(0, 16).replace('T', ' ');
+
+    const banner = (st) => {
+      const box = $('#mem-banner');
+      if (!box) return;
+      if (!st) { box.innerHTML = ''; return; }
+      if (st.enabled) { box.innerHTML = ''; return; }
+      // 关了还显示一列表，用户会以为它在工作。说清楚"存着但没用"。
+      box.innerHTML = `
+        <div class="card">
+          <div class="card-head">
+            <h3>记忆未开启 <span class="hint">下面这些内容不会被带进对话</span></h3>
+          </div>
+          <div class="note">
+            这里已经有 ${fmtInt(st.facts)} 条事实、${fmtInt(st.days)} 段概述，但开关是关的：
+            机器人既不会整理新的对话，也不会把它们放进提示词。
+            去「全局设置 → 长期记忆」打开就会开始生效。
+          </div>
+        </div>`;
+    };
+
+    const factRows = (items) => items.map((m) => `
+      <tr>
+        <td class="mono dim">${esc(m.scope === 'user' ? '人 ' : '会话 ')}${esc(m.owner_name || m.owner_id)}</td>
+        <td class="dim">${esc({ profile: '身份', preference: '偏好', fact: '事实', event: '事件' }[m.kind] || m.kind)}</td>
+        <td>${'★'.repeat(Math.max(1, Math.min(5, m.score || 3)))}</td>
+        <td class="mem-text">${esc(m.content)}</td>
+        <td class="dim mono">${esc(when(m.updated_at))}</td>
+        <td class="row end">
+          <button class="btn ghost sm" data-act="edit" data-id="${m.id}">编辑</button>
+          <button class="btn danger sm" data-act="del" data-id="${m.id}">删除</button>
+        </td>
+      </tr>`).join('');
+
+    const dayRows = (items) => items.map((d) => `
+      <tr>
+        <td class="mono dim">${esc(when(d.period_end))}</td>
+        <td class="mono dim">${esc(d.session_id)}</td>
+        <td class="mem-text">${esc(d.content)}</td>
+        <td class="dim">${fmtInt(d.msg_count)} 条</td>
+        <td><button class="btn danger sm" data-act="del-day" data-id="${d.id}">删除</button></td>
+      </tr>`).join('');
+
+    let cache = { tab: 'fact', items: [], total: 0, owners: [], status: null };
+
+    const render = () => {
+      const body = $('#mem-body');
+      const cnt = $('#mem-count');
+      if (!body || !cnt) return;
+      cnt.textContent = `${fmtInt(cache.total)} 条`;
+      banner(cache.status);
+
+      if (!cache.items.length) {
+        body.innerHTML = `<div class="empty">${tab === 'day'
+          ? '还没有概述。等下一次整理，或者在上面输入会话 ID 点「立即整理」。'
+          : '还没有记住任何事。开启记忆后会自动攒，也可以在上面手动加一条。'}</div>`;
+        return;
+      }
+
+      body.innerHTML = tab === 'day'
+        ? `<table>
+             <thead><tr><th>时间</th><th>会话</th><th>概述</th><th>消息数</th><th></th></tr></thead>
+             <tbody>${dayRows(cache.items)}</tbody>
+           </table>`
+        : `<table>
+             <thead><tr><th>归属</th><th>种类</th><th>重要度</th><th>内容</th><th>更新时间</th><th></th></tr></thead>
+             <tbody>${factRows(cache.items)}</tbody>
+           </table>`;
+    };
+
+    const reload = async () => {
+      const q = ($('#mem-q') && $('#mem-q').value.trim()) || '';
+      const d = await api('/api/memories?tab=' + encodeURIComponent(tab) +
+        (q ? '&q=' + encodeURIComponent(q) : ''));
+      cache = d;
+      render();
+    };
+
+    const fillForm = (m) => {
+      editing = m ? m.id : 0;
+      $('#mem-scope').value = m ? m.scope : 'user';
+      $('#mem-owner').value = m ? m.owner_id : '';
+      $('#mem-kind').value = m ? m.kind : 'fact';
+      $('#mem-score').value = m ? m.score : 4;
+      $('#mem-content').value = m ? m.content : '';
+      const btn = $('#mem-add');
+      const cancel = $('#mem-cancel');
+      if (btn) btn.textContent = m ? '保存修改' : '添加';
+      if (cancel) cancel.style.display = m ? '' : 'none';
+    };
+
+    bindActions(el, {
+      add: async (btn) => {
+        const content = $('#mem-content').value.trim();
+        if (!content) { bad('内容不能为空'); return; }
+        btn.disabled = true;
+        try {
+          if (editing) {
+            await api('/api/memories', {
+              method: 'PUT',
+              body: {
+                id: editing,
+                content,
+                kind: $('#mem-kind').value,
+                score: Number($('#mem-score').value),
+              },
+            });
+            ok('已更新');
+          } else {
+            await api('/api/memories', {
+              method: 'POST',
+              body: {
+                scope: $('#mem-scope').value,
+                owner_id: $('#mem-owner').value.trim(),
+                kind: $('#mem-kind').value,
+                score: Number($('#mem-score').value),
+                content,
+              },
+            });
+            ok('已记住');
+          }
+          fillForm(null);
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+      cancel: () => fillForm(null),
+      edit: (btn) => {
+        const m = cache.items.find((x) => String(x.id) === btn.dataset.id);
+        if (m) fillForm(m);
+      },
+      del: async (btn) => {
+        if (!confirm('删掉这条记忆？之后不会再被带到对话里。')) return;
+        btn.disabled = true;
+        try {
+          await api('/api/memories?id=' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+          ok('已删除');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+      'del-day': async (btn) => {
+        if (!confirm('删掉这段概述？原始聊天记录不受影响。')) return;
+        btn.disabled = true;
+        try {
+          await api('/api/memories/day?id=' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+          ok('已删除');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+      clear: async (btn) => {
+        if (!confirm('清空全部记忆（事实 + 概述）？原始聊天记录不受影响，但这一步不可撤销。')) return;
+        btn.disabled = true;
+        try {
+          await api('/api/memories/clear', { method: 'POST', body: {} });
+          ok('已清空');
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+      digest: async (btn) => {
+        const id = $('#mem-digest').value.trim();
+        if (!id) { bad('先填会话 ID，例如 group:123456'); return; }
+        btn.disabled = true;
+        btn.textContent = '整理中…';
+        try {
+          const r = await api('/api/memories/digest', { method: 'POST', body: { session_id: id } });
+          if (r.ok) ok(`整理完成：新增 ${fmtInt(r.added)} 条事实`);
+          else bad(`没整理成：${r.reason || '原因未知'}`);
+          await reload();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '立即整理';
+        }
+      },
+      reload: () => { void reload().catch((e) => bad(e.message)); },
+    });
+
+    $('#mem-tab').addEventListener('change', (e) => {
+      tab = e.target.value;
+      fillForm(null);
+      void reload().catch((e2) => bad(e2.message));
+    });
+    $('#mem-q').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') void reload().catch((err) => bad(err.message));
+    });
+    $('#mem-scope').addEventListener('change', () => {
+      const owner = $('#mem-owner');
+      owner.placeholder = $('#mem-scope').value === 'user' ? '10001' : 'group:123456';
+    });
+
+    reload().catch(errInto('#mem-body'));
   }
 
   /* ================= 人格 ================= */

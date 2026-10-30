@@ -200,6 +200,7 @@ describe('规范化外来覆盖', () => {
       'search',
       'computer',
       'context',
+      'memory',
     ]);
     assert.deepEqual(Object.keys(OVERRIDE_FIELDS.bot).sort(), [
       'blacklist_users',
@@ -261,7 +262,47 @@ describe('规范化外来覆盖', () => {
     ]);
   });
 
-  it('pickGroups 只给七个可覆盖组（不含 Key 与面板凭据）', () => {
+  it('长期记忆可以整块下沉，字符串字段顺手 trim', () => {
+    const g = defaultSettings();
+    g.memory.enabled = true;
+    g.memory.recall_days = 3;
+    g.memory.digest_model = 'global-model';
+
+    // 只改两个字段：其余必须从全局补成全量，否则引擎会读到 undefined
+    const ov = normalizeOverrides({ memory: { enabled: false, digest_model: '  cheap-model  ' } }, g);
+    assert.deepEqual(overriddenGroups(ov), ['memory']);
+
+    const r = resolveSettings(g, ov);
+    assert.equal(r.memory.enabled, false, '可以按会话单独关掉');
+    assert.equal(r.memory.digest_model, 'cheap-model', '模型名前后空格会变成 404，必须 trim');
+    assert.equal(r.memory.recall_days, 3, '没传的字段沿用全局');
+    assert.equal(r.memory.recall_budget, g.memory.recall_budget);
+
+    // 覆盖是快照，绝不能写回全局
+    assert.equal(g.memory.enabled, true);
+    assert.equal(g.memory.digest_model, 'global-model');
+  });
+
+  it('记忆组里没有密钥：覆盖整块也带不出任何凭证', () => {
+    const g = defaultSettings();
+    g.llm.api_key = 'sk-secret';
+    const ov = normalizeOverrides({ memory: { enabled: true } }, g);
+    // MemorySettings 里本来就没有 api_key；整理与对话共用 llm 那一把，
+    // 而 llm 组永不进覆盖。这条断言守的是"将来别有人往记忆组里塞密钥"。
+    assert.ok(!JSON.stringify(ov).includes('sk-secret'));
+    assert.ok(!Object.hasOwn(ov.memory!, 'api_key'));
+  });
+
+  it('记忆组类型不符的字段被判出来（面板据此 400）', () => {
+    assert.equal(badFieldOf('memory', { digest_model: 1 }), 'digest_model');
+    assert.equal(badFieldOf('memory', { recall_days: '3' }), 'recall_days');
+    assert.equal(badFieldOf('memory', { enabled: 1 }), 'enabled');
+    assert.equal(badFieldOf('memory', { enabled: true, recall_days: 3, digest_model: 'x' }), '');
+    // 类型不符的组整组丢弃，回落全局——脏数据宁可不生效
+    assert.deepEqual(normalizeOverrides({ memory: { recall_days: '3' } }, defaultSettings()), {});
+  });
+
+  it('pickGroups 只给八个可覆盖组（不含 Key 与面板凭据）', () => {
     const g = defaultSettings();
     g.llm.api_key = 'sk-secret';
     const p = pickGroups(g);
@@ -270,6 +311,7 @@ describe('规范化外来覆盖', () => {
       'computer',
       'context',
       'images',
+      'memory',
       'proactive',
       'search',
       'vision',

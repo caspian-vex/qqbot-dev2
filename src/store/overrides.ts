@@ -15,6 +15,7 @@ import {
   type ComputerSettings,
   type ContextSettings,
   type ImageSettings,
+  type MemorySettings,
   type ProactiveSettings,
   type SearchSettings,
   type Settings,
@@ -56,6 +57,16 @@ export type SessionBotOverride = Pick<
 export type SessionComputerOverride = Pick<ComputerSettings, 'enabled' | 'max_calls' | 'timeout_sec'>;
 
 /**
+ * 「长期记忆」允许按会话覆盖的字段——整块都要，所以直接复用 MemorySettings。
+ *
+ * 为什么这块可以整块下沉而 llm 不行：MemorySettings 里没有密钥。
+ * 整理与对话共用 llm.api_key，而 llm 组永远不进覆盖，密钥因此
+ * 仍然只有部署级那一份。digest_model 也放进来——安静的小群用便宜
+ * 模型整理、热闹的大群用强模型，是这个功能最实际的用法。
+ */
+export type SessionMemoryOverride = MemorySettings;
+
+/**
  * 一个会话的覆盖。
  *
  * 组的键出现即代表"本会话单独设置"，组内必须字段全量（服务端负责补全）。
@@ -73,6 +84,7 @@ export interface SessionOverrides {
   search?: SearchSettings;
   computer?: SessionComputerOverride;
   context?: ContextSettings;
+  memory?: SessionMemoryOverride;
 }
 
 /** 可覆盖的组。顺序即面板卡片顺序。 */
@@ -84,6 +96,7 @@ export const OVERRIDABLE_GROUPS = [
   'search',
   'computer',
   'context',
+  'memory',
 ] as const;
 
 export type OverridableGroup = (typeof OVERRIDABLE_GROUPS)[number];
@@ -97,9 +110,16 @@ export const GROUP_LABELS: Record<OverridableGroup, string> = {
   search: '联网搜索',
   computer: '电脑操作',
   context: '上下文',
+  memory: '长期记忆',
 };
 
-type FieldKind = 'bool' | 'num' | 'strList' | 'numList';
+/**
+ * 字段类型。
+ *
+ * str 是给 memory.digest_model 用的：它是模型名，既不是数字也不是列表，
+ * 加这一种比把模型选择排除出覆盖组更划算——见 SessionMemoryOverride。
+ */
+type FieldKind = 'bool' | 'num' | 'str' | 'strList' | 'numList';
 
 /**
  * 每组允许出现的字段名及其类型。
@@ -137,6 +157,19 @@ export const OVERRIDE_FIELDS: Record<OverridableGroup, Record<string, FieldKind>
   search: { enabled: 'bool', max_results: 'num', timeout_sec: 'num', max_calls: 'num' },
   computer: { enabled: 'bool', max_calls: 'num', timeout_sec: 'num' },
   context: { max_turns: 'num', token_budget: 'num' },
+  memory: {
+    enabled: 'bool',
+    recall_days: 'num',
+    recall_facts: 'num',
+    recall_budget: 'num',
+    min_score: 'num',
+    digest_interval_hours: 'num',
+    digest_force_msgs: 'num',
+    digest_idle_min: 'num',
+    digest_daily_limit: 'num',
+    digest_model: 'str',
+    retain_days: 'num',
+  },
 };
 
 /** 每组允许的字段名清单（顺序稳定，供报错文案与界面对齐）。 */
@@ -190,6 +223,8 @@ export function groupBase(g: OverridableGroup, global: Settings): Record<string,
       };
     case 'context':
       return { ...global.context };
+    case 'memory':
+      return { ...global.memory };
   }
 }
 
@@ -200,6 +235,8 @@ export function matchKind(kind: FieldKind, v: unknown): boolean {
       return typeof v === 'boolean';
     case 'num':
       return typeof v === 'number' && Number.isFinite(v);
+    case 'str':
+      return typeof v === 'string';
     case 'strList':
       return Array.isArray(v) && v.every((x) => typeof x === 'string');
     case 'numList':
@@ -242,7 +279,9 @@ function coerceGroup(
     const v = raw[key];
     if (!matchKind(kind, v)) return null;
     // 数组必须显式复制：直接引用外来的数组，调用方改一下就把库里那份也改了。
-    out[key] = Array.isArray(v) ? [...v] : v;
+    // 字符串顺手 trim：模型名前后多一个空格，请求就是一个 404，而界面上
+    // 两个值长得一模一样，用户只会觉得"这个群坏了"。
+    out[key] = Array.isArray(v) ? [...v] : kind === 'str' ? (v as string).trim() : v;
   }
   return out;
 }
@@ -287,6 +326,9 @@ export function normalizeOverrides(raw: unknown, global: Settings): SessionOverr
       case 'context':
         out.context = merged as unknown as ContextSettings;
         break;
+      case 'memory':
+        out.memory = merged as unknown as SessionMemoryOverride;
+        break;
     }
   }
   return out;
@@ -317,6 +359,7 @@ export function pickGroups(global: Settings): Record<OverridableGroup, unknown> 
       timeout_sec: global.computer.timeout_sec,
     },
     context: { ...global.context },
+    memory: { ...global.memory },
   };
 }
 
@@ -378,5 +421,6 @@ export function resolveSettings(global: Settings, ov: SessionOverrides | null): 
     };
   }
   if (ov.context) out.context = { ...ov.context };
+  if (ov.memory) out.memory = { ...ov.memory };
   return out;
 }
