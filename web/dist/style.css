@@ -684,6 +684,21 @@ select { cursor: pointer; }
 }
 .sess-id { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 2px; }
 
+/* 每行的操作按钮组。
+   1) 间距。原先按钮是直接拼接的，零 gap，几个 pill 边缘贴在一起像一整块。
+   2) 靠右。列宽固定，右对齐后每行的按钮组才有同一个视觉重心。
+   3) 文案恒定。「设置」不再随状态变成「设置·独立」，三行的按钮宽度因此完全
+      一致；有没有那个标记，按钮位置都不动。 */
+.sess-acts { display: inline-flex; align-items: center; gap: 10px; }
+.sess-acts .btn { flex: none; }
+td.sess-acts-cell { text-align: right; }
+
+/* 「独立」是状态标记，不是按钮：小一号 + 弱化色，与旁边的 .btn 区分开。
+   它排在「设置」左边，而整组靠右对齐，所以它只往左占位，不会把按钮推开。
+   和「设置」的距离比按钮之间（10px）再近一点，读起来才是「独立·设置」而不是
+   四个并列的块。 */
+.sess-own { font-size: 11px; color: var(--fg-dim); letter-spacing: 1px; margin-right: -4px; }
+
 .check {
   display: flex;
   align-items: flex-start;

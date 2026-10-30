@@ -2496,20 +2496,23 @@
         ? `<div class="sess-name" title="${esc(name)}">${esc(name)}</div><div class="sess-id">${esc(s.id)}</div>`
         : `<span class="mono">${esc(s.id)}</span>`;
       // 「设置」对两种行都要有：预设行同样可能已经配了一套自己的规则。
-      // 有独立设置时文案里带出来，省得用户挨个点进去看哪几个配过。
-      const cfg = `<button class="btn ghost sm" data-act="cfg" data-id="${esc(s.id)}">${
-        s.overrides ? '设置·独立' : '设置'
-      }</button>`;
+      // 有没有独立设置改成在按钮左边挂一个标记，而不是把字塞进按钮文案里——
+      // 文案一变按钮就变宽，同一列几个按钮会跟着整体位移，几行看下来参差不齐。
+      const own = s.overrides
+        ? '<span class="sess-own" title="这个会话单独指定了人格或规则">独立</span>'
+        : '';
+      const cfg = `<button class="btn ghost sm" data-act="cfg" data-id="${esc(s.id)}">设置</button>`;
+      // 按钮之间必须包一层：原先直接拼接、零间距，几个 pill 粘成一片。
       const acts = preset
-        ? `${cfg}<button class="btn ghost sm" data-act="unbind" data-id="${esc(s.id)}">取消预设</button>`
-        : `${cfg}<button class="btn ghost sm" data-act="peek" data-id="${esc(s.id)}">查看</button>
-           <button class="btn danger sm" data-act="clear" data-id="${esc(s.id)}">清空</button>`;
+        ? `<span class="sess-acts">${own}${cfg}<button class="btn ghost sm" data-act="unbind" data-id="${esc(s.id)}">取消预设</button></span>`
+        : `<span class="sess-acts">${own}${cfg}<button class="btn ghost sm" data-act="peek" data-id="${esc(s.id)}">查看</button>
+           <button class="btn danger sm" data-act="clear" data-id="${esc(s.id)}">清空</button></span>`;
       return `<tr>
         <td>${who}</td>
         <td>${s.kind === 'group' ? '<span class="tag">群聊</span>' : '<span class="tag">私聊</span>'}</td>
         <td class="dim">${preset ? '—' : fmtInt(s.messages)}</td>
         <td class="dim nowrap">${preset ? '<span class="tag on">尚未对话</span>' : esc(fmtTime(s.updated_at))}</td>
-        <td class="nowrap">${acts}</td>
+        <td class="nowrap sess-acts-cell">${acts}</td>
       </tr>`;
     };
 
