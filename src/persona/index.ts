@@ -23,10 +23,18 @@ export interface Vars {
   groupName: string;
   nickname: string;
   botName: string;
+  /**
+   * 当前说话人的 QQ 号，空串表示不知道。
+   *
+   * 类型是 string 而不是 number，是因为它要直接拼进提示词：用数字就会有人
+   * 把 `ev.user_id ?? 0` 原样写进来，于是 "0" 变成一条"对方 QQ：0"的假信息。
+   * 空串在这里有明确含义——无事件的主动发言、或协议端没带 user_id。
+   */
+  qq: string;
 }
 
 export function emptyVars(): Vars {
-  return { time: '', groupName: '', nickname: '', botName: '' };
+  return { time: '', groupName: '', nickname: '', botName: '', qq: '' };
 }
 
 /**
@@ -45,6 +53,11 @@ export function build(systemPrompt: string, v: Vars, extra = ''): string {
   const lines: string[] = [];
   if (v.botName !== '') lines.push(`- 你的名字：${v.botName}`);
   if (v.nickname !== '') lines.push(`- 对方称呼：${v.nickname}`);
+  // 号码紧跟在称呼后面：两行说的是同一个人，先"叫什么"再"号是多少"，
+  // 模型指代时最不容易串。约束也必须贴在这一行里——
+  // 放进 FORMAT_RULES 会同时出现在跟进/主动开口这种压根没有号码的请求里，
+  // 那等于告诉模型"你有一个号码但看不到"，反而诱导它编一个出来。
+  if (v.qq !== '') lines.push(`- 对方 QQ：${v.qq}（对方问起才说，不要主动提号码）`);
   if (v.groupName !== '') lines.push(`- 当前群聊：${v.groupName}`);
   if (v.time !== '') lines.push(`- 当前时间：${v.time}`);
 
@@ -62,17 +75,22 @@ export function build(systemPrompt: string, v: Vars, extra = ''): string {
 /**
  * 把 {{var}} 占位符替换成实际值。
  *
- * 仅支持 4 个已知变量，未知占位符原样保留，避免误替换用户内容。
+ * 仅支持 5 个已知变量，未知占位符原样保留，避免误替换用户内容。
  * 一次扫描完成而不是逐条 replaceAll：否则用户把人格写成
  * "{{time}} 里提到 {{nickname}}"，第二遍替换会把第一遍插进去的
  * 文本再扫一遍。
+ *
+ * {{qq}} 与 {{nickname}} 对称：号码本来就每轮都在上下文里，占位符不增加
+ * 任何新的暴露面，只是让"把人写进人设"（"你是 {{nickname}}（{{qq}}）的管家"）
+ * 有办法做到。
  */
 export function expand(s: string, v: Vars): string {
   const table: Record<string, string> = {
     '{{time}}': v.time,
     '{{group_name}}': v.groupName,
     '{{nickname}}': v.nickname,
+    '{{qq}}': v.qq,
     '{{bot_name}}': v.botName,
   };
-  return s.replace(/\{\{(time|group_name|nickname|bot_name)\}\}/g, (m) => table[m] ?? m);
+  return s.replace(/\{\{(time|group_name|nickname|qq|bot_name)\}\}/g, (m) => table[m] ?? m);
 }

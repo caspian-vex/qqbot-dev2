@@ -466,6 +466,130 @@ describe('按会话指定人格', () => {
   });
 });
 
+describe('提示词里的说话人', () => {
+  const say = (content: string): Result => ({
+    content,
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    firstTokenMs: 1,
+  });
+
+  /** 只收 system，用例全部按它断言。 */
+  const collect = (): { prompts: string[]; llm: (msgs: LlmMessage[]) => Promise<Result> } => {
+    const prompts: string[] = [];
+    return {
+      prompts,
+      llm: async (msgs) => {
+        prompts.push(contentText(msgs[0]!.content));
+        return say('嗯。');
+      },
+    };
+  };
+
+  it('群聊也给出当前说话人的 QQ，称呼与号码分两行', async () => {
+    const c = collect();
+    const h = makeHarness({ llm: c.llm });
+    try {
+      h.engine.handleEvent({
+        ...groupEv(),
+        sender: { user_id: 20000, nickname: '小明', card: '', role: 'member' },
+      });
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(c.prompts[0]!.includes('- 对方称呼：小明'));
+      assert.ok(c.prompts[0]!.includes('- 对方 QQ：20000'), '群聊里也要能认出是谁');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('协议端没带 sender 时只给号码，绝不把号码当称呼', async () => {
+    const c = collect();
+    // groupEv() 本身不带 sender：这是协议端省略 sender 时的样子
+    const h = makeHarness({ llm: c.llm });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(c.prompts[0]!.includes('- 对方 QQ：20000'));
+      assert.ok(!c.prompts[0]!.includes('- 对方称呼：'), '不知道名字就不能编一个');
+      assert.ok(!c.prompts[0]!.includes('对方称呼：20000'), '号码不能冒充名字');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('私聊同样带 QQ', async () => {
+    const c = collect();
+    const h = makeHarness({ llm: c.llm });
+    try {
+      h.engine.handleEvent({
+        ...privateEv(20001, 1),
+        sender: { user_id: 20001, nickname: '小王', card: '', role: 'friend' },
+      });
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(c.prompts[0]!.includes('- 对方 QQ：20001'));
+      assert.ok(c.prompts[0]!.includes('- 对方称呼：小王'));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('群临时会话不该把群名塞进「当前群聊」', async () => {
+    const c = collect();
+    const h = makeHarness({ llm: c.llm });
+    try {
+      // NapCat 的群临时会话：message_type 是 private，但带着 group_id
+      h.engine.handleEvent({ ...privateEv(20002, 1), group_id: 30000 });
+      await waitFor(() => h.sent.length >= 1);
+      assert.ok(!c.prompts[0]!.includes('当前群聊'), '私聊里说"当前群聊"会把它绕晕');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('跟进与主动开口的提示词里没有号码', async () => {
+    const prompts: string[] = [];
+    const h = makeHarness({
+      // 跟进的输出必须和上一条不同，否则会被"字面复读"那道闸拦掉，等不到第二条
+      llm: async (msgs) => {
+        prompts.push(contentText(msgs[0]!.content));
+        return say(prompts.length === 1 ? '第一句。' : '对了，后来呢？');
+      },
+      patch: (v) => {
+        Object.assign(v.proactive, {
+          echo_enabled: true,
+          echo_rate: 1,
+          echo_min_sec: 0,
+          echo_max_sec: 0,
+          echo_cooldown_min: 0,
+          echo_daily_limit: 10,
+        });
+      },
+    });
+    try {
+      h.engine.handleEvent(privateEv(20000, 1));
+      await waitFor(() => h.sent.length >= 2, 5000);
+      assert.ok(prompts.length >= 2, '应当出现一次正常回复 + 一次跟进');
+      assert.ok(prompts[0]!.includes('- 对方 QQ：20000'));
+      assert.ok(!prompts[1]!.includes('- 对方 QQ：'), '没人提问的场合不该有号码');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('历史里的 speaker_name 不再写成号码', async () => {
+    const h = makeHarness({ llm: async () => say('嗯。') });
+    try {
+      h.engine.handleEvent(groupEv());
+      await waitFor(() => h.sent.length >= 1);
+      const rows = h.store.sessions.recent('group:30000', 10);
+      const user = rows.find((r) => r.role === 'user')!;
+      assert.equal(user.speaker_id, 20000, '归因靠 id，不靠名字');
+      assert.equal(user.speaker_name, '', '名字不知道就留空，摘要里会渲染成「某人(20000)」');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe('会话列表里的对话对象名字', () => {
   const say = (content: string): Result => ({
     content,

@@ -541,10 +541,10 @@ describe('OneBot 消息解析', () => {
 
 describe('人格提示', () => {
   it('expand 只替换已知变量，未知占位符原样保留', () => {
-    const v = { time: 'T', groupName: 'G', nickname: 'N', botName: 'B' };
+    const v = { time: 'T', groupName: 'G', nickname: 'N', botName: 'B', qq: 'Q' };
     assert.equal(
-      expand('{{bot_name}}/{{nickname}}/{{group_name}}/{{time}}/{{unknown}}', v),
-      'B/N/G/T/{{unknown}}',
+      expand('{{bot_name}}/{{nickname}}/{{qq}}/{{group_name}}/{{time}}/{{unknown}}', v),
+      'B/N/Q/G/T/{{unknown}}',
     );
   });
 
@@ -554,17 +554,30 @@ describe('人格提示', () => {
       groupName: '测试群',
       nickname: '小明',
       botName: '咪咪',
+      qq: '123456789',
     });
     assert.ok(out.startsWith('你是猫娘\n\n上下文：\n'));
     assert.ok(out.includes('- 你的名字：咪咪'));
     assert.ok(out.includes('- 当前群聊：测试群'));
+    assert.ok(out.includes('- 对方 QQ：123456789'));
+    // 号码紧跟称呼：两行说的是同一个人，隔太远模型容易张冠李戴
+    assert.ok(out.indexOf('- 对方称呼') < out.indexOf('- 对方 QQ'));
+    // 「被问才说」的约束必须和号码同一行，否则等于给了一条无约束的号码
+    assert.match(out, /- 对方 QQ：123456789（[^）]*问[^）]*）/);
     assert.ok(out.includes('输出要求：'));
     assert.ok(out.includes('不要使用 Markdown'));
   });
 
   it('没有变量时不输出空上下文段', () => {
-    const out = buildSystem('你是助手', { time: '', groupName: '', nickname: '', botName: '' });
+    const out = buildSystem('你是助手', {
+      time: '',
+      groupName: '',
+      nickname: '',
+      botName: '',
+      qq: '',
+    });
     assert.ok(!out.includes('上下文：'));
+    assert.ok(!out.includes('对方 QQ'), '不知道号码时不能留一行空的');
     assert.ok(out.includes('输出要求：'));
   });
 });

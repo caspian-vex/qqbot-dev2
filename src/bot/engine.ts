@@ -496,7 +496,12 @@ export class Engine implements EnginePort {
       time: formatLocalMinute(new Date()),
       botName: this.botName,
       nickname: displayOf(ev),
-      groupName: await this.groupName(ev.group_id ?? 0),
+      // 只给"当前这一句"的发言者。历史里谁说的不带标签（要标就得改重放，
+      // 那会把每条历史都变长，见 ctx.build）；没有事件的那两条主动通路也不给。
+      qq: qqOf(ev),
+      // 群临时会话（message_type=private 却带 group_id）不算群聊：
+      // 不判 isGroup 的话，私聊的「当前群聊」会被填成那个群的名字。
+      groupName: isGroup(ev) ? await this.groupName(ev.group_id ?? 0) : '',
     };
     const ownerName = targetNameOf(ev, vars.groupName);
     // 记忆块插在人格与格式约束之间：它是资料，不是规则（见 persona.build）。
@@ -1725,6 +1730,10 @@ export class Engine implements EnginePort {
    *
    * 不复用 ev.user_id 那条路是刻意的：这两条通路根本没有事件，
    * 硬凑一个 id 会把"群里某个人"的偏好当成全群的事实说出去。
+   *
+   * 号码同理，而且更该留空：私聊虽然 target 就是对方 QQ，但机器人在这种场合
+   * 是主动开口，没人问过"我是谁"，把号码告诉它只会多出"我知道你是 123"的风险；
+   * 群聊的 target 还是群号，塞进「对方 QQ」等于教它把群号当人号叫出来。
    */
   private memoryBlockForTalk(sid: string, kind: string, target: number, s: Settings): string {
     return this.memoryBlock(sid, kind === 'private' ? target : 0, s);
@@ -1818,13 +1827,36 @@ function sessionKey(ev: Event): string {
   return sessionId(kindOf(ev), targetOf(ev));
 }
 
-/** 群名片优先、昵称兜底、最后退到 QQ 号。 */
+/**
+ * 当前说话人的 QQ 号，未知时回空串。
+ *
+ * 以 ev.user_id 为准、sender.user_id 只作兜底：记忆块的 user scope、历史里的
+ * speaker_id、回复日志全都读 ev.user_id，两处若不一致，会出现"提示词说 A、
+ * 记忆查 B"的错位，比报个假名字更难查。
+ *
+ * 判据是 `> 0` 而不是 `Number.isFinite`：0 是"没有"的常见写法，
+ * 它不该被渲染成一条「对方 QQ：0」的假信息。
+ */
+function qqOf(ev: Event): string {
+  const id = ev.user_id ?? 0;
+  // 事件上的 0 不算"有值"，还要再试 sender 里那份：没有鉴权的协议端偶尔两者不一致
+  const use = id > 0 ? id : (ev.sender?.user_id ?? 0);
+  return use > 0 ? String(use) : '';
+}
+
+/**
+ * 群名片优先、昵称兜底；都没有就留空。
+ *
+ * 绝不能退到 QQ 号：号码现在有独立的 vars.qq，混进称呼会被模型当成名字叫出来
+ * （"你好，2083882365"）。拿不到名字时留空，build 会把那一行整行跳过。
+ *
+ * 用 `||` 而不是 `!== ''`：协议端在群名片为空时可能整条省略 `card` 字段，
+ * 那时 `undefined !== ''` 成立，脏字符串 "undefined" 就会被拼进提示词。
+ */
 function displayOf(ev: Event): string {
   const s = ev.sender;
-  if (!s) return String(ev.user_id ?? 0);
-  if (s.card !== '') return s.card;
-  if (s.nickname !== '') return s.nickname;
-  return String(s.user_id);
+  if (!s) return '';
+  return s.card || s.nickname || '';
 }
 
 /**
@@ -1839,7 +1871,7 @@ function targetNameOf(ev: Event, groupName: string): string {
   if (isGroup(ev)) return groupName;
   const s = ev.sender;
   if (!s) return '';
-  return s.card !== '' ? s.card : s.nickname;
+  return s.card || s.nickname || '';
 }
 
 /** 本地时间 "YYYY-MM-DD HH:mm"，对应 Go 的 Format("2006-01-02 15:04")。 */

@@ -2262,7 +2262,9 @@
           <textarea id="ps-prompt" rows="10"
             placeholder="You are a helpful assistant"></textarea>
           <div class="note">
-            可用变量：{{time}} {{group_name}} {{nickname}} {{bot_name}}。
+            可用变量：{{time}} {{group_name}} {{nickname}} {{qq}} {{bot_name}}。
+            每轮还会自动附上「对方称呼」「对方 QQ」（当前这条消息的发送者，群聊私聊都有），
+            号码只在对方问起时才会说出口。
             结尾会自动追加「纯文本、不用 Markdown、1-3 句」等格式约束。
           </div>
         </div>
