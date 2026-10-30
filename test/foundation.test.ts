@@ -268,6 +268,65 @@ test('人格：首次访问自动创建 default 并激活；切换是原子的',
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('删人格：未启用且没人指定的才能删，删掉后列表里不再有它', () => {
+  const { store, dir } = tempDb();
+  store.personas.active(); // 落一个 default
+  const spare = store.personas.upsert('spare', 'be spare');
+  assert.equal(store.personas.list().length, 2);
+
+  assert.deepEqual(store.personas.remove(spare.id), { ok: true, name: 'spare' });
+  assert.equal(store.personas.list().some((x) => x.id === spare.id), false);
+  assert.equal(store.personas.active().name, 'default', '删的是备用的，不该动启用中的那个');
+
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('删人格：三道闸的顺序与返回值（不存在 / 仅剩一个 / 启用中 / 有绑定）', () => {
+  const { store, dir } = tempDb();
+  const def = store.personas.active();
+
+  assert.deepEqual(store.personas.remove(9999), { ok: false, reason: 'not_found' });
+
+  // 只剩一个时必须先报"仅剩一个"。它同时也是启用中的，若先判 active，
+  // 用户会拿到一句"先启用另一个"——而这里根本没有另一个可启用。
+  assert.deepEqual(store.personas.remove(def.id), { ok: false, reason: 'last' });
+
+  const coder = store.personas.upsert('coder', 'you write code');
+  store.personas.activate(coder.id);
+  assert.deepEqual(store.personas.remove(coder.id), { ok: false, reason: 'active' });
+
+  store.personas.activate(def.id);
+  store.personas.bind('group:1', coder.id);
+  store.personas.bind('private:2', coder.id);
+  assert.deepEqual(store.personas.remove(coder.id), { ok: false, reason: 'in_use', bindings: 2 });
+
+  // 被拒绝时不能有任何副作用：人格还在，两条绑定也还在
+  assert.equal(store.personas.list().some((x) => x.id === coder.id), true);
+  assert.equal(store.personas.bindingCount(), 2);
+
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('删人格：解绑之后就能删，绑定计数按人格分组', () => {
+  const { store, dir } = tempDb();
+  const def = store.personas.active();
+  const coder = store.personas.upsert('coder', 'you write code');
+
+  store.personas.bind('group:1', coder.id);
+  assert.equal(store.personas.bindingCounts().get(coder.id), 1);
+  assert.equal(store.personas.bindingCounts().get(def.id), undefined, '没人指定的人格不该出现在计数里');
+
+  store.personas.bind('group:1', 0); // 解绑
+  assert.deepEqual(store.personas.remove(coder.id), { ok: true, name: 'coder' });
+  assert.equal(store.personas.bindings().length, 0);
+  assert.equal(store.personas.bindingCount(), 0);
+
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('用量：写时聚合，最近 N 天只返回有数据的日期且升序', () => {
   const { store, dir } = tempDb();
   store.usage.record('m', 100, 50, false);

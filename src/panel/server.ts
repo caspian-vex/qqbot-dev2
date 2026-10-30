@@ -109,6 +109,7 @@ export class PanelServer {
     r.add('GET', '/api/personas', this.wrap((c) => a.listPersonas(c), false));
     r.add('PUT', '/api/personas', this.wrap((c) => a.upsertPersona(c), true));
     r.add('POST', '/api/personas/activate', this.wrap((c) => a.activatePersona(c), true));
+    r.add('DELETE', '/api/personas', this.wrap((c, s) => a.deletePersona(c, s), true));
     r.add('GET', '/api/sessions', this.wrap((c) => a.listSessions(c), false));
     r.add('GET', '/api/sessions/messages', this.wrap((c) => a.sessionMessages(c), false));
     r.add('POST', '/api/sessions/clear', this.wrap((c, s) => a.clearSession(c, s), true));

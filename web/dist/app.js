@@ -2282,18 +2282,28 @@
       }
       $('#ps-list').innerHTML = `
         <table>
-          <thead><tr><th>名称</th><th>状态</th><th>更新时间</th><th style="width:150px"></th></tr></thead>
+          <thead><tr><th>名称</th><th>状态</th><th>更新时间</th><th style="width:210px"></th></tr></thead>
           <tbody>
-            ${items.map((p) => `
+            ${items.map((p) => {
+              // 删除只对「没在启用、也没人单独指定」的人格开放。按钮先按这两条判据
+              // 禁掉、把原因写在 title 上，比让人点下去吃一个 400 再自己去会话页翻要好。
+              const used = Number(p.bindings) || 0;
+              const canDel = !p.active && used === 0;
+              const why = p.active ? '正在使用中，先启用另一个' : `还有 ${used} 个会话在用它，先解绑`;
+              return `
               <tr>
                 <td>${esc(p.name)}</td>
-                <td>${p.active ? '<span class="tag on">使用中</span>' : '<span class="tag">未启用</span>'}</td>
+                <td>${p.active ? '<span class="tag on">使用中</span>' : '<span class="tag">未启用</span>'}${used > 0 ? ` <span class="tag">${used} 个会话</span>` : ''}</td>
                 <td class="dim nowrap">${esc(fmtTime(p.updated_at))}</td>
                 <td class="nowrap">
                   <button class="btn ghost sm" data-act="edit" data-id="${p.id}">编辑</button>
                   ${p.active ? '' : `<button class="btn sm" data-act="activate" data-id="${p.id}">启用</button>`}
+                  ${canDel
+                    ? `<button class="btn danger sm" data-act="del" data-id="${p.id}">删除</button>`
+                    : `<button class="btn danger sm" data-act="del" data-id="${p.id}" disabled title="${why}">删除</button>`}
                 </td>
-              </tr>`).join('')}
+              </tr>`;
+            }).join('')}
           </tbody>
         </table>`;
       el._personas = items;
@@ -2312,6 +2322,25 @@
           ok('已切换人格');
           await load();
         } catch (e) { bad(e.message); }
+      },
+      del: async (btn) => {
+        const p = (el._personas || []).find((x) => String(x.id) === btn.dataset.id);
+        if (!p) return;
+        if (!confirm(`删除人格「${p.name}」？此操作不可撤销。`)) return;
+        btn.disabled = true;
+        try {
+          await api('/api/personas?id=' + encodeURIComponent(p.id), { method: 'DELETE' });
+          ok('已删除人格');
+          // 编辑器里正开着这一条时一起收起来，否则留下一个「保存即重建」的空壳。
+          if ($('#ps-name') && $('#ps-name').value.trim() === p.name) {
+            $('#ps-editor').style.display = 'none';
+          }
+          await load();
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          btn.disabled = false;
+        }
       },
       'save-persona': async (btn) => {
         const name = $('#ps-name').value.trim();

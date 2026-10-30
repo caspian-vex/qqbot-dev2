@@ -22,6 +22,20 @@ export interface BindingMeta {
   name?: string;
 }
 
+/**
+ * 删除人格的结果。
+ *
+ * 用判别式联合而不是抛 Error：调用方要把"不存在"映射成 404、把三种业务拒绝
+ * 映射成 400，靠错误字符串匹配太脆——改一个字文案就变成 500。
+ * 这与 parseDigest 的 { ok, reason } 是同一套写法。
+ */
+export type PersonaRemoveResult =
+  | { ok: true; name: string }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'last' }
+  | { ok: false; reason: 'active' }
+  | { ok: false; reason: 'in_use'; bindings: number };
+
 /** 一条「会话 → 人格」绑定，附带人格名与对象快照。 */
 export interface SessionBinding {
   session_id: string;
@@ -101,6 +115,45 @@ export class PersonaRepo {
       this.db.run(`UPDATE personas SET active = 0 WHERE active = 1`);
       const n = this.db.run(`UPDATE personas SET active = 1, updated_at = ? WHERE id = ?`, nowSec(), id);
       if (n === 0) throw new Error('记录不存在');
+    });
+  }
+
+  /**
+   * 删除一个人格。
+   *
+   * 只允许删「没在启用、也没有会话单独指定」的那一个。三道闸的顺序有讲究：
+   *
+   *   1. 只剩一个时它必然是启用中的，所以"仅剩一个"必须排在"启用中"之前——
+   *      否则用户会拿到一句「先启用另一个」，而这里根本没有另一个人格可启用。
+   *   2. "有绑定就拒绝"优先于删除，而不是删完靠 CASCADE 清绑定。删除是不可逆的，
+   *      顺手把几个群的独立人格一起抹掉，用户多半没预料到；报错让他先解绑，
+   *      影响面就始终握在他手里。
+   *
+   * session_personas 上的 ON DELETE CASCADE 仍然留着当兜底（比如有人直接用
+   * SQL 删行），但正常路径永远走不到它。
+   */
+  remove(id: number): PersonaRemoveResult {
+    return this.db.tx((): PersonaRemoveResult => {
+      const row = this.db.get<{ id: number; name: string; active: number }>(
+        `SELECT id, name, active FROM personas WHERE id = ?`,
+        id,
+      );
+      if (!row) return { ok: false, reason: 'not_found' };
+
+      const total = this.db.get<{ n: number }>(`SELECT COUNT(1) AS n FROM personas`);
+      if (Number(total?.n ?? 0) <= 1) return { ok: false, reason: 'last' };
+
+      if (Number(row.active) === 1) return { ok: false, reason: 'active' };
+
+      const used = this.db.get<{ n: number }>(
+        `SELECT COUNT(1) AS n FROM session_personas WHERE persona_id = ?`,
+        id,
+      );
+      const bindings = Number(used?.n ?? 0);
+      if (bindings > 0) return { ok: false, reason: 'in_use', bindings };
+
+      this.db.run(`DELETE FROM personas WHERE id = ?`, id);
+      return { ok: true, name: row.name };
     });
   }
 
@@ -205,6 +258,21 @@ export class PersonaRepo {
   bindingCount(): number {
     const row = this.db.get<{ n: number }>(`SELECT COUNT(1) AS n FROM session_personas`);
     return row ? Number(row.n) : 0;
+  }
+
+  /**
+   * 每个人格被多少个会话单独指定。没有绑定的 id 不会出现在结果里。
+   *
+   * 面板拿它提前禁用"删除"按钮并写明原因。不带这条信息的话，用户只能点下去
+   * 再吃一个 400，然后自己去会话页翻是哪个群在用。
+   */
+  bindingCounts(): Map<number, number> {
+    const rows = this.db.all<{ persona_id: number; n: number }>(
+      `SELECT persona_id, COUNT(1) AS n FROM session_personas GROUP BY persona_id`,
+    );
+    const out = new Map<number, number>();
+    for (const r of rows) out.set(Number(r.persona_id), Number(r.n));
+    return out;
   }
 
   private byName(name: string): Persona | undefined {

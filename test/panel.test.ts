@@ -121,6 +121,15 @@ async function login(h: Harness, password = PASSWORD, totp?: string): Promise<Re
   });
 }
 
+/** 已登录 + CSRF 的请求头，DELETE 这类写操作要用。 */
+function jsonHeaders(c: Cookies): Record<string, string> {
+  return {
+    Cookie: c.header,
+    'Content-Type': 'application/json',
+    'X-CSRF-Token': c.csrf,
+  };
+}
+
 async function authed(h: Harness): Promise<Cookies> {
   const res = await login(h);
   assert.equal(res.status, 200);
@@ -1005,6 +1014,94 @@ describe('会话与用量接口', () => {
       assert.equal(body.items.length, 1);
       assert.equal(body.active.name, 'default');
       assert.equal(body.active.active, true);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('删人格：未启用且没人指定的能删，列表与审计都对上', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const first = (await (
+        await fetch(`${h.base}/api/personas`, { headers: { Cookie: c.header } })
+      ).json()) as { items: { id: number; name: string; bindings: number }[] };
+      assert.equal(first.items[0]?.bindings, 0, '列表要带「被多少个会话单独指定」，前端靠它禁用按钮');
+
+      const spare = h.store.personas.upsert('spare', 'be spare');
+      const del = await fetch(`${h.base}/api/personas?id=${spare.id}`, {
+        method: 'DELETE',
+        headers: jsonHeaders(c),
+      });
+      assert.equal(del.status, 200);
+      assert.deepEqual(await del.json(), { ok: true });
+
+      const after = (await (
+        await fetch(`${h.base}/api/personas`, { headers: { Cookie: c.header } })
+      ).json()) as { items: { name: string }[] };
+      assert.deepEqual(after.items.map((x) => x.name), ['default']);
+
+      const audit = (await (
+        await fetch(`${h.base}/api/audit?limit=10`, { headers: { Cookie: c.header } })
+      ).json()) as { items: { action: string; detail: string }[] };
+      const hit = audit.items.find((r) => r.action === 'persona.deleted');
+      assert.ok(hit, '删除要留审计');
+      assert.equal(hit.detail, 'spare', '审计记人格名，比 id 好认');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('删人格：不存在 404；仅剩一个 / 启用中 / 有绑定都是 400 且说清下一步', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const del = (id: number | string): Promise<Response> =>
+        fetch(`${h.base}/api/personas?id=${id}`, { method: 'DELETE', headers: jsonHeaders(c) });
+      const msgOf = async (r: Response): Promise<string> =>
+        ((await r.json()) as { error: string }).error;
+
+      assert.equal((await del(9999)).status, 404);
+
+      const def = h.store.personas.active();
+      const only = await del(def.id);
+      assert.equal(only.status, 400);
+      assert.match(await msgOf(only), /至少要保留一个人格/);
+
+      const coder = h.store.personas.upsert('coder', 'you write code');
+      h.store.personas.activate(coder.id);
+      const running = await del(coder.id);
+      assert.equal(running.status, 400);
+      assert.match(await msgOf(running), /正在使用中/);
+
+      h.store.personas.activate(def.id);
+      h.store.personas.bind('group:1', coder.id);
+      const used = await del(coder.id);
+      assert.equal(used.status, 400);
+      assert.match(await msgOf(used), /还有 1 个会话在用它/);
+      assert.equal(h.store.personas.list().some((x) => x.id === coder.id), true, '被拒绝时不能真删掉');
+
+      assert.equal((await del('abc')).status, 400);
+      assert.equal(
+        (await fetch(`${h.base}/api/personas`, { method: 'DELETE', headers: jsonHeaders(c) })).status,
+        400,
+        '不带 id 是非法参数，不能"删掉点什么"',
+      );
+
+      assert.equal(
+        (await fetch(`${h.base}/api/personas?id=${def.id}`, { method: 'DELETE' })).status,
+        401,
+      );
+      assert.equal(
+        (
+          await fetch(`${h.base}/api/personas?id=${def.id}`, {
+            method: 'DELETE',
+            headers: { Cookie: c.header },
+          })
+        ).status,
+        403,
+        '删除必须过 CSRF',
+      );
     } finally {
       await h.stop();
     }

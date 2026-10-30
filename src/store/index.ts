@@ -57,7 +57,7 @@ export class Store {
 export { Db } from './db';
 export * from './types';
 export { SettingsRepo } from './settings';
-export { PersonaRepo } from './persona';
+export { PersonaRepo, type PersonaRemoveResult } from './persona';
 export { SessionRepo } from './session';
 export { SessionSettingsRepo, type SessionOverrideRow, type OverrideMeta } from './session-settings';
 export {

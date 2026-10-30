@@ -156,3 +156,11 @@ test('被 JS 直接写 textContent 的 id 仍在能安全改写的元素上', ()
   assert.match(js, /<span class="hint" id="ac-totp-state">/);
   assert.match(js, /<span class="hint" id="ov-model"><\/span>/);
 });
+
+test('人格页的删除按「未启用且没人指定」放行，读的是列表里的 bindings', () => {
+  // 删除人格有三道闸（仅剩一个 / 启用中 / 有会话在用），前端只做前两道里
+  // 能提前判断的那些：把按钮禁掉并写明原因，而不是等用户点下去吃 400 再解释。
+  assert.match(js, /api\('\/api\/personas\?id='/);
+  assert.match(js, /const canDel = !p\.active && used === 0;/);
+  assert.match(js, /p\.bindings/, '列表项要带上 bindings 计数，否则按钮无法判断');
+});

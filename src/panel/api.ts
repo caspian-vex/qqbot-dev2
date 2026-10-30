@@ -903,7 +903,13 @@ export class Api {
       this.d.log.error('读取人格失败', { err: e });
       throw new HttpError(500, '读取人格失败');
     }
-    writeJSON(ctx.res, 200, { items, active });
+    // bindings 只给列表用：前端靠它提前禁用"删除"按钮并写明原因，
+    // 否则用户只能点下去吃一个 400，再自己去会话页翻是哪个群在用。
+    const counts = this.store.personas.bindingCounts();
+    writeJSON(ctx.res, 200, {
+      items: items.map((p) => ({ ...p, bindings: counts.get(p.id) ?? 0 })),
+      active,
+    });
   }
 
   async upsertPersona(ctx: ReqCtx): Promise<void> {
@@ -938,6 +944,44 @@ export class Api {
     }
     this.store.audit.record('persona.activated', String(id), clientIP(ctx.req));
     writeJSON(ctx.res, 200, { ok: true });
+  }
+
+  /**
+   * 删除人格。
+   *
+   * 只删"没在启用、也没人单独指定"的那种。三种拒绝各有各的出路，所以文案
+   * 要说明下一步做什么：换一个启用、去会话页解绑。笼统回一句"删除失败"，
+   * 用户只会反复点同一个按钮。
+   */
+  deletePersona(ctx: ReqCtx, _sess: SessionInfo): void {
+    const id = atoi(ctx.query.get('id'));
+    if (id <= 0) throw new HttpError(400, '人格 ID 不合法');
+
+    let r;
+    try {
+      r = this.store.personas.remove(id);
+    } catch (e) {
+      this.d.log.error('删除人格失败', { err: e, id });
+      throw new HttpError(500, '删除失败');
+    }
+
+    if (r.ok) {
+      // detail 记人格名而不是 id：名字在库里是 UNIQUE，事后翻日志时比数字好认。
+      this.store.audit.record('persona.deleted', r.name, clientIP(ctx.req));
+      writeJSON(ctx.res, 200, { ok: true });
+      return;
+    }
+
+    switch (r.reason) {
+      case 'not_found':
+        throw new HttpError(404, '人格不存在');
+      case 'last':
+        throw new HttpError(400, '至少要保留一个人格');
+      case 'active':
+        throw new HttpError(400, '这个人格正在使用中，先启用另一个再删');
+      case 'in_use':
+        throw new HttpError(400, `还有 ${r.bindings} 个会话在用它，先到「会话」页解绑再删`);
+    }
   }
 
   // ---- 会话 ----
