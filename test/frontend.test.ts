@@ -174,3 +174,16 @@ test('机器人开关：登录页给入口，总览页给状态', () => {
   // 否则面板会凭空显示一个并不存在的暂停状态。
   assert.match(js, /botEnabled = d\.enabled !== false;/);
 });
+
+test('记忆页横幅有三支：全局开、部分会话开、全关', () => {
+  // 回归点：会话里勾了「启用长期记忆」，记忆页还是一句「记忆未开启」。
+  // 原因是横幅只认全局开关——所以这里先钉住它读了会话计数，
+  // 再钉住三支文案都还在（少一支就等于某类用户看到错误的说法）。
+  assert.match(js, /st\.enabled_sessions/, '横幅要读会话级开关的数量');
+  assert.match(js, /记忆只在部分会话开着/);
+  assert.match(js, /记忆未开启/, '全关那一支的原文案不能丢');
+  // 会话名是群名/群名片（外部输入），拼进 innerHTML 前必须转义
+  assert.match(js, /names\.map\(esc\)/);
+  // 旧后端/旧缓存没有这个字段时不能崩，要回落到"全关"那一支
+  assert.match(js, /Number\(st\.enabled_sessions\) \|\| 0/);
+});

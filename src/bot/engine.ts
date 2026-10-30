@@ -1258,7 +1258,9 @@ export class Engine implements EnginePort {
       this.maybeIdle(now);
       // 记忆整理放在最后，且内部从不 await：闹钟与闲置唤醒是"到点就该发"的事，
       // 不能被一次两秒起步的摘要请求拖住。
-      this.digester.sweep(this.store.settings.get());
+      // 会话级开关允许"全局关、单群开"，所以这里传解析器而不是一份全局设置：
+      // 只传全局会让那些群的定时整理永远不跑（见 Digester.sweep 的注释）。
+      this.digester.sweep(this.store.settings.get(), (sid) => this.resolveFor(sid));
       // 顺序不能反：先让安静的会话被摘要掉，再按保留期删原文。
       this.maintain();
     } catch (e) {

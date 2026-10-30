@@ -1,6 +1,6 @@
 {
   "name": "qqbot",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "description": "QQ 聊天机器人：OneBot 接入 + LLM 对话 + 自带面板（TypeScript 重写）",
   "type": "commonjs",

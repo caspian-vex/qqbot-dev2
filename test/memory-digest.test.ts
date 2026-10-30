@@ -11,6 +11,7 @@ import { Digester, DIGEST_MIN_MSGS } from '../src/memory/digest';
 import type { LlmClient, Message as LlmMessage, Result } from '../src/llm/client';
 import { Logger } from '../src/log/logger';
 import { Store } from '../src/store';
+import { resolveSettings } from '../src/store/overrides';
 import { defaultSettings, type Settings } from '../src/store/types';
 import { localDay } from '../src/util/time';
 
@@ -227,11 +228,16 @@ describe('失败路径', () => {
 });
 
 describe('调度', () => {
+  // 引擎传的是 resolveFor，这里用同一套合并规则（全局 + 会话覆盖）：
+  // 用例要验的是"逐会话判定"，不是在测试里另造一套解析逻辑。
+  const perSession = (h: Harness) => (sid: string): Settings =>
+    resolveSettings(h.settings, h.store.sessionSettings.get(sid));
+
   it('会话还在聊就不压（避免把一段对话切成两半）', async () => {
     const h = make();
     try {
       // 会话刚 touch 过，idle 阈值 10 分钟 → sweep 不该排
-      h.digester.sweep(h.settings);
+      h.digester.sweep(h.settings, perSession(h));
       assert.equal(h.digester.pendingJobs(), 0);
     } finally {
       h.cleanup();
@@ -241,9 +247,89 @@ describe('调度', () => {
   it('功能关着时 sweep 什么都不做', async () => {
     const h = make({ patch: (v) => (v.memory.enabled = false) });
     try {
-      h.digester.sweep(h.settings);
+      h.digester.sweep(h.settings, perSession(h));
       assert.equal(h.digester.pendingJobs(), 0);
       assert.equal(h.calls.length, 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // 全局关、单个群开是受支持的配置。原来 sweep 拿全局设置一刀切，
+  // 这类群的定时整理永远不跑（只有"攒够条数"那条路还活着）。
+  it('全局关着、这个会话单独开着：照样按条数整理', async () => {
+    const h = make({
+      messages: 10,
+      patch: (v) => {
+        v.memory.enabled = false;
+        v.memory.digest_idle_min = 0;
+      },
+    });
+    try {
+      h.store.sessionSettings.set(
+        'group:30000',
+        { memory: { ...h.settings.memory, enabled: true, digest_force_msgs: 6 } },
+        { kind: 'group', name: '测试群' },
+      );
+      h.digester.sweep(h.settings, perSession(h));
+      assert.equal(h.digester.pendingJobs(), 1, '会话级开着就该排上');
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(h.calls.length, 1, '而且要真的整理一次');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // 预筛放宽后会把关着记忆的会话也捞进候选，逐候选复核必须挡住它们。
+  it('全局开着、这个会话单独关着：不排', async () => {
+    const h = make({
+      messages: 10,
+      patch: (v) => {
+        v.memory.digest_idle_min = 0;
+        v.memory.digest_force_msgs = 6;
+      },
+    });
+    try {
+      h.store.sessionSettings.set(
+        'group:30000',
+        { memory: { ...h.settings.memory, enabled: false } },
+        { kind: 'group', name: '测试群' },
+      );
+      h.digester.sweep(h.settings, perSession(h));
+      assert.equal(h.digester.pendingJobs(), 0);
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(h.calls.length, 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // 覆盖里 interval=0 表示"不按时间触发"。预筛算最小间隔时不能把它当 0 小时，
+  // 否则 sinceSec 会变成 now、所有会话立刻到点。
+  it('覆盖里间隔为 0 时仍能靠条数触发', async () => {
+    const h = make({
+      messages: 10,
+      patch: (v) => {
+        v.memory.enabled = false;
+        v.memory.digest_idle_min = 0;
+      },
+    });
+    try {
+      h.store.sessionSettings.set(
+        'group:30000',
+        {
+          memory: {
+            ...h.settings.memory,
+            enabled: true,
+            digest_interval_hours: 0,
+            digest_force_msgs: 6,
+            digest_idle_min: 0,
+          },
+        },
+        { kind: 'group', name: '测试群' },
+      );
+      h.digester.sweep(h.settings, perSession(h));
+      assert.equal(h.digester.pendingJobs(), 1);
     } finally {
       h.cleanup();
     }

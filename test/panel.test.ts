@@ -2212,7 +2212,13 @@ describe('记忆接口', () => {
         total: number;
         items: { content: string; scope: string }[];
         owners: { owner_id: string }[];
-        status: { enabled: boolean; facts: number; days: number };
+        status: {
+          enabled: boolean;
+          facts: number;
+          days: number;
+          enabled_sessions: number;
+          session_names: string[];
+        };
       };
       assert.equal(d.tab, 'fact');
       assert.equal(d.total, 1);
@@ -2222,6 +2228,82 @@ describe('记忆接口', () => {
       assert.equal(d.status.enabled, false);
       assert.equal(d.status.facts, 1);
       assert.equal(d.status.days, 0);
+      // 全局关着、也没有会话单独开：横幅该走"记忆未开启"那一支
+      assert.equal(d.status.enabled_sessions, 0);
+      assert.deepEqual(d.status.session_names, []);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('全局关、单个会话单独开：status 报出会话数与名字', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      // 会话页那条路：只写覆盖，不碰全局
+      h.store.sessionSettings.set(
+        'group:123456',
+        { memory: { ...h.store.settings.get().memory, enabled: true } },
+        { kind: 'group', name: '夜猫子群' },
+      );
+
+      const d = (await (
+        await fetch(`${h.base}/api/memories`, { headers: { Cookie: c.header } })
+      ).json()) as {
+        status: { enabled: boolean; enabled_sessions: number; session_names: string[] };
+      };
+      // 全局没开这件事要如实说，但会话那边开着也得说——否则就是「勾了却说没开」
+      assert.equal(d.status.enabled, false);
+      assert.equal(d.status.enabled_sessions, 1);
+      assert.deepEqual(d.status.session_names, ['夜猫子群']);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('会话没名字时回落 ID，名字最多给三个', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const mem = h.store.settings.get().memory;
+      for (const id of ['group:1', 'group:2', 'group:3', 'group:4']) {
+        h.store.sessionSettings.set(id, { memory: { ...mem, enabled: true } });
+      }
+
+      const d = (await (
+        await fetch(`${h.base}/api/memories`, { headers: { Cookie: c.header } })
+      ).json()) as { status: { enabled_sessions: number; session_names: string[] } };
+      assert.equal(d.status.enabled_sessions, 4, '计数是全部，不能被截断');
+      assert.equal(d.status.session_names.length, 3, '名字只给前三个，横幅不是清单');
+      // 没有群名/昵称快照时必须回落到会话 ID，前端才拼得出「（group:1、…）」
+      for (const n of d.status.session_names) assert.match(n, /^group:[1-4]$/);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('坏记录不进统计，也不会让接口 500', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      const put = (id: string, overrides: string): void => {
+        h.store.db.run(
+          `INSERT INTO session_settings (session_id, kind, target_name, overrides, updated_at)
+           VALUES (?, 'group', '', ?, 0)`,
+          id,
+          overrides,
+        );
+      };
+      put('group:91', '{oops'); // 坏 JSON
+      put('group:92', '{"memory":"yes"}'); // memory 不是对象
+      put('group:93', '{"memory":{"enabled":"yes"}}'); // 不是布尔真
+      put('group:94', '{"memory":{"enabled":true}}'); // 唯一有效的一条
+
+      const d = (await (
+        await fetch(`${h.base}/api/memories`, { headers: { Cookie: c.header } })
+      ).json()) as { status: { enabled_sessions: number; session_names: string[] } };
+      assert.equal(d.status.enabled_sessions, 1);
+      assert.deepEqual(d.status.session_names, ['group:94']);
     } finally {
       await h.stop();
     }

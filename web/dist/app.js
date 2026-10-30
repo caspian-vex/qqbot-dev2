@@ -999,6 +999,7 @@
             <span>启用长期记忆
               <span class="note">关着的时候既不整理也不召回，一条都不会往提示词里塞。
               开启后机器人会记住"这人是谁、聊过什么"——群里摘的是别人的话，所以出厂是关的。
+              只想让某几个群或好友用，可以在「会话」页给它们单独打开，全局关着也生效。
               整理走的是同一把模型 Key，一天一次，一个常聊对象大约每月一块钱。</span>
             </span>
           </label>
@@ -1340,7 +1341,7 @@
   function ovrMemoryBody(v) {
     return `
       ${ovrCheck('f-ovmem', '这个会话启用长期记忆', v.enabled,
-        '关掉后既不整理也不召回，已有记忆还在，重新打开就继续用。')}
+        '只影响这个会话：全局关着时，这里打开也能单独生效。关掉后既不整理也不召回，已有记忆还在，重新打开就继续用。')}
       <div class="grid c3">
         ${ovrNum('f-ovmem-days', '带几条概述', v.recall_days, 1, 14, '最近几段概述进提示词。')}
         ${ovrNum('f-ovmem-facts', '带几条事实', v.recall_facts, 1, 20, '按重要度从高到低取。')}
@@ -2028,6 +2029,29 @@
       if (!box) return;
       if (!st) { box.innerHTML = ''; return; }
       if (st.enabled) { box.innerHTML = ''; return; }
+
+      // 全局关着，但个别会话能单独开（「会话」页每组设置的第 8 张卡）。
+      // 只认全局开关的话，用户刚在群里勾完，回来看到的还是"未开启"，像是没保存。
+      const n = Number(st.enabled_sessions) || 0;
+      const names = Array.isArray(st.session_names) ? st.session_names : [];
+      if (n > 0) {
+        // 名字是群名/群名片，外部输入，必须转义后再拼进 innerHTML
+        const who = names.map(esc).join('、');
+        const more = n > names.length ? ` 等 ${fmtInt(n)} 个` : '';
+        box.innerHTML = `
+        <div class="card">
+          <div class="card-head">
+            <h3>记忆只在部分会话开着 <span class="hint">其余会话下面这些内容不会被带进对话</span></h3>
+          </div>
+          <div class="note">
+            全局开关是关的，但有 ${fmtInt(n)} 个会话单独打开了长期记忆${who ? `（${who}${more}）` : ''}：
+            这几个会话会照常整理新的对话，也会把记下的东西带进提示词，别的会话只存不用。
+            想让所有会话都用上，去「全局设置 → 长期记忆」打开；只调某一个，到「会话」页开它的「长期记忆」。
+          </div>
+        </div>`;
+        return;
+      }
+
       // 关了还显示一列表，用户会以为它在工作。说清楚"存着但没用"。
       box.innerHTML = `
         <div class="card">

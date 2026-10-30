@@ -33,6 +33,22 @@ export interface OverrideMeta {
   name?: string;
 }
 
+/**
+ * 一条「在会话级单独开启了长期记忆」的记录。
+ *
+ * memory 给的是覆盖里那一组原始字段：调用方（摘要调度）要拿它算
+ * 「最宽松的间隔/条数」，而字段可能来自旧版本的残缺快照，所以类型是
+ * Record 而不是 MemorySettings——判定方自己用 isFinite 兜底。
+ */
+export interface MemoryEnabledRow {
+  session_id: string;
+  /** sessions.name 优先，其次写覆盖时存下的快照；都没有就是空串（面板回落到 ID） */
+  name: string;
+  /** 覆盖里 memory 组的原始对象 */
+  memory: Record<string, unknown>;
+  updated_at: Date;
+}
+
 export class SessionSettingsRepo {
   constructor(private readonly db: Db) {}
 
@@ -113,6 +129,63 @@ export class SessionSettingsRepo {
   ids(): Set<string> {
     const rows = this.db.all<{ session_id: string }>(`SELECT session_id FROM session_settings`);
     return new Set(rows.map((r) => r.session_id));
+  }
+
+  /**
+   * 只挑出「memory.enabled 显式为 true」的会话，按最近改动倒序。
+   *
+   * 与 list() 分开是有意的：这个查询必须读 overrides 正文，而 list() 是给
+   * 会话列表补行的，几百行时白读一堆用不上的 JSON（见它的注释）。这里有
+   * 两个读者——面板横幅要数「有几个会话单独开着」，摘要调度要拿这些会话的
+   * 间隔/条数算预筛边界——都是"少而准"的场合。
+   *
+   * 坏 JSON、memory 不是对象、enabled 不是布尔真，一律跳过而不抛：与 get()
+   * 同一条规矩，一条手改坏的记录不该让「记忆」页整个打不开，也不该让摘要
+   * 调度每分钟炸一次。
+   *
+   * 注意 enabled 是「保存那一刻整组挖下来的快照」，所以这里数的是
+   * "显式在会话级打开过"的数量，不等于"与全局设置不同"的会话数。
+   */
+  listMemoryEnabled(): MemoryEnabledRow[] {
+    const rows = this.db.all<{
+      session_id: string;
+      target_name: string;
+      overrides: string;
+      updated_at: number;
+      name: string;
+    }>(
+      `SELECT ss.session_id,
+              ss.target_name,
+              ss.overrides,
+              ss.updated_at,
+              COALESCE(NULLIF(s.name, ''), ss.target_name, '') AS name
+         FROM session_settings ss
+         LEFT JOIN sessions s ON s.id = ss.session_id
+        ORDER BY ss.updated_at DESC, ss.session_id`,
+    );
+
+    const out: MemoryEnabledRow[] = [];
+    for (const r of rows) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(r.overrides);
+      } catch {
+        continue;
+      }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      const mem = (parsed as Record<string, unknown>)['memory'];
+      if (mem === null || typeof mem !== 'object' || Array.isArray(mem)) continue;
+      // 严格 === true：字符串 "yes"、1、缺字段都不算开——宁可少报也不能
+      // 让面板说"这个群开着"，而引擎那边 resolveSettings 之后判成没开。
+      if ((mem as Record<string, unknown>)['enabled'] !== true) continue;
+      out.push({
+        session_id: r.session_id,
+        name: r.name,
+        memory: mem as Record<string, unknown>,
+        updated_at: new Date(Number(r.updated_at) * 1000),
+      });
+    }
+    return out;
   }
 
   count(): number {

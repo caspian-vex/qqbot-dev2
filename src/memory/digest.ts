@@ -23,6 +23,15 @@ export const DIGEST_BATCH = 60;
 const DIGEST_MAX_BATCHES = 2;
 /** 一轮 tick 最多排几个会话，避免 20 个群同时到点时把并发打满。 */
 export const DIGEST_SWEEP = 4;
+/**
+ * 一轮 tick 最多看几个候选。
+ *
+ * 以前是 DIGEST_SWEEP*3（12）：那时预筛条件就是真正生效的条件，筛出来的
+ * 基本都是该压的。现在预筛取的是"启用者里最宽松的边界"，关着记忆的会话
+ * 也会混进来（随后被逐会话判定挡掉），12 个名额会被它们吃光。
+ * 50 是上限区间——dueSessions 每条候选都带两个子查询。
+ */
+const DIGEST_CANDIDATES = 50;
 export const DIGEST_MAX_TOKENS = 700;
 export const DIGEST_TIMEOUT_MS = 20_000;
 /** 1 核 2G，宁可排队也别并发抢 CPU。 */
@@ -148,26 +157,63 @@ export class Digester {
    *
    * 只做同步数据库查询，从不 await——tick 里还排着闹钟与闲置唤醒，
    * 那些都是「到点必须发」的事，不能被整理记忆拖慢。
+   *
+   * 为什么必须逐会话解析设置，而不是拿一份设置一刀切：全局关、单个群开
+   * 是受支持的配置（会话级覆盖整块替换 memory 组），原来那句
+   * `if (!s.memory.enabled) return` 会把这类会话的定时整理永久掐死——
+   * 只有 consider() 那条"攒够条数"的路还活着，于是"一天都攒不够 120 条"
+   * 的安静群永远不会被整理，面板上还一直说"记忆未开启"。
+   *
+   * @param global  全局设置。只用来算预筛边界与兜底语义。
+   * @param resolve 该会话实际生效的设置。引擎传 resolveFor；测试传自己的解析器。
+   *                不做成可选参数：给个默认实现就等于在这里再写一份合并规则，
+   *                两份迟早漂移（见 overrides.ts 里"面板与引擎各一套"的教训）。
    */
-  sweep(s: Settings): void {
-    if (!s.memory.enabled) return;
+  sweep(global: Settings, resolve: (sessionID: string) => Settings): void {
     if (this.signal?.aborted) return;
+
+    // 会话级单独开着的那些：既是"要不要干活"的依据，也是预筛边界的来源。
+    // 读失败就当没有：宁可这一轮不整理，也不能让 tick 抛出去带走闹钟与唤醒。
+    let rows;
+    try {
+      rows = this.store.sessionSettings.listMemoryEnabled();
+    } catch (e) {
+      this.log.warn('读取会话级记忆开关失败', { err: e });
+      return;
+    }
+    if (!global.memory.enabled && rows.length === 0) return;
 
     const now = nowSec();
 
-    const hours = s.memory.digest_interval_hours;
-    // 0（或负数）表示不按时间触发，只靠攒条数。传 -1 让
-    // "last_digest_at <= sinceSec" 恒为假——直接传 now 会让所有会话立即到点。
-    const sinceSec = hours > 0 ? now - hours * 3600 : -1;
-    const idleSec = Math.max(0, s.memory.digest_idle_min) * 60;
+    // 预筛必须是"所有可能到点会话"的超集，所以取启用者里最小的正间隔/正条数：
+    // 谁的阈值最小，谁最容易被选中，用它算边界就不会漏掉阈值更大的会话。
+    // 0 与脏值一律不参与（它们在逐会话判定里同样表示"这条路不触发"）。
+    let minHours = 0;
+    let minForce = 0;
+    const noteLimits = (v: unknown): void => {
+      const hours = num(v, 'digest_interval_hours');
+      const force = num(v, 'digest_force_msgs');
+      if (hours > 0 && (minHours === 0 || hours < minHours)) minHours = hours;
+      if (force > 0 && (minForce === 0 || force < minForce)) minForce = force;
+    };
+    if (global.memory.enabled) noteLimits(global.memory);
+    for (const r of rows) noteLimits(r.memory);
+
+    // hours 为 0 表示"不按时间触发"，传 -1 让 last_digest_at <= sinceSec 恒为假；
+    // 直接传 now 会让所有会话立即到点（与原来同一处理）。
+    const sinceSec = minHours > 0 ? now - minHours * 3600 : -1;
+    // force 为 0 时 dueSessions 内部会换成 MAX_SAFE_INTEGER，等于关掉条数分支。
+    const forceMsgs = minForce;
 
     let candidates;
     try {
       candidates = this.store.memory.dueSessions({
         sinceSec,
-        forceMsgs: s.memory.digest_force_msgs,
+        forceMsgs,
         failureCutoff: now - FAILURE_COOLDOWN_SEC,
-        limit: DIGEST_SWEEP * 3,
+        // 预筛放宽后，关着记忆的会话也会混进候选（它们随后被 m.enabled 挡掉），
+        // 12 个名额不够用；50 是上限区间——每条候选的 SQL 里都带两个子查询。
+        limit: DIGEST_CANDIDATES,
       });
     } catch (e) {
       this.log.warn('查询待摘要会话失败', { err: e });
@@ -177,14 +223,38 @@ export class Digester {
     let picked = 0;
     for (const c of candidates) {
       if (picked >= DIGEST_SWEEP) break;
+
+      const s = resolve(c.session_id);
+      const m = s.memory;
+      // 会话级关掉的跳过：预筛只保证不漏，判断"开没开"必须用这个会话自己的设置。
+      if (m.enabled !== true) continue;
+
+      const hours = num(m, 'digest_interval_hours');
+      const force = num(m, 'digest_force_msgs');
+      const byTime = hours > 0 && now - c.last_digest_at >= hours * 3600;
+      // byTime 成立时短路，不再多查一次 COUNT：大多数会话都是按时到点的那种。
+      // 查询失败按"没攒够"处理：一条候选查不出来不该让整轮调度（含闹钟与
+      // 闲置唤醒之后的 maintain）跟着一起放弃。
+      let byCount = false;
+      if (!byTime && force > 0) {
+        try {
+          byCount = this.store.memory.pending(c.session_id) >= force;
+        } catch (e) {
+          this.log.warn('检查待摘要条数失败', { session: c.session_id, err: e });
+        }
+      }
+      if (!byTime && !byCount) continue;
+
       // 会话还在聊就不压：中途压会把一段对话切成两半，概述和事实都不完整。
+      const idleSec = Math.max(0, m.digest_idle_min) * 60;
       if (idleSec > 0 && now - c.updated_at < idleSec) continue;
-      // 与 consider() 同一道闸（硬顶 + 每会话日上限）
+      // 与 consider() 同一道闸（硬顶 + 每会话日上限），跟着会话自己的设置走
       if (!this.withinQuota(c.session_id, s)) {
         // 硬顶撞了就没必要再看后面的会话了，整轮到此为止
         if (this.quotaUsed + this.pendingJobs() >= DIGEST_DAILY_HARD_CAP) break;
         continue;
       }
+      // 队列里的作业带着这个会话的解析结果：digest_model、日上限都跟着它走
       if (this.enqueue(c.session_id, s)) picked++;
     }
   }
@@ -452,4 +522,17 @@ export class Digester {
       // 记录失败本身不该再抛
     }
   }
+}
+
+/**
+ * 从一份设置（或会话覆盖里的原始 JSON）取一个数值字段，拿不到就回 0。
+ *
+ * 会话覆盖是"保存那一刻整组挖下来的快照"，老版本写下的行可能缺字段，
+ * 手改过的行还可能是字符串。用 0 表示"这个字段不可用"：在 byTime/byCount
+ * 里 0 本来就等于"这条路不触发"，不会把 undefined 当 0 天间隔去疯狂整理。
+ */
+function num(src: unknown, key: string): number {
+  if (src === null || typeof src !== 'object') return 0;
+  const v = (src as Record<string, unknown>)[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }

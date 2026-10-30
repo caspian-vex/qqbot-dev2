@@ -99,6 +99,14 @@ export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
  */
 const WS_FIX_MAX_FAILURES = 8;
 
+/**
+ * 记忆页横幅最多列出几个「单独开着记忆」的会话名。
+ *
+ * 横幅是提示不是清单：只给数量，用户会问"哪几个"；给全量，几百个群时会
+ * 拉成一行号码墙。三个够对上号了——排序按最近改动，刚勾的那个必在前三。
+ */
+const MEMORY_SESSION_NAME_LIMIT = 3;
+
 /** 已通过鉴权的处理函数。 */
 export type AuthedHandler = (ctx: ReqCtx, sess: SessionInfo) => void | Promise<void>;
 
@@ -1740,6 +1748,11 @@ export class Api {
    * 一次把 owners 与 status 带上：归属下拉不必再发一次请求，
    * 而 status 让页面能在功能关闭时直接说「已关闭，这 N 条不会被使用」——
    * 否则用户看到一列表会以为它正在生效。
+   *
+   * status 里的 enabled 只表示**全局**开关。会话级还能单独打开长期记忆
+   * （「会话」页每组设置第 8 张卡），所以另外给 enabled_sessions：否则
+   * 全局关着时页面无法解释「明明在会话里勾了，这里却说没开」——那句话
+   * 不仅误导，还让用户以为设置没保存上。
    */
   listMemories(ctx: ReqCtx): void {
     const tab = (ctx.query.get('tab') ?? 'fact').trim();
@@ -1754,10 +1767,17 @@ export class Api {
     let status;
     try {
       owners = this.store.memory.owners();
+      const global = this.store.settings.get();
+      // 最近改过的排前面（仓储里按 updated_at 倒序），所以刚勾的那几个
+      // 一定在名单里；只取前几个是因为横幅是提示，不是清单。
+      const memSessions = this.store.sessionSettings.listMemoryEnabled();
       status = {
-        enabled: this.store.settings.get().memory.enabled,
+        enabled: global.memory.enabled,
         facts: this.store.memory.list({ limit: 1 }).total,
         days: this.store.memory.listDays({ limit: 1 }).total,
+        enabled_sessions: memSessions.length,
+        // 与计数解耦：4 个会话时这里只有 3 个名字，前端写「… 等 4 个」
+        session_names: memSessions.slice(0, MEMORY_SESSION_NAME_LIMIT).map((r) => r.name || r.session_id),
       };
     } catch (e) {
       this.d.log.error('读取记忆概况失败', { err: e });
