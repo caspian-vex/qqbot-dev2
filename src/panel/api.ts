@@ -812,8 +812,40 @@ export class Api {
       usage_today: usage,
       model: settings.llm.model,
       totp_enabled: settings.panel.totp_enabled,
+      bot_enabled: settings.bot.enabled,
       dedupe_size: this.d.engine.dedupeSize(),
     });
+  }
+
+  // ---- 机器人总开关 ----
+
+  getBot(ctx: ReqCtx): void {
+    writeJSON(ctx.res, 200, { enabled: this.settings().bot.enabled });
+  }
+
+  /**
+   * 暂停 / 恢复机器人。
+   *
+   * 单独开一个接口而不是走 PUT /api/settings：那个接口提交的是整份设置，
+   * 而这里只该动一个字段——用户可能在另一个标签页改着别的参数，
+   * 整份覆盖会把它们回滚掉。`settings.update` 是"读最新值 → 改一个字段 →
+   * 落库"的事务，只碰自己那一下。
+   */
+  async setBot(ctx: ReqCtx, sess: SessionInfo): Promise<void> {
+    const req = await body(ctx, 1024);
+    const on = (req as { enabled?: unknown })?.enabled;
+    // 严格要求 boolean：`!` 或字符串 "false" 在这里都会变成"开启"，
+    // 而用户点的可能是"暂停"——静默反向是最不能接受的失败方式。
+    if (typeof on !== 'boolean') throw new HttpError(400, 'enabled 必须是 true 或 false');
+
+    this.store.settings.update((v) => {
+      v.bot.enabled = on;
+    });
+    this.d.engine.setEnabled?.(on);
+
+    const ip = clientIP(ctx.req);
+    this.store.audit.record(on ? 'bot.resumed' : 'bot.paused', sess.user, ip);
+    writeJSON(ctx.res, 200, { ok: true, enabled: on });
   }
 
   // ---- 设置 ----

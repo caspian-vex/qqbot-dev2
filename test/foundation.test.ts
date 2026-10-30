@@ -542,3 +542,24 @@ test('日志保留错误的堆栈与 cause 链', () => {
   assert.match(text, /ECONNREFUSED/, '要带 cause');
   assert.match(text, /at /, '要带堆栈位置');
 });
+
+test('机器人总开关：出厂是开的，缺字段与脏值都按开处理', () => {
+  const d = defaultSettings();
+  assert.equal(d.bot.enabled, true, '暂停开关出厂必须是开的，否则升级完机器人直接哑了');
+
+  // 旧库：bot 块里没有这个字段（0.6.x 的 JSON）
+  const old = defaultSettings() as unknown as Record<string, unknown>;
+  delete (old['bot'] as Record<string, unknown>)['enabled'];
+  assert.equal(normalizeSettings(old as unknown as Settings).bot.enabled, true);
+
+  // 脏值：手改成字符串。不收敛的话「!== false」会把它当开，而面板显示的是
+  // 「已暂停」——状态与行为对不上是最难查的那种故障，必须在读取时摁死。
+  const dirty = defaultSettings();
+  (dirty.bot as unknown as Record<string, unknown>)['enabled'] = 'false';
+  assert.equal(normalizeSettings(dirty).bot.enabled, true);
+
+  // 真的关掉时不能被兜底改回开
+  const off = defaultSettings();
+  off.bot.enabled = false;
+  assert.equal(normalizeSettings(off).bot.enabled, false, '暂停状态必须留得住');
+});

@@ -17,6 +17,19 @@ export interface LLMSettings {
 
 /** 触发与投递配置。 */
 export interface BotSettings {
+  /**
+   * 机器人总开关：false = 暂停。
+   *
+   * 与其它能力开关的口径不同——那些出厂全关，是"新能力让用户自己决定"；
+   * 这个出厂必须是开的，它不是一个能力，而是"让机器人先别说话"的暂停开关。
+   *
+   * 暂停时 QQ 仍保持在线，协议端连接不断，恢复即时；只是不再回复任何消息、
+   * 不再主动开口，暂停期间收到的消息也不入库、不进上下文。
+   *
+   * 刻意不放进会话覆盖白名单：这是部署级语义，允许单群覆盖会让"关了它"
+   * 变成"关了但某个群还能说话"，没法向用户解释。
+   */
+  enabled: boolean;
   wake_words: string[];
   passive_rate: number;
   group_cooldown_sec: number;
@@ -353,6 +366,7 @@ export function defaultSettings(): Settings {
       timeout_sec: 60,
     },
     bot: {
+      enabled: true,
       wake_words: [],
       passive_rate: 0.15,
       group_cooldown_sec: 30,

@@ -370,6 +370,15 @@ export class Engine implements EnginePort {
       return;
     }
 
+    // 总开关。必须排在 decide 之前：decide 里对私聊和 @ 会顺手打冷却时间戳，
+    // 暂停期间照样跑的话，恢复后收到的第一条消息会被那几秒冷却吃掉——
+    // 用户会觉得"开了但第一条不理我"。
+    if (!settings.bot.enabled) {
+      this.counters.ignored++;
+      this.log.debug('机器人已暂停，忽略消息', { session: sid });
+      return;
+    }
+
     const decision = decide(ev, settings.bot, this.selfId, this.cool);
     if (!decision.respond) {
       this.counters.ignored++;
@@ -413,6 +422,13 @@ export class Engine implements EnginePort {
   // ---- 回复链路 ----
 
   private async reply(ev: Event, settings: Settings, d: Decision, sid: string): Promise<void> {
+    // 任务在队里排了一会儿才轮到执行，期间可能刚被暂停。
+    // 必须读实时值：settings 是提交这个任务那一刻取的快照，看不出之后的切换。
+    // 在取图和调模型之前就退，省掉一次下载和一次计费的请求。
+    if (!this.isEnabled()) {
+      this.log.debug('机器人已暂停，丢弃排队的回复', { session: sid });
+      return;
+    }
     const rawText = d.text.trim();
 
     // 先把图取回来。任何一张读不到都只是"少一张"，不能升级成整条回复失败；
@@ -1037,6 +1053,7 @@ export class Engine implements EnginePort {
     this.rollEchoDay();
     const cdMs = Math.max(0, p.echo_cooldown_min) * 60_000;
     const last = this.echoSentAt.get(sid) ?? 0;
+    if (!settings.bot.enabled) return;
     if (!p.echo_enabled) return;
     if (this.echoTotal >= ECHO_DAILY_HARD_CAP) return;
     if (p.echo_daily_limit <= 0 || (this.echoCount.get(sid) ?? 0) >= p.echo_daily_limit) return;
@@ -1158,6 +1175,33 @@ export class Engine implements EnginePort {
     for (const sid of [...this.pendingEcho.keys()]) this.cancelEcho(sid);
   }
 
+  // ---- 总开关 ----
+
+  /**
+   * 当前是否允许说话。
+   *
+   * 每次都重新读设置，不缓存：暂停要即时生效，而设置读的是进程内缓存，
+   * 开销只是一次对象拷贝。读失败按"开"处理——数据库抖一下不该让机器人
+   * 静默失语，那是最难查的故障（用户看到的是"它不理我"，日志一片干净）。
+   */
+  private isEnabled(): boolean {
+    try {
+      return this.store.settings.get().bot.enabled !== false;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * 开关切换后的即时钩子。设置已经落库，这里只处理内存侧。
+   *
+   * 必须显式清一次待发跟进：它们的定时器已经挂在事件循环上，不会因为
+   * 设置变了就自己停下。不清的话恢复瞬间会集中冒出一批"刚才那事怎么样了"。
+   */
+  setEnabled(on: boolean): void {
+    if (!on) this.cancelAllEchoes();
+  }
+
   /** 跨天清零跟进计数。 */
   private rollEchoDay(): void {
     const day = localDay();
@@ -1195,6 +1239,13 @@ export class Engine implements EnginePort {
     }
     this.ticking = true;
     try {
+      // 暂停时只留清理。闹钟、闲置唤醒、记忆整理全跳过：
+      // 前两者是"对外说话"，暂停了就不该发；整理在暂停期间也没有新对话可摘。
+      // maintain() 是保留期清理，跟说不说话无关，长时间停着更应该继续跑。
+      if (!this.isEnabled()) {
+        this.maintain();
+        return;
+      }
       await this.fireAlarms(now);
       this.maybeIdle(now);
       // 记忆整理放在最后，且内部从不 await：闹钟与闲置唤醒是"到点就该发"的事，
@@ -1274,6 +1325,12 @@ export class Engine implements EnginePort {
     }
 
     this.rollProactiveDay();
+    // 暂停期间到点的闹钟就此作废，不补发。行已经被 fireAlarms 标过 done
+    // （"至多一次"），这里 return 就是终态——恢复后不会突然冒出一句迟到的提醒。
+    if (!settings.bot.enabled) {
+      this.log.info('机器人已暂停，定时消息取消', { session: sid, id: row.id });
+      return;
+    }
     const limit = settings.proactive.proactive_daily_limit;
     if (limit <= 0 || (this.proactiveCount.get(sid) ?? 0) >= limit) {
       this.log.info('本会话主动发言额度用尽，定时消息取消', { session: sid, id: row.id });

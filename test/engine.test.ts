@@ -1193,3 +1193,76 @@ describe('群名缓存', () => {
     }
   });
 });
+
+describe('机器人总开关', () => {
+  it('关掉后群里的消息一律不回复，只记一次忽略', async () => {
+    const h = makeHarness({
+      patch: (v) => {
+        v.bot.enabled = false;
+      },
+    });
+    try {
+      h.engine.handleEvent(groupEv());
+      await sleep(250);
+      assert.equal(h.sent.length, 0, '暂停时不能说话');
+      assert.equal(h.engine.stats().ignored, 1);
+      assert.equal(h.engine.stats().replied, 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('暂停期间不消耗冷却，恢复后第一条私聊立刻能回', async () => {
+    // 开关判断如果在 decide 之后，暂停时照样会调 cool.allow 把时间戳打上，
+    // 恢复后 3 秒内的第一条会被这笔"幽灵冷却"吃掉——用户看到的是"开了但第一条不理我"。
+    const h = makeHarness();
+    try {
+      h.store.settings.update((v) => {
+        v.bot.enabled = false;
+      });
+      h.engine.handleEvent(privateEv(20001, 1));
+      await sleep(150);
+      assert.equal(h.sent.length, 0, '暂停时不能回');
+
+      h.store.settings.update((v) => {
+        v.bot.enabled = true;
+      });
+      h.engine.handleEvent(privateEv(20001, 2));
+      await waitFor(() => h.sent.length >= 1, 2000);
+      assert.equal(h.sent.length, 1, '恢复后第一条应该立刻回，不该被暂停期间的冷却挡住');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('暂停时 tick 不发到点的定时消息，恢复后照常发', async () => {
+    const h = makeHarness();
+    try {
+      const id = h.store.scheduled.add({
+        session_id: 'group:30000',
+        kind: 'group',
+        target_id: 30000,
+        body: '该开会了',
+        due_at: Math.floor(Date.now() / 1000) + 1,
+      });
+      assert.ok(id > 0);
+
+      h.store.settings.update((v) => {
+        v.bot.enabled = false;
+      });
+      await h.engine.tick(Date.now() + 5000);
+      await sleep(120);
+      assert.equal(h.sent.length, 0, '暂停时定时消息不该发');
+      assert.equal(h.store.scheduled.countPending(), 1, '也不能被当成已发掉');
+
+      h.store.settings.update((v) => {
+        v.bot.enabled = true;
+      });
+      await h.engine.tick(Date.now() + 5000);
+      await waitFor(() => h.sent.length >= 1, 2000);
+      assert.equal(h.sent.length, 1, '恢复后到点的消息照常发');
+    } finally {
+      h.cleanup();
+    }
+  });
+});

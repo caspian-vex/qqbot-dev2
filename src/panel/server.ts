@@ -104,6 +104,9 @@ export class PanelServer {
 
     // 业务接口
     r.add('GET', '/api/overview', this.wrap((c) => a.overview(c), false));
+    // 机器人总开关。与 QQ 登录态无关：关掉只是不说话了，连接和在线都不动。
+    r.add('GET', '/api/bot', this.wrap((c) => a.getBot(c), false));
+    r.add('POST', '/api/bot', this.wrap((c, s) => a.setBot(c, s), true));
     r.add('GET', '/api/settings', this.wrap((c) => a.getSettings(c), false));
     r.add('PUT', '/api/settings', this.wrap((c, s) => a.putSettings(c, s), true));
     r.add('GET', '/api/personas', this.wrap((c) => a.listPersonas(c), false));

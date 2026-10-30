@@ -164,3 +164,13 @@ test('人格页的删除按「未启用且没人指定」放行，读的是列�
   assert.match(js, /const canDel = !p\.active && used === 0;/);
   assert.match(js, /p\.bindings/, '列表项要带上 bindings 计数，否则按钮无法判断');
 });
+
+test('机器人开关：登录页给入口，总览页给状态', () => {
+  // 开关藏在「登录 QQ」页，但暂停状态必须在总览上看得见——总览是进来第一眼
+  // 就会看的页面，不标的话关了两天会以为机器人坏了。
+  assert.match(js, /data-act="bot-toggle"/);
+  assert.match(js, /id="ov-bot"/);
+  // 接口没返回这个字段时（旧版本、读设置失败）必须按"开"处理，
+  // 否则面板会凭空显示一个并不存在的暂停状态。
+  assert.match(js, /botEnabled = d\.enabled !== false;/);
+});

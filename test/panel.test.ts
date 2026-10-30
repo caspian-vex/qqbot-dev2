@@ -2302,3 +2302,86 @@ describe('记忆接口', () => {
     }
   });
 });
+
+describe('机器人总开关接口', () => {
+  it('默认开，能关能开，非布尔值一律拒绝', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+
+      let r = await fetch(`${h.base}/api/bot`, { headers: { Cookie: c.header } });
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), { enabled: true });
+
+      // 总览也要带这个状态，否则关了之后没有任何地方提示
+      const ov = (await (await fetch(`${h.base}/api/overview`, { headers: { Cookie: c.header } })).json()) as {
+        bot_enabled: boolean;
+      };
+      assert.equal(ov.bot_enabled, true);
+
+      r = await fetch(`${h.base}/api/bot`, {
+        method: 'POST',
+        headers: jsonHeaders(c),
+        body: JSON.stringify({ enabled: false }),
+      });
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), { ok: true, enabled: false });
+      assert.equal(h.store.settings.get().bot.enabled, false);
+
+      // 字符串 "false" 用 `!on` 之类的写法会被当成"开"，静默反向最不能接受
+      r = await fetch(`${h.base}/api/bot`, {
+        method: 'POST',
+        headers: jsonHeaders(c),
+        body: JSON.stringify({ enabled: 'false' }),
+      });
+      assert.equal(r.status, 400);
+      assert.equal(h.store.settings.get().bot.enabled, false, '被拒的请求不能改状态');
+
+      r = await fetch(`${h.base}/api/bot`, {
+        method: 'POST',
+        headers: jsonHeaders(c),
+        body: JSON.stringify({ enabled: true }),
+      });
+      assert.equal(r.status, 200);
+      assert.equal(h.store.settings.get().bot.enabled, true);
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('未登录读不到，没有 CSRF 改不了', async () => {
+    const h = await harness();
+    try {
+      assert.equal((await fetch(`${h.base}/api/bot`)).status, 401);
+      const c = await authed(h);
+      const r = await fetch(`${h.base}/api/bot`, {
+        method: 'POST',
+        headers: { Cookie: c.header, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      assert.equal(r.status, 403);
+      assert.equal(h.store.settings.get().bot.enabled, true, 'CSRF 挡下的请求不能生效');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('暂停与恢复都写审计', async () => {
+    const h = await harness();
+    try {
+      const c = await authed(h);
+      for (const enabled of [false, true]) {
+        await fetch(`${h.base}/api/bot`, {
+          method: 'POST',
+          headers: jsonHeaders(c),
+          body: JSON.stringify({ enabled }),
+        });
+      }
+      const acts = h.store.audit.list(20).map((x) => x.action);
+      assert.ok(acts.includes('bot.paused'), '暂停要有记录');
+      assert.ok(acts.includes('bot.resumed'), '恢复也要有');
+    } finally {
+      await h.stop();
+    }
+  });
+});

@@ -526,3 +526,22 @@ describe('跟进也带记忆', () => {
     }
   });
 });
+
+describe('总开关对跟进的影响', () => {
+  it('暂停会立刻清掉已排定的跟进', async () => {
+    // 定时器已经挂在事件循环上，设置变了它不会自己停。不清的话，
+    // 恢复那一刻会把这期间欠下的跟进一起冒出来。
+    const h = makeHarness({ echo_min_sec: 60, echo_max_sec: 60 });
+    try {
+      h.engine.handleEvent(ev());
+      await waitFor(() => h.sent.length >= 1);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(h.engine.pendingEchoCount(), 1, '应已排上一条跟进');
+
+      h.engine.setEnabled(false);
+      assert.equal(h.engine.pendingEchoCount(), 0, '暂停必须把定时器一起清掉');
+    } finally {
+      h.cleanup();
+    }
+  });
+});

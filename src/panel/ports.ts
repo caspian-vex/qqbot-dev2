@@ -74,6 +74,14 @@ export interface EnginePort {
     summary: string;
     reason?: string;
   }>;
+  /**
+   * 暂停 / 恢复机器人（面板上的总开关）。
+   *
+   * 状态本身存在设置里，引擎每次自己读；这个方法只是"切换之后顺带做点内存侧
+   * 清理"的钩子，目前是清掉已挂定时器的待发跟进。可选：没有它，暂停依然生效，
+   * 只是恢复瞬间可能冒出几句排队中的话。
+   */
+  setEnabled?(on: boolean): void;
 }
 
 /**

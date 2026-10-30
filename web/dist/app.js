@@ -497,7 +497,7 @@
           <div class="v sm"><span class="dot" id="ov-dot"></span><span id="ov-conn">—</span></div>
         </div>
         <div class="metric">
-          <div class="k">机器人</div>
+          <div class="k">机器人 <span class="tag off" id="ov-bot" style="display:none">已暂停</span></div>
           <div class="v sm mono" id="ov-self">—</div>
         </div>
         <div class="metric">
@@ -573,6 +573,11 @@
       dot.className = 'dot ' + (d.connected ? (d.online ? 'ok' : 'warn') : 'bad');
       $('#ov-conn').textContent = d.connected ? (d.online ? '已连接' : '在线状态未知') : '未连接';
       $('#ov-self').textContent = d.self_id ? `${d.nickname || ''} (${d.self_id})` : '未登录';
+      // 暂停了就在总览上直接标出来：这个开关平时藏在「登录」页，
+      // 不标的话用户过两天会以为机器人坏了
+      const paused = d.bot_enabled === false;
+      const botTag = $('#ov-bot');
+      if (botTag) botTag.style.display = paused ? '' : 'none';
       $('#ov-up').textContent = d.uptime || '—';
       $('#ov-cost').textContent = fmtCost(d.usage_today && d.usage_today.cost_cny);
       $('#ov-model').textContent = d.model ? '模型 ' + d.model : '';
@@ -3011,6 +3016,9 @@
     let qrStale = false;
     const QR_TTL_MS = 110000; // 二维码约 2 分钟失效，留 10 秒余量
     let loggedIn = false;
+    // 机器人总开关。跟 QQ 登录态是两件事：退出登录会让机器人离线，
+    // 暂停只让它闭嘴。两者都要能独立操作，所以各存一份状态。
+    let botEnabled = true;
 
     el.innerHTML = `
       <div class="page-head">
@@ -3034,6 +3042,19 @@
           <span class="mono" id="qq-uin" style="color:var(--fg-dim);font-size:12px"></span>
         </div>
         <div id="qq-hint" style="margin-top:10px;font-size:11.5px;color:var(--fg-mute);line-height:1.7"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>机器人 <span class="tag on" id="bot-tag">运行中</span></h3>
+          <div class="card-actions">
+            <button class="btn ghost" id="bot-toggle" data-act="bot-toggle">暂停</button>
+          </div>
+        </div>
+        <p class="note" style="margin:0">
+          暂停后机器人仍保持 QQ 在线，只是不再回复任何消息、也不再主动开口，暂停期间收到的消息不会进上下文。
+          恢复是即时的，不用重新扫码。要彻底让 QQ 下线，用上面的「退出登录」。
+        </p>
       </div>
 
       <div class="card" id="qq-login-card" style="display:none">
@@ -3109,7 +3130,26 @@
       // 已登录才给「退出登录」：换号必须先退，否则协议端会拒绝新的登录
       const lo = $('#qq-logout');
       if (lo) lo.style.display = d.login ? '' : 'none';
+      // 登录态变了，开关的可用性要跟着变
+      renderBot();
     }
+
+    // 总开关的两种状态。文字、配色、可用性都跟着走——否则很容易出现
+    // "按钮写着暂停，其实点下去是恢复"这种事。
+    function renderBot() {
+      const tag = $('#bot-tag');
+      const btn = $('#bot-toggle');
+      if (!tag || !btn) return;
+      tag.textContent = botEnabled ? '运行中' : '已暂停';
+      tag.className = 'tag ' + (botEnabled ? 'on' : 'off');
+      btn.textContent = botEnabled ? '暂停' : '恢复运行';
+      // 运行中用次要样式：暂停不该看起来像"这个页面的主操作"
+      btn.className = botEnabled ? 'btn ghost' : 'btn';
+      // 没登录 QQ 时机器人本来就不会说话，开关没有意义
+      btn.disabled = !loggedIn;
+      btn.title = loggedIn ? '' : '先登录 QQ';
+    }
+
 
     function qrNote(text) {
       const n = $('#qq-qr-note');
@@ -3217,6 +3257,13 @@
     // 白挨一次"QQ Is Logined"。refresh 内部会在未登录时补取码。
     refresh();
     loadSaved();
+    // 开关状态只在这个页面会改，拉一次就够，不用跟状态轮询一起每 3 秒问一遍
+    api('/api/bot')
+      .then((d) => {
+        botEnabled = d.enabled !== false;
+        renderBot();
+      })
+      .catch(() => renderBot());
 
     const statusTimer = setInterval(refresh, 3000);
     stops.push(() => clearInterval(statusTimer));
@@ -3236,6 +3283,22 @@
     stops.push(() => clearInterval(qrWatch));
 
     bindActions(el, {
+      'bot-toggle': async (btn) => {
+        // 先定格当前状态，避免连点时"读到一半新一半旧"
+        const next = !botEnabled;
+        btn.disabled = true;
+        try {
+          const r = await api('/api/bot', { method: 'POST', body: { enabled: next } });
+          botEnabled = r.enabled !== false;
+          renderBot();
+          ok(botEnabled ? '机器人已恢复运行' : '机器人已暂停，QQ 仍在线');
+        } catch (e) {
+          bad(e.message);
+        } finally {
+          // 失败也要把按钮还回去，否则连登录态一起卡住
+          btn.disabled = !loggedIn;
+        }
+      },
       'qq-refresh': async () => {
         await refresh();
         ok('已刷新');
